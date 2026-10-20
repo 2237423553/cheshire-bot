@@ -1,0 +1,5 @@
+node_modules/
+bot.log
+bot.err
+llmstate.json
+B站总结/
