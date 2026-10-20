@@ -11,10 +11,15 @@ import { cfg } from './config.mjs';
 
 const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可贵等也不要误报
 
-/** 画一张图，返回 PNG Buffer。失败抛 Error（消息直接给模型/群里看） */
+/** 画一张图，返回 PNG Buffer。失败抛 Error（消息直接给模型/群里看）。
+ *  外壳只做参数校验；真正的抓取在内层（429 限流时内层自己等一把重试一次）。 */
 export async function generateImage(prompt) {
   const p = String(prompt ?? '').trim();
   if (!p) throw new Error('没给画面描述');
+  return generateImageInner(p);
+}
+
+async function generateImageInner(prompt) {
 
   let r;
   try {
@@ -44,6 +49,14 @@ export async function generateImage(prompt) {
       throw new Error('画面描述被生图服务的安全审核拦截了（这个中转审核很严，无关内容也可能误拦）——如实告诉指挥官画不了，建议换个描述再试');
     }
     if (r.status === 401) throw new Error('生图 API Key 无效（401）');
+    // 429 = 中转限流（今天连画几张很容易撞上）。有 Retry-After 就等一把重试一次，
+    // 还不行就明说「限流了等几分钟」，别让群里以为机器人坏了
+    if (r.status === 429) {
+      const wait = Math.min(Number(r.headers.get('retry-after')) || 30, 90);
+      console.log(`[bot] 生图被限流（429），等 ${wait}s 重试一次`);
+      await new Promise((res) => setTimeout(res, wait * 1000));
+      return generateImageInner(prompt);
+    }
     throw new Error(`生图失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
   }
 
