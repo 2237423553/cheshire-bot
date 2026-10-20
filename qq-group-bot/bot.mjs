@@ -445,10 +445,11 @@ async function generateImageTool(args, gid) {
     return '画画失败：' + e.message;
   }
   try {
+    // 2~3MB 图走 highway 上传可能超过 SDK 默认 30s，实测超时报「发送失败」其实 QQ 侧还在传
     await http.raw('send_group_msg', {
       group_id: Number(gid),
       message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
-    });
+    }, { timeoutMs: 120 * 1000 });
   } catch (e) {
     console.warn('[bot] 图片发送失败:', e.message);
     return `图已经画好了（${Math.round(buf.length / 1024)}KB）但发到群里失败：${e.message}`;
@@ -1124,10 +1125,11 @@ bot.onGroupMessage(async (event, ctx) => {
 
         // 路由本身有 drewImage 语义：走到这步就必然真生成真发送，不存在嘴遁环节
         const buf = await imggen.generateImage(prompt);
+        // 同上：SDK 默认 30s 掐不死 highway 慢传，给到 120s
         await http.raw('send_group_msg', {
           group_id: Number(gid),
           message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
-        });
+        }, { timeoutMs: 120 * 1000 });
         const caption = `画好啦喵～给指挥官画的是：${drawSubj}`;
         await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
 
