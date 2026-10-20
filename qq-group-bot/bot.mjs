@@ -796,10 +796,11 @@ function parseDrawIntent(raw) {
   if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词)/.test(t)) return null;
   // 「画」必须在句首附近才算画图诉求（防「你上次画的大凤呢」这种越聊越歪的）
   const headDraw = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}画[\s\S]{1,60}$/.test(t);
-  // 「生成一张 XX」「画一张 XX」「来张 XX 的图」这种带量词/图字的
-  const looseDraw = /(?:画|生成|来|出)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)[^。？！]{0,50}(?:图|图片|照片)?[。！~\s]*$/.test(t)
-    && /(?:图|图片|照片|画)/.test(t);
-  if (!headDraw && !looseDraw) return null;
+  // 「画一张 X」「生成一张 X」：有量词就算（群里真实句式「生成一张赛车大凤」没有图字）
+  const counterDraw = /(?:画|生成)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)/.test(t);
+  // 「来张 X 的图」「生成 X 图片」：动词弱，必须有图字才认
+  const nounDraw = /(?:画|生成|来|出)\s*[^。？！]{0,50}(?:图|图片|照片)/.test(t);
+  if (!headDraw && !counterDraw && !nounDraw) return null;
   return t;
 }
 
@@ -1101,6 +1102,46 @@ bot.onGroupMessage(async (event, ctx) => {
       try { await ctx.reply(text(`⚠️ ${e.message}`)); } catch { /* 发不出去就算了 */ }
     }
     return;
+  }
+
+  // ── 画图意图强制路由（2026-10-20 上线）──
+  // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
+  // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
+  // 全程模型没有「装成功」的机会（翻 prompt 那步模型只当翻译器）。
+  const drawSubj = atMe ? parseDrawIntent(userText) : null;
+  let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
+  if (drawSubj) {
+    const sid = `img-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
+    try {
+      const prompt = await translateDrawPrompt(sid, drawSubj);
+      if (!prompt) {
+        // 翻译层否决：不是画图诉求，走正常对话继续
+        drawVeto = true;
+        console.log(`[bot] 群 ${gid} 画图意图被翻译层否决 <- ${drawSubj.slice(0, 18)}`);
+      } else {
+        console.log(`[bot] 🎨 意图路由接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        await ctx.reply(text(`正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
+
+        // 路由本身有 drewImage 语义：走到这步就必然真生成真发送，不存在嘴遁环节
+        const buf = await imggen.generateImage(prompt);
+        await http.raw('send_group_msg', {
+          group_id: Number(gid),
+          message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
+        });
+        const caption = `画好啦喵～给指挥官画的是：${drawSubj}`;
+        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+
+        // 进对话线（纯文字）：user 记诉求、assistant 记 [已画图]，之后可以接着聊这张画
+        pushHistory(gid, 'user', drawSubj, `${displayName(event)}: ${drawSubj} [要求画图]`);
+        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已画图: ${drawSubj}] ${caption}`);
+      }
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 画图出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)); } catch { /* 发不出去就算了 */ }
+    } finally {
+      promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
+    }
+    if (!drawVeto) return;   // 接管成功或失败都到此为止；被否决才放行到正常对话
   }
 
   // ── 管理指令：不走 LLM、不耗 token、立即返回 ──
