@@ -48,6 +48,15 @@
 日常：重启就再点一次（幂等）；换模型双击 `切换模型.cmd`（先验证再写盘）；
 日志在 `qq-group-bot/bot.log`（正常）和 `bot.err`（报错走 stderr）。
 
+## 自定义
+
+- **更换 LLM API**：双击「切换模型.cmd」（交互式：地址 → Key → 拉列表 → 选 → 验证通过才切换），
+  或命令行 `bun run switch-model.mjs <url> <key> [model]`，或直接改 `config.mjs` 默认值。
+  回滚 = 删掉 `llmstate.json`。换服务商要探的四件事见 [docs/01 · 8.1](docs/01-部署与配置.md)
+- **更改人设 / 提示词**：全部集中在 `config.mjs`——`systemPrompt`（人设 + 铁律 + 能力边界）、
+  `eatPrompt`（#吃什么 文案语气）、`beaconTrigger/beaconReply`（信标词）。
+  改完重启生效，验证三步见 [docs/01 · 8.2](docs/01-部署与配置.md)
+
 ## 文档（细节都在这里）
 
 | 文档 | 内容 |
