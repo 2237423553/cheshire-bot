@@ -20,7 +20,6 @@ export async function generateImage(prompt) {
 }
 
 async function generateImageInner(prompt) {
-
   let r;
   try {
     r = await fetch(cfg.imggenUrl, {
@@ -31,7 +30,7 @@ async function generateImageInner(prompt) {
       },
       body: JSON.stringify({
         model: cfg.imggenModel,
-        prompt: p,
+        prompt,
         size: cfg.imggenSize,
         n: 1,
       }),
