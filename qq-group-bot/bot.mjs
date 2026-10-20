@@ -781,6 +781,54 @@ function parseWtCommand(raw) {
   return m ? m[1].trim() : null;
 }
 
+/**
+ * 画图意图识别（意图强制路由的闸门）。
+ * 命中：@ 后「画…」开头（画一张/画个/画大凤…），或「生成/来/出 …图(片/照片)」句式。
+ * 原则：**宁漏勿错** —— 文字类产物（代码/脚本/文档…）绝对不接画，闲聊疑似灵活放行。
+ * 返回要画的主题原文（交给翻译层 Plumbing 成英文 prompt），不命中返回 null。
+ */
+function parseDrawIntent(raw) {
+  // 摘掉开头的 @某人和询呼词，剩下才是诉求本体
+  let t = String(raw ?? '').trim();
+  t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
+  if (!t || t.length > 80) return null;
+  // 明确要的是文字产物：接了必错，直接放行走正常对话
+  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词)/.test(t)) return null;
+  // 「画」必须在句首附近才算画图诉求（防「你上次画的大凤呢」这种越聊越歪的）
+  const headDraw = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}画[\s\S]{1,60}$/.test(t);
+  // 「生成一张 XX」「画一张 XX」「来张 XX 的图」这种带量词/图字的
+  const looseDraw = /(?:画|生成|来|出)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)[^。？！]{0,50}(?:图|图片|照片)?[。！~\s]*$/.test(t)
+    && /(?:图|图片|照片|画)/.test(t);
+  if (!headDraw && !looseDraw) return null;
+  return t;
+}
+
+/**
+ * 把画图诉求翻成英文生图 prompt（独立小会话，不吃群记忆、不占上下文、不带工具）。
+ * 翻译层带否决权：根本不是画图诉求时回复 NO，路由退回正常对话（双保险）。
+ * 返回 null = 否决或空译文。
+ */
+async function translateDrawPrompt(sid, subj) {
+  try {
+    const msg = await callLLM(sid, [
+      {
+        role: 'system',
+        content:
+          '你是文生图 prompt 翻译器。把用户请求翻成一段高质量的英文生图 prompt：' +
+          '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（30~80 词英文），无解释、无引号。' +
+          '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。',
+      },
+      { role: 'user', content: subj },
+    ], false);
+    const p = cleanToolArtifacts(msg.content ?? '').trim();
+    if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
+    return p.slice(0, 800);   // prompt 太长也没意义，截到 800
+  } catch (e) {
+    console.warn('[bot] 生图 prompt 翻译失败:', e.message);
+    return null;
+  }
+}
+
 async function handleCommand(cmd, gid, ctx) {
   // ── #吃什么：唯一会真调大模型的指令 ──
   // 用独立会话 food-<gid>：
