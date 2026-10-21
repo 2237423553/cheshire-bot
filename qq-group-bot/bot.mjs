@@ -1255,6 +1255,12 @@ bot.onGroupMessage(async (event, ctx) => {
   // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
   const videoSubj = atMe ? parseVideoIntent(userText) : null;
   let vidVeto = false;
+  if (videoSubj && cfg.vidgenEnabled === false) {
+    // 总闸关着：直接告知歇业，不放行进普通对话（免得模型嘴上承诺「这就生成」又装成功，坑 34 同族）
+    console.log(`[bot] 群 ${gid} 生视频业务已暂停，直接回绝 <- ${videoSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('生视频业务暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
   if (videoSubj) {
     const sid = `vid-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
     try {

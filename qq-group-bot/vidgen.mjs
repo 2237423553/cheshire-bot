@@ -92,15 +92,35 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       if (dur > maxSec) {
         throw new Error(`这次生成了 ${dur}s，超过上限 ${maxSec}s，已弃用不发送`);
       }
-      // ③ 下载成片（站内相对路径）
+      // ③ 下载成片（站内相对路径）。任务已 done、费用已扣，下载失败绝不直接放弃：
+      // 429/5xx/超时都重试（中转实测会在下载这步限流），最多 4 把
       const url = j.video?.url ?? `/v1/videos/${rid}/content`;
-      const dr = await fetch(baseOf() + url, {
-        headers: { 'Authorization': `Bearer ${cfg.vidgenKey}` },
-        signal: AbortSignal.timeout(120 * 1000),
-      });
-      if (!dr.ok) throw new Error(`视频下载失败（HTTP ${dr.status}）`);
-      const buf = Buffer.from(await dr.arrayBuffer());
-      if (!buf.length) throw new Error('视频下载到 0 字节');
+      let buf = null;
+      let dlErr = '';
+      let drHeaders = {};   // 上一把下载响应的头（取 Retry-After 用）
+      for (let d = 0; d < 4 && !buf; d++) {
+        if (d > 0) {
+          // 有 Retry-After 就按它等，没有就固定歇 10s
+          const wait = Math.min(Number(drHeaders['retry-after'] ?? 0) * 1000 || 10000, 60000);
+          console.log(`[bot] 🎬 视频下载失败（${dlErr}），${Math.round(wait / 1000)}s 后重试（第 ${d}/3 次）`);
+          await new Promise((res) => setTimeout(res, wait));
+        }
+        try {
+          const dr = await fetch(baseOf() + url, {
+            headers: { 'Authorization': `Bearer ${cfg.vidgenKey}` },
+            signal: AbortSignal.timeout(120 * 1000),
+          });
+          drHeaders = dr.headers;
+          if (!dr.ok) { dlErr = `HTTP ${dr.status}`; continue; }
+          const b = Buffer.from(await dr.arrayBuffer());
+          if (!b.length) { dlErr = '下载到 0 字节'; continue; }
+          buf = b;
+        } catch (e) {
+          dlErr = e.name === 'TimeoutError' ? '下载超时' : String(e.message ?? e).slice(0, 80);
+        }
+      }
+      drHeaders = {};
+      if (!buf) throw new Error(`视频下载失败（重试 3 次都不行：${dlErr}）——成片还在服务器上，稍后让柴郡重发或换个说法再生成一次`);
       return buf;
     }
     if (j.status && j.status !== 'pending' && j.status !== 'done') {
