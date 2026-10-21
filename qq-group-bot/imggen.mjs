@@ -12,14 +12,15 @@ import { cfg } from './config.mjs';
 const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可贵等也不要误报
 
 /** 画一张图，返回 PNG Buffer。失败抛 Error（消息直接给模型/群里看）。
- *  外壳只做参数校验；真正的抓取在内层（429 限流时内层自己等一把重试一次）。 */
+ *  外壳只做参数校验；真正的抓取在内层（429 限流时内层自己等一把重试，最多 3 次请求 2 次重试）。 */
 export async function generateImage(prompt) {
   const p = String(prompt ?? '').trim();
   if (!p) throw new Error('没给画面描述');
-  return generateImageInner(p);
+  return generateImageInner(p, 0);
 }
 
-async function generateImageInner(prompt) {
+async function generateImageInner(prompt, attempt) {
+  if (attempt >= 3) throw new Error('生图被限流了（429 重试 2 次都不行），中转在限流高峰——过几分钟再试一次');
   let r;
   try {
     r = await fetch(cfg.imggenUrl, {
@@ -52,9 +53,9 @@ async function generateImageInner(prompt) {
     // 还不行就明说「限流了等几分钟」，别让群里以为机器人坏了
     if (r.status === 429) {
       const wait = Math.min(Number(r.headers.get('retry-after')) || 30, 90);
-      console.log(`[bot] 生图被限流（429），等 ${wait}s 重试一次`);
+      console.log(`[bot] 生图被限流（429），等 ${wait}s 重试（第 ${attempt + 1}/2 次重试）`);
       await new Promise((res) => setTimeout(res, wait * 1000));
-      return generateImageInner(prompt);
+      return generateImageInner(prompt, attempt + 1);
     }
     throw new Error(`生图失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
   }
