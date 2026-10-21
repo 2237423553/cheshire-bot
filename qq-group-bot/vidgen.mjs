@@ -72,6 +72,12 @@ export async function generateVideo(prompt) {
       continue;   // 单次轮询失败不放弃，下一轮再试
     }
     if (j.status === 'done') {
+      // 指挥官限额：成片最长 15 秒（2026-10-21 加）。超限就弃用不发（费用照扣，但绝不让超长片进群）
+      const dur = Number(j.video?.duration ?? 0);
+      const maxSec = cfg.vidgenMaxSeconds ?? 15;
+      if (dur > maxSec) {
+        throw new Error(`这次生成了 ${dur}s，超过上限 ${maxSec}s，已弃用不发送`);
+      }
       // ③ 下载成片（站内相对路径）
       const url = j.video?.url ?? `/v1/videos/${rid}/content`;
       const dr = await fetch(baseOf() + url, {
