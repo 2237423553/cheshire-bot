@@ -31,6 +31,9 @@ export const PAGE_HTML = `<!doctype html>
   .probe td:first-child { width:110px; } .probe .lat { color:var(--dim); font-size:12px; }
   .prof td { border-top:1px solid var(--line); padding:7px 6px; }
   .prof button { padding:2px 10px; font-size:12px; margin-left:4px; }
+  .drop { position:absolute; z-index:9; left:0; right:0; top:calc(100% + 2px); background:#151a22; border:1px solid var(--line); border-radius:8px; max-height:220px; overflow-y:auto; box-shadow:0 6px 18px #0009; }
+  .drop div { padding:5px 10px; cursor:pointer; font-size:13px; }
+  .drop div:hover, .drop div.hl { background:#20303f; }
   #bar { position:fixed; left:0; right:0; bottom:0; background:#0c0f14ee; border-top:1px solid var(--line); padding:8px 18px; font-size:13px; }
   #bar.ok { color:var(--ok); } #bar.bad { color:var(--bad); } #bar.busy { color:var(--warn); }
   .foot { color:var(--dim); font-size:11px; margin:14px 0 46px; }
@@ -61,8 +64,8 @@ export const PAGE_HTML = `<!doctype html>
   <label class="rg"><input type="radio" name="tk" value="auto">auto</label>
   <label class="rg"><input type="radio" name="tk" value="enabled">enabled</label>
   <label class="rg"><input type="radio" name="tk" value="disabled">disabled</label></td></tr>
-<tr><td>模型</td><td><div class="row"><input id="f_model" list="mdl" placeholder="先拉列表，或直接输模型 ID"><button onclick="loadModels()">拉取模型列表</button></div>
-  <datalist id="mdl"></datalist><div class="hint" id="mdl_hint"></div></td></tr>
+<tr><td>模型</td><td><div class="row"><div style="position:relative;flex:1"><input id="f_model" autocomplete="off" placeholder="先拉列表，或直接输模型 ID"><div id="mdl_drop" class="drop" style="display:none"></div></div><button onclick="loadModels()">拉取模型列表</button></div>
+  <div class="hint" id="mdl_hint"></div></td></tr>
 </table>
 <div class="row" style="margin-top:10px">
   <button class="pri" onclick="probeAndSwitch()">探测四件套并切换</button>
@@ -84,7 +87,27 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-let lastProbe = null, lastForm = null;
+let lastProbe = null, lastForm = null, MODELS = [];
+
+// ── 模型自定义下拉：点开/输入即弹全部列表（datalist 会拿输入当过滤条件，不合用）──
+function renderDrop() {
+  const q = $('f_model').value.trim().toLowerCase();
+  const list = q ? MODELS.filter((m) => m.toLowerCase().includes(q)) : MODELS;
+  const d = $('mdl_drop');
+  d.innerHTML = (list.length ? list : ['（没有匹配的模型，回车/留空直接用输入值）'])
+    .map((m) => '<div data-v="' + esc(m) + '">' + esc(m) + '</div>').join('');
+  d.style.display = 'block';
+  d.querySelectorAll('div').forEach((el) => el.onclick = () => {
+    $('f_model').value = el.dataset.v; hideDrop(); $('mdl_hint').textContent = '已选 ' + el.dataset.v;
+  });
+}
+function hideDrop() { $('mdl_drop').style.display = 'none'; }
+function initDrop() {
+  const inp = $('f_model');
+  inp.addEventListener('focus', () => { if (MODELS.length) renderDrop(); });
+  inp.addEventListener('input', () => { if (MODELS.length) renderDrop(); });
+  inp.addEventListener('blur', () => setTimeout(hideDrop, 150));   // 留 150ms 给点击事件
+}
 
 function bar(msg, cls) { const b = $('bar'); b.textContent = msg; b.className = cls || ''; }
 
@@ -167,8 +190,9 @@ async function loadModels() {
   bar('正在拉模型列表…', 'busy');
   try {
     const j = await api('/api/models', { method: 'POST', body: JSON.stringify(formTo(f)) });
-    $('mdl').innerHTML = j.models.map((m) => '<option value="' + esc(m) + '">').join('');
-    $('mdl_hint').textContent = '拉到 ' + j.models.length + ' 个模型（点击模型框可搜索选择）';
+    MODELS = j.models;
+    $('mdl_hint').textContent = '拉到 ' + j.models.length + ' 个模型（点击模型框打开完整列表，输入可过滤）';
+    renderDrop();
     bar('列表拉到了（' + j.models.length + ' 个）', 'ok');
   } catch (e) { bar('拉列表失败：' + e.message, 'bad'); $('mdl_hint').textContent = ''; }
 }
@@ -272,4 +296,5 @@ async function delProf(id) {
 }
 
 refresh();
+initDrop();
 </script></body></html>`;
