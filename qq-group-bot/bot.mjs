@@ -846,8 +846,8 @@ function parseDrawIntent(raw) {
   let t = String(raw ?? '').trim();
   t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
   if (!t || t.length > 80) return null;
-  // 明确要的是文字产物：接了必错，直接放行走正常对话
-  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词)/.test(t)) return null;
+  // 明确要的是文字/视频产物：接了必错，直接放行（视频走 vidgen 路由，别被画图闸抢走）
+  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词|视频|影片|动画)/.test(t)) return null;
   // 「画」必须在句首附近才算画图诉求（防「你上次画的大凤呢」这种越聊越歪的）
   const headDraw = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}画[\s\S]{1,60}$/.test(t);
   // 「画一张 X」「生成一张 X」：有量词就算（群里真实句式「生成一张赛车大凤」没有图字）

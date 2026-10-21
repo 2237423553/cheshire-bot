@@ -97,7 +97,7 @@ export const cfg = {
   // ── 文生视频（sui-xiang.net Grok 通道，异步任务制，只支持文生）──
   // grok-imagine-video=文生视频；grok-imagine-video-1.5=图生视频（勿混）
   // 提交后返回 request_id，轮询 /v1/videos/<id> 到 done 再下载，见 vidgen.mjs
-  vidgenUrl: 'https://www.sui-xiang.net/v1/videos/generations',
+  vidgenUrl: 'https://www.sui-xiang.vip/v1/videos/generations',
   vidgenKey: 'sk-在这里填你的生视频密钥',
   vidgenModel: 'grok-imagine-video-1.5',
   vidgenMaxSeconds: 15,   // 成片时长上限（脚本硬检查，超了弃用不发；提交不带 duration 走自动时长省额度）

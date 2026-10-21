@@ -31,29 +31,37 @@ export async function generateVideo(prompt) {
   const p = String(prompt ?? '').trim();
   if (!p) throw new Error('没给画面描述');
 
-  // ① 提交任务
+  // ① 提交任务（502/503/504 是中转侧网络波动，重试 2 次；审核/401 是终局错误不重试）
   let rid;
-  try {
-    const r = await fetch(cfg.vidgenUrl, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ model: cfg.vidgenModel, prompt: p, n: 1 }),
-      signal: AbortSignal.timeout(60 * 1000),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) {
-      const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-      if (/安全策略|合规|moderation/i.test(msg)) {
-        throw new Error('画面描述被生视频服务的安全审核拦截了——如实告诉指挥官生成不了，换个描述试试');
+  let lastErr = '';
+  for (let attempt = 0; attempt < 3 && !rid; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 3000));
+    try {
+      const r = await fetch(cfg.vidgenUrl, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ model: cfg.vidgenModel, prompt: p, n: 1 }),
+        signal: AbortSignal.timeout(60 * 1000),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) {
+        const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
+        if (/安全策略|合规|moderation/i.test(msg)) {
+          throw new Error('画面描述被生视频服务的安全审核拦截了——如实告诉指挥官生成不了，换个描述试试');
+        }
+        if (r.status === 401) throw new Error('生视频 API Key 无效（401）');
+        if (r.status === 429) throw new Error('生视频被限流（429），稍后再试');
+        if ([502, 503, 504].includes(r.status)) { lastErr = `HTTP ${r.status}`; continue; }
+        throw new Error(`提交生视频任务失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
       }
-      if (r.status === 401) throw new Error('生视频 API Key 无效（401）');
-      throw new Error(`提交生视频任务失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
+      rid = j.request_id;
+    } catch (e) {
+      // 终局错误（审核/401/429/其它明确报错）直接抛；瞬时问题记下最后一搏
+      if (e.name === 'TimeoutError') { lastErr = '提交超时'; continue; }
+      throw e;
     }
-    rid = j.request_id;
-  } catch (e) {
-    if (e.name === 'TimeoutError') throw new Error('提交生视频任务超时');
-    throw e;
   }
+  if (!rid) throw new Error(`提交生视频任务失败（重试 3 次都不行：${lastErr}）——稍后再试`);
   if (!rid) throw new Error('生视频接口没返回 request_id，可能改版了');
   console.log(`[bot] 🎬 生视频任务已提交：${rid}`);
 
