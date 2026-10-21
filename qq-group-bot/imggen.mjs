@@ -44,9 +44,9 @@ async function generateImageInner(prompt, attempt) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok || j.error) {
     const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-    // 中转的审核拦截长这样，翻译成人话给模型，让它如实转告
-    if (/安全策略|合规/.test(msg)) {
-      throw new Error('画面描述被生图服务的安全审核拦截了（这个中转审核很严，无关内容也可能误拦）——如实告诉指挥官画不了，建议换个描述再试');
+    // 中转的审核拦截长这样——当场拒绝、不重试（重试也没用），翻译成人话如实转告
+    if (/安全策略|合规|审核/.test(msg)) {
+      throw new Error('⛔ 这张图被生图服务的安全审核拒绝了（它审核很严，正常内容也可能误拒）——画不了，换个描述试试吧');
     }
     if (r.status === 401) throw new Error('生图 API Key 无效（401）');
     // 429 = 中转限流（今天连画几张很容易撞上）。有 Retry-After 就等一把重试一次，

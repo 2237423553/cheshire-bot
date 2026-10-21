@@ -52,8 +52,9 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       const j = await r.json().catch(() => ({}));
       if (!r.ok || j.error) {
         const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-        if (/安全策略|合规|moderation/i.test(msg)) {
-          throw new Error('画面描述被生视频服务的安全审核拦截了——如实告诉指挥官生成不了，换个描述试试');
+        if (/安全策略|合规|moderation|审核/i.test(msg)) {
+          // 审核=当场拒绝，不重试（重试也没用）
+          throw new Error('⛔ 这个描述被生视频服务的安全审核拒绝了——生成不了，换个描述试试吧');
         }
         if (r.status === 401) throw new Error('生视频 API Key 无效（401）');
         if (r.status === 429) throw new Error('生视频被限流（429），稍后再试');
