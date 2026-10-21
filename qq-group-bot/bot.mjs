@@ -1221,44 +1221,9 @@ bot.onGroupMessage(async (event, ctx) => {
     if (!drawVeto) return;   // 接管成功或失败都到此为止；被否决才放行到正常对话
   }
 
-  // ── 生视频意图强制路由（2026-10-21 上线，grok-imagine-video 文生通道）──
-  // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
-  // 生成是分钟级，ack 要说清楚「要几分钟」；失败/被审核拦都明着报。
-  const videoSubj = atMe ? parseVideoIntent(userText) : null;
-  let vidVeto = false;
-  if (videoSubj) {
-    const sid = `vid-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
-    try {
-      const prompt = await translateVideoPrompt(sid, videoSubj);
-      if (!prompt) {
-        vidVeto = true;
-        console.log(`[bot] 群 ${gid} 生视频意图被翻译层否决 <- ${videoSubj.slice(0, 18)}`);
-      } else {
-        console.log(`[bot] 🎬 意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
-        await ctx.reply(text(`正在给指挥官生成视频喵，这个要几分钟，先去干点别的别干等～`));
-
-        const buf = await vidgen.generateVideo(prompt);
-        // 视频比图大（实测 5.5MB/8s），highway 上传更慢，超时给到 5 分钟
-        await http.raw('send_group_msg', {
-          group_id: Number(gid),
-          message: [{ type: 'video', data: { file: 'base64://' + buf.toString('base64') } }],
-        }, { timeoutMs: 300 * 1000 });
-        const caption = `生成好啦喵～给指挥官做的是：${videoSubj}`;
-        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
-
-        // 进对话线（纯文字），之后可以接着聊这条视频
-        pushHistory(gid, 'user', videoSubj, `${displayName(event)}: ${videoSubj} [要求生视频]`);
-        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已生成视频: ${videoSubj}] ${caption}`);
-      }
-    } catch (e) {
-      console.error(`[bot] 群 ${gid} 生视频出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${String(e.message).slice(0, 100)}`)); }
-      catch (e2) { console.error('[bot] 生视频失败提示也发不出去：', e2.message); }
-    } finally {
-      promptTokens.delete(sid);
-    }
-    if (!vidVeto) return;
-  }
+  // ── 生视频意图强制路由（2026-10-21 上线）─────────────
+  // 放在 buildContent 之后（见下方调用处）：要支持图生视频，图来自消息本体或引用。
+  // 这里只留个声明位，实际接管在 buildContent 拿到媒体之后。
 
   // ── 管理指令：不走 LLM、不耗 token、立即返回 ──
   if (cmd) {
@@ -1283,6 +1248,54 @@ bot.onGroupMessage(async (event, ctx) => {
     try {
       await ctx.reply(text(`⚠️ [媒体] ${content.mediaErrors.join('；')}`));
     } catch { /* 发不出去就算了，别影响后面的回复 */ }
+  }
+
+  // ── 生视频意图强制路由（2026-10-21 上线；下午起支持图生视频）──
+  // 放在 buildContent 之后：图生视频的图来自消息本体或引用（expandReplySegs 已并进 parts）。
+  // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
+  const videoSubj = atMe ? parseVideoIntent(userText) : null;
+  let vidVeto = false;
+  if (videoSubj) {
+    const sid = `vid-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
+    try {
+      // 图生视频：拿本轮视觉里的第一张图（消息附带的或引用里的都算）
+      const imgPart = content.parts.find((p) =>
+        p.type === 'image_url' && String(p.image_url?.url ?? '').startsWith('data:'));
+      const imgDataUrl = imgPart ? imgPart.image_url.url : '';
+
+      const prompt = await translateVideoPrompt(sid, videoSubj);
+      if (!prompt) {
+        vidVeto = true;
+        console.log(`[bot] 群 ${gid} 生视频意图被翻译层否决 <- ${videoSubj.slice(0, 18)}`);
+      } else {
+        console.log(`[bot] 🎬 ${imgDataUrl ? '图生视频' : '文生视频'}意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        await ctx.reply(text(imgDataUrl
+          ? `收到喵，按指挥官给的图生视频，要几分钟，别干等～`
+          : `正在给指挥官生成视频喵，这个要几分钟，先去干点别的别干等～`));
+
+        const buf = await vidgen.generateVideo(prompt, imgDataUrl);
+        // 视频比图大（实测 5.5MB/8s），highway 上传更慢，超时给到 5 分钟
+        await http.raw('send_group_msg', {
+          group_id: Number(gid),
+          message: [{ type: 'video', data: { file: 'base64://' + buf.toString('base64') } }],
+        }, { timeoutMs: 300 * 1000 });
+        const caption = imgDataUrl
+          ? `生成好啦喵～按指挥官给的图做的是：${videoSubj}`
+          : `生成好啦喵～给指挥官做的是：${videoSubj}`;
+        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+
+        // 进对话线（纯文字），之后可以接着聊这条视频
+        pushHistory(gid, 'user', videoSubj, `${displayName(event)}: ${videoSubj} [要求生视频${imgDataUrl ? '，按图' : ''}]`);
+        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已生成视频: ${videoSubj}] ${caption}`);
+      }
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 生视频出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${String(e.message).slice(0, 100)}`)); }
+      catch (e2) { console.error('[bot] 生视频失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);
+    }
+    if (!vidVeto) return;
   }
 
   try {

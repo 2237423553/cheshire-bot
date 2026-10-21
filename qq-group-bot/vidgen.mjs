@@ -26,8 +26,9 @@ function authHeaders() {
   };
 }
 
-/** 画一段视频，返回 mp4 Buffer。失败抛 Error（消息给群里看） */
-export async function generateVideo(prompt) {
+/** 画一段视频，返回 mp4 Buffer。失败抛 Error（消息给群里看）。
+ *  imageDataUrl 有值 = 图生视频（1.5 看家本领）：实测 image_url 填 data URL 字符串即可 */
+export async function generateVideo(prompt, imageDataUrl = '') {
   const p = String(prompt ?? '').trim();
   if (!p) throw new Error('没给画面描述');
 
@@ -40,7 +41,12 @@ export async function generateVideo(prompt) {
       const r = await fetch(cfg.vidgenUrl, {
         method: 'POST',
         headers: authHeaders(),
-        body: JSON.stringify({ model: cfg.vidgenModel, prompt: p, n: 1 }),
+        body: JSON.stringify({
+          model: cfg.vidgenModel,
+          prompt: p,
+          n: 1,
+          ...(imageDataUrl ? { image_url: imageDataUrl } : {}),
+        }),
         signal: AbortSignal.timeout(60 * 1000),
       });
       const j = await r.json().catch(() => ({}));
