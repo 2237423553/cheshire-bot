@@ -33,6 +33,9 @@
               ├ bot.mjs        主程序：消息流 / 工具循环 / 指令 / 媒体 / 上下文
               ├ bilibili.mjs   B站看片引擎（直链直传 + 拒答重试）
               ├ exa.mjs        Exa MCP 客户端（搜索/抓取）
+              ├ api-panel.mjs / panel-page.mjs   本地 API 配置面板（Web）
+              ├ probe-suite.mjs                  四件套探测（基础/思考档/工具/视觉）
+              ├ llm-state.mjs / botctl.mjs       llmstate+档案唯一写入口 / 机器人进程控制
               ├ wt.mjs         战争雷霆战绩查询（Thunderskill）
               ├ imggen.mjs     文生图客户端
               ├ vidgen.mjs     文生/图生视频客户端（异步任务：提交→轮询→下载）
@@ -51,14 +54,16 @@
 4. **前置**：本机装 NTQQ（9.9.x；经典版不支持）并登录机器人的 QQ 号
 5. **双击 `一键启动.cmd`**：自动停旧实例 → 起 SnowLuma + 机器人 → 弹管理后台 → 12 项自检
 
-日常：重启就再点一次（幂等）；换模型双击 `切换模型.cmd`（先验证再写盘）；
+日常：重启就再点一次（幂等）；换模型双击 **「切换面板.cmd」**（本地网页：表单填 API → 拉模型列表 → 四件套探测 → 一键切换，适合不想碰命令行）、
+或 `切换模型.cmd`（命令行：先验证再写盘）；
 日志在 `qq-group-bot/bot.log`（正常）和 `bot.err`（报错走 stderr）。
 
 ## 自定义
 
-- **更换 LLM API**：双击「切换模型.cmd」（交互式：地址 → Key → 拉列表 → 选 → 验证通过才切换），
-  或命令行 `bun run switch-model.mjs <url> <key> [model]`，或直接改 `config.mjs` 默认值。
-  回滚 = 删掉 `llmstate.json`。换服务商要探的四件事见 [docs/01 · 8.1](docs/01-部署与配置.md)
+- **更换 LLM API**：双击「切换面板.cmd」（推荐，本地网页：表单 + 模型下拉 + **四件套自动探测**
+  基础/思考档/工具/视觉 + 配置档案管理），或「切换模型.cmd」命令行（掩码输 Key、`--probe`
+  四件套、`--list`），或直接改 `config.mjs` 默认值。
+  回滚 = 删掉 `llmstate.json`。换服务商要探的四件事已自动化（面板/`--probe`）
 - **更改人设 / 提示词**：全部集中在 `config.mjs`——`systemPrompt`（人设 + 铁律 + 能力边界）、
   `eatPrompt`（#吃什么 文案语气）、`beaconTrigger/beaconReply`（信标词）。
   改完重启生效，验证三步见 [docs/01 · 8.2](docs/01-部署与配置.md)

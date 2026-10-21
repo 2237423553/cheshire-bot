@@ -1,11 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  服务商探测 —— 给「#接口 / #切换」用
+//  服务商探测库 —— 「切换模型.cmd / API 面板」共用的纯函数层（无 fs、无状态）
 //
 //  职责：
 //    1. 把指挥官粘进来的地址补成真正的 chat/completions 端点
-//       （官网控制台页面地址也认，会映射到对应 API）
+//       （官网控制台页面/常见大厂首页也认，PRESETS 映射到对应 API）
 //    2. 拉模型列表（GET .../models）
-//    3. 用一个极小请求验证「URL + Key + 模型」能不能跑通
+//    3. 用一个极小请求验证「URL + Key + 模型」能不能跑通（probeModel）
+//    4. 统一底层请求 chatOnce（四件套探测 probe-suite.mjs 也走这里）
 //
 //  独立成文件是为了能脱离 QQ 单测：`bun run providers.mjs <url> <key>`
 // ═══════════════════════════════════════════════════════════════════════
@@ -14,6 +15,13 @@
 const PRESETS = [
   [/^https?:\/\/(?:www\.)?opencode\.ai\/console\//i, 'https://opencode.ai/zen/go/v1/chat/completions'],
   [/^https?:\/\/(?:www\.)?commandcode\.ai\/(?:console|provider)/i, 'https://api.commandcode.ai/provider/v1/chat/completions'],
+  // ── 2026-10-21 扩充：常见中转/大厂（粘官网首页/控制台页也能映射）──
+  [/^https?:\/\/(?:www\.)?platform\.deepseek\.com/i, 'https://api.deepseek.com/v1/chat/completions'],
+  [/^https?:\/\/(?:www\.)?(?:kimi\.com|platform\.moonshot\.cn)/i, 'https://api.moonshot.cn/v1/chat/completions'],
+  [/^https?:\/\/(?:[a-z0-9-]+\.)*bigmodel\.cn/i, 'https://open.bigmodel.cn/api/paas/v4/chat/completions'],   // 智谱没有 /v1（open./www. 等子域都认）
+  [/^https?:\/\/(?:www\.)?siliconflow\.(?:cn|com)/i, 'https://api.siliconflow.cn/v1/chat/completions'],
+  [/^https?:\/\/(?:www\.)?openrouter\.ai\/(?:keys|settings|activity)/i, 'https://openrouter.ai/api/v1/chat/completions'],  // openrouter.ai/api/v1 结尾的地址已被通用规则兜住，这里兜它的站点页
+  [/^https?:\/\/(?:127\.0\.0\.1|localhost):11434/i, 'http://127.0.0.1:11434/v1/chat/completions'],     // Ollama 本地
 ];
 
 /** 补成 chat/completions 端点 */
@@ -67,12 +75,53 @@ function withExtra(base, extra) {
   return { ...base, ...(extra ?? {}) };
 }
 
+/** key 为空时别带 Authorization（Ollama 本地等服务空 key 反而会被拒） */
+function authHeaders(key, extra) {
+  const base = key
+    ? { 'Authorization': `Bearer ${key}` }
+    : {};
+  return withExtra(base, extra);
+}
+
+/** 统一底层请求：拼头 + fetch + 超时 + 错误分类。探测全家桶共用这一个口。
+ *  返回 { ok, status, json, txt, latencyMs }；失败（超时/网络）抛 Error。
+ *  2xx 但带 error 字段不算传输失败——交给调用方按业务判定。 */
+export async function chatOnce(chatUrl, key, body, extraHeaders, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 45 * 1000;
+  const t0 = Date.now();
+  let r;
+  try {
+    r = await fetch(chatUrl, {
+      method: 'POST',
+      headers: withExtra({
+        ...authHeaders(key, {}),
+        'Content-Type': 'application/json',
+        'User-Agent': 'qq-group-bot/1.0',
+        'x-opencode-session': opts.session ?? 'probe-suite',
+      }, extraHeaders),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+      const err = new Error(`请求超时（>${Math.round(timeoutMs / 1000)}s）`);
+      err.kind = 'timeout';
+      throw err;
+    }
+    throw e;
+  }
+  const txt = await r.text();
+  let json = null;
+  try { json = JSON.parse(txt); } catch { /* 非 JSON 交给调用方 */ }
+  return { ok: r.ok, status: r.status, json, txt, latencyMs: Date.now() - t0 };
+}
+
 /** 拉模型列表，返回模型 ID 数组 */
 export async function fetchModels(chatUrl, key, extraHeaders) {
   const url = modelsUrlOf(chatUrl);
   const r = await fetch(url, {
     headers: withExtra({
-      'Authorization': `Bearer ${key}`,
+      ...authHeaders(key, {}),
       'Accept': 'application/json',
       'User-Agent': 'qq-group-bot/1.0',
     }, extraHeaders),
@@ -92,29 +141,17 @@ export async function fetchModels(chatUrl, key, extraHeaders) {
   return ids;
 }
 
-/** 极小请求验证一组配置；HTTP 非 2xx 或带 error 就抛错 */
+/** 极小请求验证一组配置；HTTP 非 2xx 或带 error 就抛错（chatOnce 的薄包装，行为与老版一致） */
 export async function probeModel(chatUrl, key, model, extraHeaders) {
-  const r = await fetch(chatUrl, {
-    method: 'POST',
-    headers: withExtra({
-      'Authorization': `Bearer ${key}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'qq-group-bot/1.0',
-      'x-opencode-session': 'probe-switch',
-    }, extraHeaders),
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 16,
-    }),
-  });
-  const txt = await r.text();
-  let j = null;
-  try { j = JSON.parse(txt); } catch { /* 非 JSON 就看原文 */ }
-  if (!r.ok || j?.error) {
-    throw new Error(`HTTP ${r.status} ${JSON.stringify(j?.error ?? txt).slice(0, 140)}`);
+  const { ok, status, json, txt } = await chatOnce(chatUrl, key, {
+    model,
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 16,
+  }, extraHeaders, { session: 'probe-switch' });
+  if (!ok || json?.error) {
+    throw new Error(`HTTP ${status} ${JSON.stringify(json?.error ?? txt).slice(0, 140)}`);
   }
-  return j?.choices?.[0]?.message ?? {};
+  return json?.choices?.[0]?.message ?? {};
 }
 
 // ── 命令行自测：bun run providers.mjs <url> <key> [model] [headers] ──
