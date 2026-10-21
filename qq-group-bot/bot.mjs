@@ -27,6 +27,7 @@ const groupSummary = new Map();   // gid -> 压缩后的历史摘要
 const promptTokens = new Map();   // gid -> 上次请求的真实 prompt_tokens
 const repeatState = new Map();    // gid -> 上一条消息 { sig, sender, joined }，用来识别「+1 复读」
 const eatHistory = new Map();     // gid -> 最近推过的菜名，用来避免老推同样的几样
+const lastDrawByGroup = new Map(); // gid -> 最近一次画图 { prompt, subj, at }，供「改一下/重画」改稿路由用
 
 /**
  * content 可以是字符串（纯文字），也可以是 parts 数组（带图片/视频）。
@@ -442,7 +443,17 @@ async function generateImageTool(args, gid) {
     buf = await imggen.generateImage(args.prompt);
   } catch (e) {
     console.warn('[bot] 生图失败:', e.message);
-    return '画画失败：' + e.message;
+    // 失败原因别指望模型转告（它有时就吞了）——脚本直接发群里，返回值只要它别重复
+    try {
+      await http.raw('send_group_msg', {
+        group_id: Number(gid),
+        message: [text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)],
+      }, { timeoutMs: 60 * 1000 });
+      return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
+    } catch (e2) {
+      console.error('[bot] 失败提示也发不出去:', e2.message);
+      return '画画失败：' + e.message;
+    }
   }
   try {
     // 2~3MB 图走 highway 上传可能超过 SDK 默认 30s，实测超时报「发送失败」其实 QQ 侧还在传
@@ -525,8 +536,9 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     if (!toolCalls?.length) {
       const content = cleanToolArtifacts(msg.content ?? '');
       // 模型有样学样：上下文里全是「画好啦喵～」的成功句式，它就会跳过工具直接编一句。
-      // 声称画好了但这轮没调过画图工具 => 图不存在，当场戳穿让它重画或如实说。
-      if (!drewImage && /画好|画完|图片已(生成|发)/.test(content)) {
+      // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
+      // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
+      if (!drewImage && /画好|画完|图片已(生成|发)|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
         messages.push({
           role: 'user',
           content: '[系统提示：你说「画好了」，但这一轮你并没有真的调用 generate_image 工具，群里的图片并不存在。' +
@@ -808,18 +820,21 @@ function parseDrawIntent(raw) {
 /**
  * 把画图诉求翻成英文生图 prompt（独立小会话，不吃群记忆、不占上下文、不带工具）。
  * 翻译层带否决权：根本不是画图诉求时回复 NO，路由退回正常对话（双保险）。
+ * prevPrompt 有值 = 改稿模式：这是对上一次成图的修改请求，翻成「修改版 prompt」。
  * 返回 null = 否决或空译文。
  */
-async function translateDrawPrompt(sid, subj) {
+async function translateDrawPrompt(sid, subj, prevPrompt = '') {
   try {
+    const sys = prevPrompt
+      ? `这是对上一次 AI 生成图片的修改请求。上一次使用的英文生图 prompt：\n${prevPrompt}\n\n` +
+        '按用户的反馈修改这张图的 prompt：只改被点名的部分，没提到的保持原样，' +
+        '直接输出修改后的完整英文 prompt（30~80 词），无解释、无引号。' +
+        '如果用户的反馈根本不是在要求修改这张图（纯闲聊/问别的事），只回复 NO。'
+      : '你是文生图 prompt 翻译器。把用户请求翻成一段高质量的英文生图 prompt：' +
+        '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（30~80 词英文），无解释、无引号。' +
+        '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。';
     const msg = await callLLM(sid, [
-      {
-        role: 'system',
-        content:
-          '你是文生图 prompt 翻译器。把用户请求翻成一段高质量的英文生图 prompt：' +
-          '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（30~80 词英文），无解释、无引号。' +
-          '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。',
-      },
+      { role: 'system', content: sys },
       { role: 'user', content: subj },
     ], false);
     const p = cleanToolArtifacts(msg.content ?? '').trim();
@@ -1105,23 +1120,35 @@ bot.onGroupMessage(async (event, ctx) => {
     return;
   }
 
-  // ── 画图意图强制路由（2026-10-20 上线）──
+  // ── 画图意图强制路由（2026-10-20 上线；10-21 加改稿路由）──
   // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
   // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
   // 全程模型没有「装成功」的机会（翻 prompt 那步模型只当翻译器）。
-  const drawSubj = atMe ? parseDrawIntent(userText) : null;
+  // 改稿路由：刚画过的 10 分钟内，「性别错了/改一下/重画」这类没有画图句式的
+  // 追加意见也接管重画（沿用上次 prompt + 用户反馈），否则模型只会嘴上答应不干活。
+  const lastDraw = lastDrawByGroup.get(gid);
+  const drawSubj = atMe ? (parseDrawIntent(userText)
+    ?? (lastDraw
+      && Date.now() - lastDraw.at < 10 * 60 * 1000
+      && userText.length <= 60
+      && /(改|换|重画|重新画|不对|错了|不像|性别|再来|画错|加个|不要)/.test(userText)
+      ? userText : null)) : null;
+  const isRedraw = !!(drawSubj && !parseDrawIntent(userText) && lastDraw
+    && Date.now() - lastDraw.at < 10 * 60 * 1000);
   let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
   if (drawSubj) {
     const sid = `img-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
     try {
-      const prompt = await translateDrawPrompt(sid, drawSubj);
+      const prompt = await translateDrawPrompt(sid, drawSubj, isRedraw ? lastDraw.prompt : '');
       if (!prompt) {
         // 翻译层否决：不是画图诉求，走正常对话继续
         drawVeto = true;
         console.log(`[bot] 群 ${gid} 画图意图被翻译层否决 <- ${drawSubj.slice(0, 18)}`);
       } else {
-        console.log(`[bot] 🎨 意图路由接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
-        await ctx.reply(text(`正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
+        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        await ctx.reply(text(isRedraw
+          ? `收到喵，按「${drawSubj.slice(0, 20)}」重新画，要等十几秒～`
+          : `正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
 
         // 路由本身有 drewImage 语义：走到这步就必然真生成真发送，不存在嘴遁环节
         const buf = await imggen.generateImage(prompt);
@@ -1130,16 +1157,23 @@ bot.onGroupMessage(async (event, ctx) => {
           group_id: Number(gid),
           message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
         }, { timeoutMs: 120 * 1000 });
-        const caption = `画好啦喵～给指挥官画的是：${drawSubj}`;
+        const caption = isRedraw
+          ? `改好啦喵～按「${drawSubj.slice(0, 30)}」重新画了一版`
+          : `画好啦喵～给指挥官画的是：${drawSubj}`;
         await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
 
+        // 记下这次的 prompt：10 分钟内的「改一下/性别错了」能接着改稿
+        lastDrawByGroup.set(gid, { prompt, subj: drawSubj, at: Date.now() });
+
         // 进对话线（纯文字）：user 记诉求、assistant 记 [已画图]，之后可以接着聊这张画
-        pushHistory(gid, 'user', drawSubj, `${displayName(event)}: ${drawSubj} [要求画图]`);
+        pushHistory(gid, 'user', drawSubj, `${displayName(event)}: ${drawSubj}${isRedraw ? ' [要求改图]' : ' [要求画图]'}`);
         pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已画图: ${drawSubj}] ${caption}`);
       }
     } catch (e) {
       console.error(`[bot] 群 ${gid} 画图出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)); } catch { /* 发不出去就算了 */ }
+      // 失败提示必须送达（22:41 事故：只 log 没发群里，指挥官干等）；再发不出去也留痕
+      try { await ctx.reply(text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)); }
+      catch (e2) { console.error('[bot] 画图失败提示也发不出去：', e2.message); }
     } finally {
       promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
     }
