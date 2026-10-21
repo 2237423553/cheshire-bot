@@ -99,7 +99,7 @@ export const cfg = {
   // 提交后返回 request_id，轮询 /v1/videos/<id> 到 done 再下载，见 vidgen.mjs
   vidgenUrl: 'https://www.sui-xiang.net/v1/videos/generations',
   vidgenKey: 'sk-在这里填你的生视频密钥',
-  vidgenModel: 'grok-imagine-video',
+  vidgenModel: 'grok-imagine-video-1.5',
 
   // ── 网络搜索 / 网页抓取（Exa MCP Server，2026-10-17 从直连 REST 改为 MCP）──
   // 实测无需 API key 即可用；若被限流，可在 URL 后追加 ?exaApiKey=你的key
