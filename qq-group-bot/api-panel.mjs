@@ -25,6 +25,8 @@ const SWITCH_PATH = path.join(__dir, 'switches.json');
 const MEDIA_PATH = path.join(__dir, 'mediaapi.json');
 const SWITCH_KEYS = ['imggen', 'vidgenEnabled', 'bilibili', 'search', 'repeat', 'beacon'];
 const MEDIA_KEYS = ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize', 'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds'];
+const PROMPT_PATH = path.join(__dir, 'prompt.json');
+const PROMPT_LIMIT = 8000;   // 提示词最长字符（防手滑把 10 万字灌进每条消息）
 const OPEN_BROWSER = process.argv.includes('--open');
 const PORTS = [5098, 5097, 5096, 5095, 5094, 5093, 5092, 5091, 5090];
 
@@ -208,6 +210,31 @@ async function route(req, port) {
     // 真花一张图的钱实测（最小 prompt，生成结果不进群、直接丢弃）
     const buf = await imggen.generateImage('a simple red circle on a white background');
     return json({ ok: true, bytes: buf.length });
+  }
+
+  // ── 自定义提示词（prompt.json；config.mjs 启动时合并，改完重启 bot 生效）──
+  if (path === '/api/prompt' && req.method === 'GET') {
+    const saved = readJson(PROMPT_PATH) ?? {};
+    return json({
+      systemPrompt: cfg.systemPrompt, eatPrompt: cfg.eatPrompt,
+      overridden: { systemPrompt: typeof saved.systemPrompt === 'string', eatPrompt: typeof saved.eatPrompt === 'string' },
+      limit: PROMPT_LIMIT,
+    });
+  }
+  if (path === '/api/prompt' && req.method === 'POST') {
+    const b = await bodyJson(req);
+    const cur = readJson(PROMPT_PATH) ?? {};
+    const merged = { ...cur };
+    for (const k of ['systemPrompt', 'eatPrompt']) {
+      if (!(k in b)) continue;
+      const v = String(b[k] ?? '');
+      if (v.trim() === '') { delete merged[k]; continue; }   // 存空 = 恢复 config 默认
+      if (v.length > PROMPT_LIMIT) return json({ error: `${k} 超过 ${PROMPT_LIMIT} 字上限（现在 ${v.length} 字）` }, 400);
+      merged[k] = v;
+    }
+    writeJsonAtomic(PROMPT_PATH, merged);
+    console.log('[panel] 自定义提示词已保存（重启 bot 生效）');
+    return json({ ok: true, note: '重启 bot 后生效', reset: Object.keys(merged).filter((k) => !merged[k]) });
   }
   return json({ error: '未知接口' }, 404);
 }

@@ -103,6 +103,16 @@ export const PAGE_HTML = `<!doctype html>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('vidgen')">保存生视频配置</button></div>
 <div class="hint">没放实测按钮——生视频按次计费，验证就烧一把额度；营业与否用「功能开关」里的生视频闸</div></div>
 
+<div class="card"><h2>自定义提示词</h2>
+<table class="kv">
+<tr><td>人设</td><td><textarea id="p_sys" rows="7" maxlength="8000"></textarea>
+<div class="row" style="margin-top:2px"><span class="hint" id="p_sys_meta"></span></div></td></tr>
+<tr><td>#吃什么文案</td><td><textarea id="p_eat" rows="5" maxlength="8000"></textarea>
+<div class="row" style="margin-top:2px"><span class="hint" id="p_eat_meta"></span></div></td></tr>
+</table>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="savePrompt()">保存提示词</button><button onclick="resetPrompt()">清掉自定义（回到 config.mjs 默认）</button></div>
+<div class="hint">「人设」= systemPrompt（性格/铁律/能力边界都在这）；保存后重启机器人生效；写空存盘 = 恢复默认</div></div>
+
 <div id="sw_modal" style="display:none;position:fixed;inset:0;background:#000b;z-index:99" onclick="if(event.target===this)closeSw()">
 <div style="background:var(--card);max-width:380px;margin:90px auto;border:1px solid var(--line);border-radius:12px;padding:16px 20px">
 <h2 style="color:var(--acc);font-size:13px;margin-bottom:10px">功能开关（保存即刻生效，不用重启）</h2>
@@ -390,7 +400,43 @@ async function testImggen() {
   } catch (e) { bar('生图实测失败：' + e.message, 'bad'); }
 }
 
+// ── 自定义提示词 ──
+const P_LIMIT = 8000;
+function pMeta(ta, meta, saved) {
+  const n = $(ta).value.length;
+  $(meta).textContent = n + ' / ' + P_LIMIT + ' 字' + (saved ? ' · 当前生效的是自定义版' : ' · 当前生效的是 config.mjs 默认');
+}
+async function loadPrompt() {
+  try {
+    const j = await api('/api/prompt');
+    $('p_sys').value = j.systemPrompt || ''; $('p_eat').value = j.eatPrompt || '';
+    pMeta('p_sys', 'p_sys_meta', j.overridden.systemPrompt);
+    pMeta('p_eat', 'p_eat_meta', j.overridden.eatPrompt);
+  } catch (e) { bar('读提示词失败：' + e.message, 'bad'); }
+}
+async function savePrompt() {
+  const sys = $('p_sys').value, eat = $('p_eat').value;
+  if ((sys.length > P_LIMIT) || (eat.length > P_LIMIT)) return bar('超过 ' + P_LIMIT + ' 字上限', 'bad');
+  if (!sys.trim() && !eat.trim()) return bar('两个都清空等于恢复默认——用「清掉自定义」按钮', 'bad');
+  try {
+    await api('/api/prompt', { method: 'POST', body: JSON.stringify({ systemPrompt: sys, eatPrompt: eat }) });
+    bar('提示词已保存 —— 重启机器人后生效', 'ok');
+    loadPrompt();
+    if (confirm('现在重启机器人让新提示词生效？')) await doRestart(false, true);
+  } catch (e) { bar('保存失败：' + e.message, 'bad'); }
+}
+async function resetPrompt() {
+  if (!confirm('清掉自定义提示词，回到 config.mjs 默认？（重启后生效）')) return;
+  try {
+    await api('/api/prompt', { method: 'POST', body: JSON.stringify({ systemPrompt: '', eatPrompt: '' }) });
+    bar('自定义已清掉 —— 重启机器人后回到默认', 'ok');
+    loadPrompt();
+    if (confirm('现在重启机器人？')) await doRestart(false, true);
+  } catch (e) { bar('清掉失败：' + e.message, 'bad'); }
+}
+
 refresh();
 initDrop();
 loadMedia();
+loadPrompt();
 </script></body></html>`;

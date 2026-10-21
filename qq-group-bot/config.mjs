@@ -148,3 +148,16 @@ try {
 } catch {
   // 没这个文件就全用上面的默认值
 }
+
+// ── 自定义提示词覆盖（API 面板写 prompt.json；改完重启 bot 生效）──
+// systemPrompt = 人设/铁律/能力边界；eatPrompt = #吃什么 的推荐语格式
+// 删掉文件即回滚到上面写的默认值
+const PROMPT_FILE = path.join(__dir, 'prompt.json');
+try {
+  const o = JSON.parse(fs.readFileSync(PROMPT_FILE, 'utf8'));
+  for (const k of ['systemPrompt', 'eatPrompt']) {
+    if (typeof o[k] === 'string' && o[k].trim() !== '') cfg[k] = o[k];
+  }
+} catch {
+  // 没这个文件就全用上面的默认值
+}
