@@ -1,7 +1,17 @@
-# 柴郡 QQ 群机器人
+# 柴郡 QQ 群机器人 / Cheshire QQ Group Bot
 
 > QQ 群聊机器人：@ 对话（文字/图片/视频）、**B站链接自动总结**、联网搜索、上下文记忆。
 > **仓库不含任何密钥**，也不含 SnowLuma 本体（需单独安装）。
+
+## 🇬🇧 English Quick Look
+
+A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself (playurl direct-stream → multimodal model) and summarizes it, asks her to **draw** something and the image lands right in the group (gpt-image-2), or generate **videos** from text and images (Grok Imagine, ≤15 s). Extras: web search (Exa MCP), context memory with auto-compression, admin commands, and a **local web config panel** with provider presets (OpenCode / DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama) and an automatic 4-point probe (basic generation / thinking modes / tool calling / vision).
+
+- **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM (default: MiMo)
+- **This repo contains no keys** — fill your own in `config.mjs` (placeholders marked); SnowLuma is a separate install
+- Docs are in Chinese (docs/01–03 + 更新公告 with an English summary at top); code comments are Chinese too, but the code itself is straightforward to read
+
+> 中文文档从下一节开始 / Chinese docs start below ↓
 
 ## 功能一览
 
