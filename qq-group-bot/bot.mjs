@@ -12,6 +12,7 @@ import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
 import * as imggen from './imggen.mjs';
+import * as vidgen from './vidgen.mjs';
 import { extractBvLink, summarizeVideo } from './bilibili.mjs';
 
 // ─────────── 限制 ───────────
@@ -795,6 +796,46 @@ function parseWtCommand(raw) {
 }
 
 /**
+ * 生视频意图识别（和画图同理，宁漏勿错）。
+ * 必须同时有「视频/影片/动画」关键词 + 动作词；纯提「视频」俩字不接。
+ * 注意：parseDrawIntent 的文字产物名单里含「视频」，两闸互斥不抢活。
+ */
+function parseVideoIntent(raw) {
+  let t = String(raw ?? '').trim();
+  t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
+  if (!t || t.length > 80) return null;
+  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词)/.test(t)) return null;
+  if (!/(视频|影片|动画)/.test(t)) return null;
+  if (!/(?:生成|画|做|来|出|拍|给我)/.test(t)) return null;
+  return t;
+}
+
+/**
+ * 把生视频诉求翻成英文视频 prompt（独立小会话 vid-<gid>）。
+ * 同翻译层否决权：不是要视频就 NO，放行正常对话。
+ */
+async function translateVideoPrompt(sid, subj) {
+  try {
+    const msg = await callLLM(sid, [
+      {
+        role: 'system',
+        content:
+          '你是文生视频 prompt 翻译器。把用户请求翻成一段高质量的英文生视频 prompt：' +
+          '描述场景、主体、动作/镜头运动、氛围（30~80 词英文），直接输出 prompt 本身，无解释、无引号。' +
+          '如果用户的请求根本不是要生成一段视频（要代码/文字/图片/闲聊等），只回复 NO。',
+      },
+      { role: 'user', content: subj },
+    ], false);
+    const p = cleanToolArtifacts(msg.content ?? '').trim();
+    if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
+    return p.slice(0, 800);
+  } catch (e) {
+    console.warn('[bot] 生视频 prompt 翻译失败:', e.message);
+    return null;
+  }
+}
+
+/**
  * 画图意图识别（意图强制路由的闸门）。
  * 命中：@ 后「画…」开头（画一张/画个/画大凤…），或「生成/来/出 …图(片/照片)」句式。
  * 原则：**宁漏勿错** —— 文字类产物（代码/脚本/文档…）绝对不接画，闲聊疑似灵活放行。
@@ -1178,6 +1219,45 @@ bot.onGroupMessage(async (event, ctx) => {
       promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
     }
     if (!drawVeto) return;   // 接管成功或失败都到此为止；被否决才放行到正常对话
+  }
+
+  // ── 生视频意图强制路由（2026-10-21 上线，grok-imagine-video 文生通道）──
+  // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
+  // 生成是分钟级，ack 要说清楚「要几分钟」；失败/被审核拦都明着报。
+  const videoSubj = atMe ? parseVideoIntent(userText) : null;
+  let vidVeto = false;
+  if (videoSubj) {
+    const sid = `vid-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
+    try {
+      const prompt = await translateVideoPrompt(sid, videoSubj);
+      if (!prompt) {
+        vidVeto = true;
+        console.log(`[bot] 群 ${gid} 生视频意图被翻译层否决 <- ${videoSubj.slice(0, 18)}`);
+      } else {
+        console.log(`[bot] 🎬 意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        await ctx.reply(text(`正在给指挥官生成视频喵，这个要几分钟，先去干点别的别干等～`));
+
+        const buf = await vidgen.generateVideo(prompt);
+        // 视频比图大（实测 5.5MB/8s），highway 上传更慢，超时给到 5 分钟
+        await http.raw('send_group_msg', {
+          group_id: Number(gid),
+          message: [{ type: 'video', data: { file: 'base64://' + buf.toString('base64') } }],
+        }, { timeoutMs: 300 * 1000 });
+        const caption = `生成好啦喵～给指挥官做的是：${videoSubj}`;
+        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+
+        // 进对话线（纯文字），之后可以接着聊这条视频
+        pushHistory(gid, 'user', videoSubj, `${displayName(event)}: ${videoSubj} [要求生视频]`);
+        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已生成视频: ${videoSubj}] ${caption}`);
+      }
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 生视频出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${String(e.message).slice(0, 100)}`)); }
+      catch (e2) { console.error('[bot] 生视频失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);
+    }
+    if (!vidVeto) return;
   }
 
   // ── 管理指令：不走 LLM、不耗 token、立即返回 ──
