@@ -67,6 +67,7 @@
 - **更改人设 / 提示词**：全部集中在 `config.mjs`——`systemPrompt`（人设 + 铁律 + 能力边界）、
   `eatPrompt`（#吃什么 文案语气）、`beaconTrigger/beaconReply`（信标词）。
   改完重启生效，验证三步见 [docs/01 · 8.2](docs/01-部署与配置.md)
+- **功能开关**：面板「功能开关」子窗（即刻生效）或手改 `qq-group-bot/switches.json`；生图/生视频的端点/Key 在面板「生图 API / 生视频 API」卡里改（写 `mediaapi.json`，重启生效）
 
 ## 文档（细节都在这里）
 

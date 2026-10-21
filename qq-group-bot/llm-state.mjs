@@ -23,6 +23,21 @@ function writeAtomic(file, obj) {
   fs.renameSync(tmp, file);
 }
 
+/** 给面板等邻域模块用的通用原子写（switches.json / mediaapi.json 也走这套，别自己 fs.writeFileSync） */
+export function writeJsonAtomic(file, obj) {
+  writeAtomic(file, obj);
+}
+
+/** 读 json 文件，坏/缺失返回 null */
+export function readJson(file) {
+  try {
+    const o = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return o && typeof o === 'object' ? o : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 读 llmstate.json；不存在/坏 JSON 返回 null（config.mjs 静默回默认，同口径） */
 export function loadState() {
   try {

@@ -8,15 +8,23 @@
 //  - 端口 5098 起，被占向 5090–5097 顺延；占用者若是本面板则提示已在运行
 // ═══════════════════════════════════════════════════════════════════════
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { cfg } from './config.mjs';
 import { normalizeChatUrl, modelsUrlOf, fetchModels, probeModel, maskKey } from './providers.mjs';
-import { loadState, saveState, listProfiles, upsertProfile, deleteProfile, applyProfile } from './llm-state.mjs';
+import { loadState, saveState, listProfiles, upsertProfile, deleteProfile, applyProfile, writeJsonAtomic, readJson } from './llm-state.mjs';
 import { restartBot, isBotRunning } from './botctl.mjs';
 import { runProbeSuite } from './probe-suite.mjs';
+import * as imggen from './imggen.mjs';
 import { PAGE_HTML } from './panel-page.mjs';
 
 const TOKEN = crypto.randomUUID();
+const __dir = path.dirname(fileURLToPath(import.meta.url));
+const SWITCH_PATH = path.join(__dir, 'switches.json');
+const MEDIA_PATH = path.join(__dir, 'mediaapi.json');
+const SWITCH_KEYS = ['imggen', 'vidgenEnabled', 'bilibili', 'search', 'repeat', 'beacon'];
+const MEDIA_KEYS = ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize', 'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds'];
 const OPEN_BROWSER = process.argv.includes('--open');
 const PORTS = [5098, 5097, 5096, 5095, 5094, 5093, 5092, 5091, 5090];
 
@@ -151,6 +159,55 @@ async function route(req, port) {
     }
     applyProfile(b.id);
     return json({ ok: true });
+  }
+
+  // ── 功能开关（switches.json；bot 逐条消息现读，保存即生效不用重启）──
+  if (path === '/api/switches' && req.method === 'GET') {
+    const saved = readJson(SWITCH_PATH) ?? {};
+    const vidDflt = cfg.vidgenEnabled !== false;   // 生视频的缺省跟 config 真身（其余键缺省=开）
+    return json({
+      switches: Object.fromEntries(SWITCH_KEYS.map((k) => [k, saved[k] ?? (k === 'vidgenEnabled' ? vidDflt : true)])),
+      defaults: { vidgenEnabled: vidDflt },
+      hint: 'vidgenEnabled 缺省跟 config.mjs 的 vidgenEnabled，其余缺省=开',
+    });
+  }
+  if (path === '/api/switches' && req.method === 'POST') {
+    const b = await bodyJson(req);
+    const cur = readJson(SWITCH_PATH) ?? {};
+    const merged = { ...cur };
+    for (const k of SWITCH_KEYS) if (k in b) merged[k] = Boolean(b[k]);
+    writeJsonAtomic(SWITCH_PATH, merged);
+    console.log(`[panel] 功能开关已保存：${JSON.stringify(Object.fromEntries(SWITCH_KEYS.filter((k) => k in b).map((k) => [k, merged[k]])))}`);
+    return json({ ok: true, switches: merged });
+  }
+
+  // ── 生图/生视频 API（mediaapi.json；config.mjs 启动时合并，改完要重启 bot）──
+  if (path === '/api/media' && req.method === 'GET') {
+    return json({
+      imggen: { url: cfg.imggenUrl, keyMasked: maskKey(cfg.imggenKey), hasKey: Boolean(cfg.imggenKey), model: cfg.imggenModel, size: cfg.imggenSize },
+      vidgen: { url: cfg.vidgenUrl, keyMasked: maskKey(cfg.vidgenKey), hasKey: Boolean(cfg.vidgenKey), model: cfg.vidgenModel, maxSeconds: cfg.vidgenMaxSeconds },
+      note: 'Key 打码；改完重启 bot 生效',
+    });
+  }
+  if (path === '/api/media' && req.method === 'POST') {
+    const b = await bodyJson(req);
+    const cur = readJson(MEDIA_PATH) ?? {};
+    const merged = { ...cur };
+    // key 空串 = 沿用现有；显式给了才覆盖
+    for (const k of MEDIA_KEYS) {
+      if (!(k in b)) continue;
+      const v = k === 'vidgenMaxSeconds' ? Math.max(1, Number(b[k]) || 15) : String(b[k] ?? '').trim();
+      if (k.endsWith('Key')) { if (v) merged[k] = v; }
+      else if (v !== '') merged[k] = v;
+    }
+    writeJsonAtomic(MEDIA_PATH, merged);
+    console.log('[panel] 生图/生视频 API 配置已保存（重启 bot 生效）');
+    return json({ ok: true, note: '重启 bot 后生效' });
+  }
+  if (path === '/api/imggen-test' && req.method === 'POST') {
+    // 真花一张图的钱实测（最小 prompt，生成结果不进群、直接丢弃）
+    const buf = await imggen.generateImage('a simple red circle on a white background');
+    return json({ ok: true, bytes: buf.length });
   }
   return json({ error: '未知接口' }, 404);
 }

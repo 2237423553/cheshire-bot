@@ -81,7 +81,36 @@ export const PAGE_HTML = `<!doctype html>
 <table class="prof" id="prof_tbl"><tr><td class="hint">还没有存过档案</td></tr></table>
 <div class="hint">档案含真 Key，存在本目录 llm-profiles.json（已挡在仓库外）。<b>CLI 和面板别同时改配置。</b></div></div>
 
-<div class="foot">写盘 = llmstate.json（运行时真源，删掉恢复 config.mjs 默认）· 探测消耗 &lt;3K token/次 · 源码 qq-group-bot/api-panel.mjs</div>
+<div class="card"><h2>功能开关</h2>
+<div class="row"><div class="hint" id="sw_txt">读取中…</div><button onclick="openSw()">打开开关子窗</button></div>
+<div class="hint">机器人每条消息现读开关 —— 改完<b>即刻生效，不用重启</b></div></div>
+
+<div class="card"><h2>生图 API</h2>
+<table class="kv">
+<tr><td>端点</td><td><input id="m_url"></td></tr>
+<tr><td>Key</td><td><div class="row"><input id="m_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="mtoggle()">👁</button></div></td></tr>
+<tr><td>模型</td><td><input id="m_model"></td></tr>
+<tr><td>尺寸</td><td><input id="m_size" placeholder="1024x1024"></td></tr></table>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('imggen')">保存生图配置</button><button onclick="testImggen()">花一张图的钱实测</button></div>
+<div class="hint">实测 = 真生成一张最小图（结果不进群、直接丢弃）；保存后重启机器人生效</div></div>
+
+<div class="card"><h2>生视频 API</h2>
+<table class="kv">
+<tr><td>端点</td><td><input id="v_url"></td></tr>
+<tr><td>Key</td><td><div class="row"><input id="v_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="vtoggle()">👁</button></div></td></tr>
+<tr><td>模型</td><td><input id="v_model"></td></tr>
+<tr><td>时长上限</td><td><input id="v_max" type="number" min="1" max="60"> <span class="hint">秒（超出弃用不发）</span></td></tr></table>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('vidgen')">保存生视频配置</button></div>
+<div class="hint">没放实测按钮——生视频按次计费，验证就烧一把额度；营业与否用「功能开关」里的生视频闸</div></div>
+
+<div id="sw_modal" style="display:none;position:fixed;inset:0;background:#000b;z-index:99" onclick="if(event.target===this)closeSw()">
+<div style="background:var(--card);max-width:380px;margin:90px auto;border:1px solid var(--line);border-radius:12px;padding:16px 20px">
+<h2 style="color:var(--acc);font-size:13px;margin-bottom:10px">功能开关（保存即刻生效，不用重启）</h2>
+<div id="sw_list"></div>
+<div class="row" style="margin-top:12px"><button class="pri" onclick="saveSw()">保存</button><button onclick="closeSw()">取消</button></div>
+</div></div>
+
+<div class="foot">写盘 = llmstate.json（运行时真源，删掉恢复 config.mjs 默认）· 功能开关 = switches.json · 生图/生视频 = mediaapi.json · 探测消耗 &lt;3K token/次 · 源码 qq-group-bot/api-panel.mjs</div>
 <div id="bar"></div>
 <script>window.PT = "__PANEL_TOKEN__";</script>
 <script>
@@ -295,6 +324,73 @@ async function delProf(id) {
   catch (e) { bar('删除失败：' + e.message, 'bad'); }
 }
 
+// ── 功能开关子窗 ──
+const SW_LABELS = {
+  imggen: '画画 / 改稿路由（关了 @ 点画图回「暂停营业」）',
+  vidgenEnabled: '生视频（文生 + 图生）',
+  bilibili: 'B站链接免 @ 总结',
+  search: '联网搜索（Exa，关了模型就没搜索工具）',
+  repeat: '+1 复读',
+  beacon: '寻呼信标「柴郡柴郡」',
+};
+function swSummary(sw) {
+  const on = Object.keys(SW_LABELS).filter((k) => sw[k]);
+  const off = Object.keys(SW_LABELS).filter((k) => !sw[k]);
+  return '开：' + (on.length ? on.map((k) => SW_LABELS[k].split('（')[0].split('「')[0]).join(' · ') : '无')
+    + (off.length ? '　｜　关：' + off.map((k) => SW_LABELS[k].split('（')[0].split('「')[0]).join(' · ') : '');
+}
+async function openSw() {
+  try {
+    const j = await api('/api/switches');
+    $('sw_list').innerHTML = Object.entries(SW_LABELS).map(([k, l]) =>
+      '<label style="display:block;margin:7px 0"><input type="checkbox" id="sw_' + k + '"' + (j.switches[k] ? ' checked' : '') + '> '
+      + esc(l) + (k === 'vidgenEnabled' ? ' <span class="hint">（缺省跟 config：' + j.defaults.vidgenEnabled + '）</span>' : '') + '</label>').join('');
+    $('sw_txt').textContent = swSummary(j.switches);
+    $('sw_modal').style.display = '';
+  } catch (e) { bar('读开关失败：' + e.message, 'bad'); }
+}
+function closeSw() { $('sw_modal').style.display = 'none'; }
+async function saveSw() {
+  const flags = {};
+  for (const k of Object.keys(SW_LABELS)) flags[k] = $('sw_' + k).checked;
+  try {
+    const j = await api('/api/switches', { method: 'POST', body: JSON.stringify(flags) });
+    $('sw_txt').textContent = swSummary(j.switches);
+    bar('开关已保存，即刻生效（不用重启）', 'ok');
+    closeSw();
+  } catch (e) { bar('开关保存失败：' + e.message, 'bad'); }
+}
+
+// ── 生图/生视频 API ──
+function mtoggle() { const k = $('m_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
+function vtoggle() { const k = $('v_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
+async function loadMedia() {
+  try {
+    const j = await api('/api/media');
+    $('m_url').value = j.imggen.url || ''; $('m_model').value = j.imggen.model || ''; $('m_size').value = j.imggen.size || '';
+    $('v_url').value = j.vidgen.url || ''; $('v_model').value = j.vidgen.model || ''; $('v_max').value = j.vidgen.maxSeconds || 15;
+  } catch (e) { bar('读生图/生视频配置失败：' + e.message, 'bad'); }
+}
+async function saveMedia(side) {
+  const b = side === 'imggen'
+    ? { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(), imggenSize: $('m_size').value.trim() }
+    : { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim(), vidgenMaxSeconds: Number($('v_max').value) || 15 };
+  try {
+    await api('/api/media', { method: 'POST', body: JSON.stringify(b) });
+    bar('已保存（' + (side === 'imggen' ? '生图' : '生视频') + '）——重启机器人后生效', 'ok');
+    if (confirm('现在重启机器人让 API 配置生效？')) await doRestart(false, true);
+  } catch (e) { bar('保存失败：' + e.message, 'bad'); }
+}
+async function testImggen() {
+  if (!confirm('真生成一张最小测试图（花一张图的钱，结果不进群直接丢弃）？')) return;
+  bar('生图实测中（十几秒到一分钟）…', 'busy');
+  try {
+    const j = await api('/api/imggen-test', { method: 'POST', body: '{}' });
+    bar('生图通了！返回 ' + Math.round(j.bytes / 1024) + 'KB 图（未进群）', 'ok');
+  } catch (e) { bar('生图实测失败：' + e.message, 'bad'); }
+}
+
 refresh();
 initDrop();
+loadMedia();
 </script></body></html>`;

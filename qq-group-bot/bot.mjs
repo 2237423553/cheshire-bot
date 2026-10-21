@@ -6,6 +6,8 @@
 //  所以被 @ 时若本条没有媒体，就回溯群历史，把最近的媒体一并喂给模型。
 // ═══════════════════════════════════════════════════════════
 import { readFile } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
 import { pickThree, foodCount } from './foods.mjs';
@@ -27,6 +29,31 @@ const lastReplyAt = new Map();
 const groupSummary = new Map();   // gid -> 压缩后的历史摘要
 const promptTokens = new Map();   // gid -> 上次请求的真实 prompt_tokens
 const repeatState = new Map();    // gid -> 上一条消息 { sig, sender, joined }，用来识别「+1 复读」
+
+// ─────────── 功能开关（API 面板写 switches.json；每条消息现读，改了即刻生效，不用重启）───────────
+// 键：imggen(画图+改稿路由) / vidgenEnabled(生视频) / bilibili(免@总结) /
+//     search(联网搜索) / repeat(+1复读) / beacon(寻呼信标)。缺省=开；vidgen 缺省跟 cfg.vidgenEnabled。
+const SWITCH_PATH = fileURLToPath(new URL('./switches.json', import.meta.url));
+let swCache = { mtime: -1, data: null };
+function featureOn(name, dflt = true) {
+  try {
+    const m = statSync(SWITCH_PATH).mtimeMs;
+    if (m !== swCache.mtime) swCache = { mtime: m, data: JSON.parse(readFileSync(SWITCH_PATH, 'utf8')) };
+  } catch { swCache = { mtime: -1, data: swCache.data ?? null }; }
+  const v = swCache.data?.[name];
+  return v === undefined || v === null ? dflt : Boolean(v);
+}
+function toolsNow() {
+  // 联网搜索关了就不给模型 web_search / fetch_webpage；生图关了不给 generate_image（路由也会歇业）
+  const search = featureOn('search', true);
+  const imggenOn = featureOn('imggen', true);
+  return TOOLS.filter((t) => {
+    const n = t.function?.name;
+    if (!search && (n === 'web_search' || n === 'fetch_webpage')) return false;
+    if (!imggenOn && n === 'generate_image') return false;
+    return true;
+  });
+}
 const eatHistory = new Map();     // gid -> 最近推过的菜名，用来避免老推同样的几样
 const lastDrawByGroup = new Map(); // gid -> 最近一次画图 { prompt, subj, at }，供「改一下/重画」改稿路由用
 
@@ -483,7 +510,7 @@ async function callLLM(sessionId, messages, useTools) {
     messages,
   };
   if (cfg.thinking && cfg.thinking !== 'default') body.thinking = cfg.thinking;   // 'default' = 不传，用模型默认
-  if (useTools) body.tools = TOOLS;
+  if (useTools) body.tools = toolsNow();   // 按开关现过滤（search/imggen 关了工具就从清单里消失）
 
   const r = await fetch(cfg.llmUrl, {
     method: 'POST',
@@ -1063,6 +1090,12 @@ console.log(`[bot]      #吃什么（从 ${foodCount()} 道菜里真随机抽早
 console.log(`[bot] 复读：群里出现「+1 复读」时跟着复读一次（同一内容只跟一次，防死循环）`);
 console.log(`[bot] 支持：文字 / 图片 / 视频 | 语音暂不支持(QQ用SILK编码)`);
 console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
+{
+  // 开机打一眼当前开关状态（面板改了开关不用重启，这行只在启动时打一次快照）
+  const names = { imggen: '画画', vidgenEnabled: '生视频', bilibili: 'B站总结', search: '搜索', repeat: '复读', beacon: '信标' };
+  const states = Object.entries(names).map(([k, l]) => `${l}=${featureOn(k, k === 'vidgenEnabled' ? cfg.vidgenEnabled !== false : true) ? '开' : '关'}`);
+  console.log(`[bot] 功能开关：${states.join(' · ')}（switches.json，每条消息现读，面板改了即刻生效）`);
+}
 
 const bot = new SnowLumaWebSocketClient({ url: cfg.obWs, accessToken: cfg.obWsToken, reconnect: true });
 
@@ -1084,7 +1117,7 @@ bot.onGroupMessage(async (event, ctx) => {
   //    ④ 必须换个人来重复 —— 同一个人连发同样的话不算复读
   // 寻呼 / 指令 / @ 我都算「正事」，不参与复读，免得把复读链搅乱。
   const last = repeatState.get(gid);
-  if (userText && !beacon && !cmd && !atMe && !bvLink) {
+  if (userText && !beacon && !cmd && !atMe && !bvLink && featureOn('repeat', true)) {
     const sameAsLast = !!last && last.sig === userText;
     const byAnother = sameAsLast && String(last.sender) !== String(event.user_id);
 
@@ -1113,7 +1146,7 @@ bot.onGroupMessage(async (event, ctx) => {
 
   // ── B站链接：群里出现就自动总结（不用 @，链接即触发）──
   // 同一条视频 2 小时内只「看」一遍（缓存秒回），正在看的时候再发不重复点火。
-  if (bvLink) {
+  if (bvLink && featureOn('bilibili', true)) {
     const nowBv = Date.now();
     if (nowBv - (lastReplyAt.get(gid) ?? 0) < cfg.cooldownMs) return;
     lastReplyAt.set(gid, nowBv);
@@ -1126,7 +1159,7 @@ bot.onGroupMessage(async (event, ctx) => {
     return;
   }
 
-  if (!atMe && !beacon) return;   // 既没 @ 我、也没喊寻呼，就当没看见
+  if (!atMe && !(beacon && featureOn('beacon', true))) return;   // 既没 @ 我、也没喊寻呼（或信标已关），就当没看见
 
   // 冷却：防刷屏（寻呼和正常回复共用一个闸门，免得刷爆）
   const now = Date.now();
@@ -1135,7 +1168,7 @@ bot.onGroupMessage(async (event, ctx) => {
 
   // ── 寻呼信标：喊「柴郡柴郡」就自动蹦出来 ──
   // 纯脚本回复，不走 LLM、不耗 token、瞬间到达；目的就是让指挥官搜得到机器人在哪。
-  if (beacon) {
+  if (beacon && featureOn('beacon', true)) {
     try {
       await ctx.reply(text(cfg.beaconReply));
       console.log(`[bot] 寻呼信标触发 群 ${gid} <- ${userText.slice(0, 18)}  ->  ${cfg.beaconReply}`);
@@ -1177,6 +1210,12 @@ bot.onGroupMessage(async (event, ctx) => {
   const isRedraw = !!(drawSubj && !parseDrawIntent(userText) && lastDraw
     && Date.now() - lastDraw.at < 10 * 60 * 1000);
   let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
+  if (drawSubj && !featureOn('imggen', true)) {
+    // 生图总闸关着：直接回歇业，不进普通对话（防模型嘴上承诺画却零动作，坑 34 同族）
+    console.log(`[bot] 群 ${gid} 生图业务已暂停，直接回绝 <- ${drawSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('画画业务暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
   if (drawSubj) {
     const sid = `img-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
     try {
@@ -1255,7 +1294,7 @@ bot.onGroupMessage(async (event, ctx) => {
   // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
   const videoSubj = atMe ? parseVideoIntent(userText) : null;
   let vidVeto = false;
-  if (videoSubj && cfg.vidgenEnabled === false) {
+  if (videoSubj && !featureOn('vidgenEnabled', cfg.vidgenEnabled !== false)) {
     // 总闸关着：直接告知歇业，不放行进普通对话（免得模型嘴上承诺「这就生成」又装成功，坑 34 同族）
     console.log(`[bot] 群 ${gid} 生视频业务已暂停，直接回绝 <- ${videoSubj.slice(0, 18)}`);
     try { await ctx.reply(text('生视频业务暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }

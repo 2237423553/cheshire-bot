@@ -135,3 +135,16 @@ try {
 } catch {
   // 文件不存在 / 坏了 —— 用上面的默认值，不报错
 }
+
+// ── 生图/生视频 API 覆盖（API 面板写 mediaapi.json；改完重启 bot 生效）──
+// 同样删掉文件即回滚；两个来源（llmstate 式合并）不改 config.mjs 真身
+const MEDIA_FILE = path.join(__dir, 'mediaapi.json');
+try {
+  const o = JSON.parse(fs.readFileSync(MEDIA_FILE, 'utf8'));
+  for (const k of ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
+                   'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds']) {
+    if (o[k] !== undefined && o[k] !== null && o[k] !== '') cfg[k] = o[k];
+  }
+} catch {
+  // 没这个文件就全用上面的默认值
+}
