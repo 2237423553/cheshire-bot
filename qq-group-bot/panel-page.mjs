@@ -112,6 +112,10 @@ function formFrom() {
            key: $('f_key').value, model: $('f_model').value.trim(),
            headers, thinking: (document.querySelector('input[name=tk]:checked') || {}).value || 'keep' };
 }
+/** 顶层入口统一走这里：formFrom 抛错落到状态栏，绝不整卡无响应 */
+function getForm() {
+  try { return formFrom(); } catch (e) { bar(e.message, 'bad'); return null; }
+}
 function formTo(f, keepKey) {
   return { url: f.url, key: f.key, model: f.model, headers: f.headers, name: f.name, thinking: f.thinking };
 }
@@ -158,7 +162,7 @@ function loadProfiles() {
 }
 
 async function loadModels() {
-  const f = formFrom();
+  const f = getForm(); if (!f) return;
   if (!f.url) return bar('先填 URL', 'bad');
   bar('正在拉模型列表…', 'busy');
   try {
@@ -170,7 +174,7 @@ async function loadModels() {
 }
 
 async function runProbe() {
-  const f = formFrom();
+  const f = getForm(); if (!f) return null;
   const urlN = f.url; // 服务端会补全
   bar('四件套探测中（基础/思考三档/工具/视觉）… 约半分钟', 'busy');
   try {
@@ -211,7 +215,7 @@ function renderProbe(j) {
 }
 
 async function doSave(asProfile) {
-  const f = formFrom();
+  const f = getForm(); if (!f) return;
   if (!f.url || !f.model) return bar('URL 和模型都要有', 'bad');
   bar('写盘中…', 'busy');
   try {
@@ -228,7 +232,7 @@ async function doSave(asProfile) {
   } catch (e) { bar('保存失败：' + e.message, 'bad'); }
 }
 async function probeAndSwitch() {
-  const f = formFrom();
+  const f = getForm(); if (!f) return;
   if (!f.url || !f.model) return bar('URL 和模型都要有', 'bad');
   const j = await runProbe();
   if (!j) return;
@@ -236,7 +240,7 @@ async function probeAndSwitch() {
   await doSave(false);
 }
 async function saveOnly(asProfile) {
-  const f = formFrom();
+  const f = getForm(); if (!f) return;
   if (!f.url || !f.model) return bar('URL 和模型都要有', 'bad');
   await doSave(asProfile);
 }
