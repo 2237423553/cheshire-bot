@@ -57,6 +57,10 @@ export async function generateVideo(prompt, imageDataUrl = '') {
           throw new Error('⛔ 这个描述被生视频服务的安全审核拒绝了——生成不了，换个描述试试吧');
         }
         if (r.status === 401) throw new Error('生视频 API Key 无效（401）');
+        // 中转把「没钱」也用 429 包着发（body 是 API_KEY_QUOTA_EXHAUSTED）——认出来当场明报，不重试
+        if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+          throw new Error('⛔ 生视频 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
+        }
         if (r.status === 429) throw new Error('生视频被限流（429），稍后再试');
         if ([502, 503, 504].includes(r.status)) { lastErr = `HTTP ${r.status}`; continue; }
         throw new Error(`提交生视频任务失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);

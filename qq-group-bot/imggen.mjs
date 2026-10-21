@@ -49,6 +49,10 @@ async function generateImageInner(prompt, attempt) {
       throw new Error('⛔ 这张图被生图服务的安全审核拒绝了（它审核很严，正常内容也可能误拒）——画不了，换个描述试试吧');
     }
     if (r.status === 401) throw new Error('生图 API Key 无效（401）');
+    // 中转把「没钱」也用 429 包着发（body 是 API_KEY_QUOTA_EXHAUSTED）——认出来当场明报，不重试
+    if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+      throw new Error('⛔ 生图 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
+    }
     // 429 = 中转限流（今天连画几张很容易撞上）。有 Retry-After 就等一把重试一次，
     // 还不行就明说「限流了等几分钟」，别让群里以为机器人坏了
     if (r.status === 429) {
