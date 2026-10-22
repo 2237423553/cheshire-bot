@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { cfg } from './config.mjs';
-import { normalizeChatUrl, modelsUrlOf, fetchModels, probeModel, maskKey } from './providers.mjs';
+import { normalizeChatUrl, modelsUrlOf, mediaModelsUrlOf, fetchModels, probeModel, maskKey } from './providers.mjs';
 import { loadState, saveState, listProfiles, upsertProfile, deleteProfile, applyProfile, writeJsonAtomic, readJson } from './llm-state.mjs';
 import { restartBot, isBotRunning } from './botctl.mjs';
 import { runProbeSuite } from './probe-suite.mjs';
@@ -205,6 +205,15 @@ async function route(req, port) {
     writeJsonAtomic(MEDIA_PATH, merged);
     console.log('[panel] 生图/生视频 API 配置已保存（重启 bot 生效）');
     return json({ ok: true, note: '重启 bot 后生效' });
+  }
+  // 生图/生视频卡的「拉模型列表」：端点掐掉 generations 接 /models；key 空串 = 沿用当前
+  if (path === '/api/media-models' && req.method === 'POST') {
+    const b = await bodyJson(req);
+    const side = b.side === 'vidgen' ? 'vidgen' : 'imggen';
+    const url = String(b.url ?? '').trim() || (side === 'imggen' ? cfg.imggenUrl : cfg.vidgenUrl);
+    const key = String(b.key ?? '') || (side === 'imggen' ? cfg.imggenKey : cfg.vidgenKey);
+    const models = await fetchModels(url, key, undefined, mediaModelsUrlOf(url));
+    return json({ ok: true, models });
   }
   if (path === '/api/imggen-test' && req.method === 'POST') {
     // 真花一张图的钱实测（最小 prompt，生成结果不进群、直接丢弃）

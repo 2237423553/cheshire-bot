@@ -32,7 +32,19 @@ async function generateImageInner(prompt, attempt) {
       body: JSON.stringify({
         model: cfg.imggenModel,
         prompt,
-        size: cfg.imggenSize,
+        // 两套参数体系按模型分家：
+        //   gpt-image 系：size（如 1024x1024）+ quality（low/medium/high）
+        //   xAI Grok 系：aspect_ratio + resolution(1k/2k) + quality
+        //   ⚠️ Grok 的 quality 不传 = auto = 生成走 low 最低档（官方文档实测口径），
+        //      档位上限就是 medium —— 所以必须显式传，指挥官按张收费拉满档。
+        ...(String(cfg.imggenModel).includes('grok-imagine')
+          ? {
+              aspect_ratio: cfg.imggenAspectRatio || 'auto',
+              resolution: cfg.imggenResolution || '2k',
+              quality: cfg.imggenQuality || 'medium',
+            }
+          : { size: cfg.imggenSize, quality: cfg.imggenQuality || undefined }),
+        response_format: 'b64_json',
         n: 1,
       }),
       signal: AbortSignal.timeout(TIMEOUT),

@@ -872,7 +872,10 @@ function parseDrawIntent(raw) {
   // 摘掉开头的 @某人和询呼词，剩下才是诉求本体
   let t = String(raw ?? '').trim();
   t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
-  if (!t || t.length > 80) return null;
+  // 长度上限 5000（原 80，2026-10-22 指挥官指示）：精细画图需求（编号列表逐条提要求）
+  // 实测能到 150+ 字，80 上限把这种挡在闸门外、掉进普通对话被模型嘴上画图（坑 34 同族）。
+  // 误触风险不用怕：后面还有翻译层否决权（不是画图诉求回 NO）兜底。
+  if (!t || t.length > 5000) return null;
   // 明确要的是文字/视频产物：接了必错，直接放行（视频走 vidgen 路由，别被画图闸抢走）
   if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词|视频|影片|动画)/.test(t)) return null;
   // 「画」必须在句首附近才算画图诉求（防「你上次画的大凤呢」这种越聊越歪的）
@@ -899,7 +902,14 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
         '直接输出修改后的完整英文 prompt（30~80 词），无解释、无引号。' +
         '如果用户的反馈根本不是在要求修改这张图（纯闲聊/问别的事），只回复 NO。'
       : '你是文生图 prompt 翻译器。把用户请求翻成一段高质量的英文生图 prompt：' +
-        '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（30~80 词英文），无解释、无引号。' +
+        '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（40~120 词英文），无解释、无引号。' +
+        '用户列的编号要求/否定要求（「1.不要文字」「2.背景是X」这类）必须逐条翻进 prompt' +
+        '（否定要求用 without / no X 等英文表达），一条都不许丢。' +
+        '装备/舰船/坦克的中文别称必须翻成官方英文名，不许意译成别的词：' +
+        '（例：「挑战者2黑夜」= Challenger 2 "Black Night"、「台风」= Eurofighter Typhoon、' +
+        '「暴风」= Hawker Tempest、「彗星」= Comet、「大凤」= Taihou、' +
+        '碧蓝航线的「纳尔逊」= Nelson）；' +
+        '遇到不确定的专有名词，按字面音译 + 在 prompt 里描述其特征，别编一个错误的名字。' +
         '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。';
     const msg = await callLLM(sid, [
       { role: 'system', content: sys },

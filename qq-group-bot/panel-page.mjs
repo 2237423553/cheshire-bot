@@ -89,7 +89,7 @@ export const PAGE_HTML = `<!doctype html>
 <table class="kv">
 <tr><td>端点</td><td><input id="m_url"></td></tr>
 <tr><td>Key</td><td><div class="row"><input id="m_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="mtoggle()">👁</button></div></td></tr>
-<tr><td>模型</td><td><input id="m_model"></td></tr>
+<tr><td>模型</td><td><div class="row"><div style="position:relative;flex:1"><input id="m_model" autocomplete="off" placeholder="先拉列表，或直接输模型 ID"><div id="m_drop" class="drop" style="display:none"></div></div><button onclick="pullMediaModels('imggen')">拉列表</button></div></td></tr>
 <tr><td>尺寸</td><td><input id="m_size" placeholder="1024x1024"></td></tr></table>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('imggen')">保存生图配置</button><button onclick="testImggen()">花一张图的钱实测</button></div>
 <div class="hint">实测 = 真生成一张最小图（结果不进群、直接丢弃）；保存后重启机器人生效</div></div>
@@ -98,7 +98,7 @@ export const PAGE_HTML = `<!doctype html>
 <table class="kv">
 <tr><td>端点</td><td><input id="v_url"></td></tr>
 <tr><td>Key</td><td><div class="row"><input id="v_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="vtoggle()">👁</button></div></td></tr>
-<tr><td>模型</td><td><input id="v_model"></td></tr>
+<tr><td>模型</td><td><div class="row"><div style="position:relative;flex:1"><input id="v_model" autocomplete="off" placeholder="先拉列表，或直接输模型 ID"><div id="v_drop" class="drop" style="display:none"></div></div><button onclick="pullMediaModels('vidgen')">拉列表</button></div></td></tr>
 <tr><td>时长上限</td><td><input id="v_max" type="number" min="1" max="60"> <span class="hint">秒（超出弃用不发）</span></td></tr></table>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('vidgen')">保存生视频配置</button></div>
 <div class="hint">没放实测按钮——生视频按次计费，验证就烧一把额度；营业与否用「功能开关」里的生视频闸</div></div>
@@ -146,6 +146,42 @@ function initDrop() {
   inp.addEventListener('focus', () => { if (MODELS.length) renderDrop(); });
   inp.addEventListener('input', () => { if (MODELS.length) renderDrop(); });
   inp.addEventListener('blur', () => setTimeout(hideDrop, 150));   // 留 150ms 给点击事件
+}
+
+// 生图/生视频卡的下拉：和 LLM 卡同款交互（点开全显 / 输入过滤 / 点选回填 / blur 延迟收起），
+// 每张卡独立列表互不干扰。PANEL 页面禁用嵌套模板字面量，这里全部字符串拼接。
+function makeDrop(inpId, dropId) {
+  let models = [];
+  const inp = $(inpId), d = $(dropId);
+  const hide = () => { d.style.display = 'none'; };
+  const render = () => {
+    const q = inp.value.trim().toLowerCase();
+    const list = q ? models.filter((m) => m.toLowerCase().includes(q)) : models;
+    d.innerHTML = (list.length ? list : ['（没有匹配项，直接用输入值）'])
+      .map((m) => '<div data-v="' + esc(m) + '">' + esc(m) + '</div>').join('');
+    d.style.display = 'block';
+    d.querySelectorAll('div').forEach((el) => el.onclick = () => {
+      inp.value = el.dataset.v; hide();
+    });
+  };
+  inp.addEventListener('focus', () => { if (models.length) render(); });
+  inp.addEventListener('input', () => { if (models.length) render(); });
+  inp.addEventListener('blur', () => setTimeout(hide, 150));
+  return { set(list) { models = list || []; if (models.length) render(); } };
+}
+const imgDrop = makeDrop('m_model', 'm_drop');
+const vidDrop = makeDrop('v_model', 'v_drop');
+
+async function pullMediaModels(side) {
+  const url = $(side === 'imggen' ? 'm_url' : 'v_url').value.trim();
+  if (!url) return bar('先填端点 URL', 'bad');
+  const key = $(side === 'imggen' ? 'm_key' : 'v_key').value;   // 空串 = 沿用当前 Key
+  bar('正在拉' + (side === 'imggen' ? '生图' : '生视频') + '模型列表…', 'busy');
+  try {
+    const j = await api('/api/media-models', { method: 'POST', body: JSON.stringify({ side, url, key }) });
+    (side === 'imggen' ? imgDrop : vidDrop).set(j.models);
+    bar('列表拉到了（' + j.models.length + ' 个）——点模型框打开，输入可过滤', 'ok');
+  } catch (e) { bar('拉列表失败：' + e.message, 'bad'); }
 }
 
 function bar(msg, cls) { const b = $('bar'); b.textContent = msg; b.className = cls || ''; }

@@ -41,6 +41,13 @@ export function modelsUrlOf(chatUrl) {
   return /\/chat\/completions$/i.test(s) ? s.replace(/\/chat\/completions$/i, '/models') : s + '/models';
 }
 
+/** 生图/生视频端点 -> 模型列表端点（掐掉 /images/generations、/videos/generations 再接 /models；
+ *  直接套 modelsUrlOf 会拼出 .../images/generations/models 这种 404 地址） */
+export function mediaModelsUrlOf(mediaUrl) {
+  const s = String(mediaUrl).replace(/\/+$/, '');
+  return s.replace(/\/(?:images|videos)\/generations$/i, '/models');
+}
+
 /** 日志/群里展示用：只露头尾，别把整把钥匙贴出去 */
 export function maskKey(k) {
   if (!k) return '（空）';
@@ -116,9 +123,9 @@ export async function chatOnce(chatUrl, key, body, extraHeaders, opts = {}) {
   return { ok: r.ok, status: r.status, json, txt, latencyMs: Date.now() - t0 };
 }
 
-/** 拉模型列表，返回模型 ID 数组 */
-export async function fetchModels(chatUrl, key, extraHeaders) {
-  const url = modelsUrlOf(chatUrl);
+/** 拉模型列表，返回模型 ID 数组。第 4 参可显式指定列表端点（生图/生视频卡用 mediaModelsUrlOf） */
+export async function fetchModels(chatUrl, key, extraHeaders, modelsUrl) {
+  const url = modelsUrl || modelsUrlOf(chatUrl);
   const r = await fetch(url, {
     headers: withExtra({
       ...authHeaders(key, {}),
