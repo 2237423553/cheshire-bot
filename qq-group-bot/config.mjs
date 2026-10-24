@@ -36,8 +36,8 @@ export const cfg = {
   obHttp: 'http://127.0.0.1:3000/',
   obWs: 'ws://127.0.0.1:3001/',
   // ⚠️ SnowLuma 的 HTTP 和 WS 是两套独立令牌，别混用！
-  //   obHttpToken -> config/onebot_你的QQ号.json -> networks.httpServers[0].accessToken
-  //   obWsToken   -> config/onebot_你的QQ号.json -> networks.wsServers[0].accessToken
+  //   obHttpToken -> config/onebot_<你的QQ号>.json -> networks.httpServers[0].accessToken
+  //   obWsToken   -> config/onebot_<你的QQ号>.json -> networks.wsServers[0].accessToken
   obHttpToken: '在这里填你的OneBotHTTP令牌',
   obWsToken: '在这里填你的OneBotWS令牌',
 
@@ -87,16 +87,21 @@ export const cfg = {
   stripMarkdown: false,        // 保留模型的 markdown（**加粗** 等是情景模拟的产物，不是垃圾）
 
   // ── 文生图（sui-xiang.net 中转，OpenAI 兼容 /v1/images/generations）──
-  // 实测 gpt-image-2 返回 b64_json（PNG 约 2~3MB），OneBot base64:// 直发已验证。
+  // 2026-10-22 从 gpt-image-2 换 grok-imagine-image-2.0（xAI 最新代，同价下质量最高）：
+  //   老的「quality」款模型 11-2 退役会静默降成 low 档（官方公告），所以直接上 2.0。
+  //   ⚠️ Grok 的 quality 不传 = auto = 生成走 low 最低档；档位上限就是 medium（没有 high）。
   // 注意中转审核很敏感，正常内容也可能被 400 拦，imggen.mjs 会如实转告。
   imggenUrl: 'https://www.sui-xiang.net/v1/images/generations',
   imggenKey: 'sk-在这里填你的生图密钥',
-  imggenModel: 'gpt-image-2',
-  imggenSize: '1024x1024',
+  imggenModel: 'gpt-image-2',   // 2026-10-22 从 grok-imagine-image-2.0 切回（指挥官指示）
+  // —— Grok 系参数（换回 gpt-image 系则用 imggenSize + imggenQuality:'high'）——
+  imggenAspectRatio: 'auto',   // auto=模型按画面选最佳比例；要固定可填 16:9/1:1/21:9 等
+  imggenResolution: '2k',      // 1k/2k，按张收费直接 2k
+  imggenSize: '1024x1024',     // 仅 gpt-image 系生效
+  imggenQuality: 'high',       // gpt-image 系最高档；Grok 系上限只到 medium
 
   // ── 文生视频（sui-xiang.net Grok 通道，异步任务制，只支持文生）──
-  // grok-imagine-video=文生视频；grok-imagine-video-1.5=图生视频（勿混）
-  // 提交后返回 request_id，轮询 /v1/videos/<id> 到 done 再下载，见 vidgen.mjs
+  // 注意：grok-imagine-video=文生视频；grok-imagine-video-1.5=图生视频（勿混）
   vidgenUrl: 'https://www.sui-xiang.vip/v1/videos/generations',
   vidgenKey: 'sk-在这里填你的生视频密钥',
   vidgenModel: 'grok-imagine-video-1.5',
@@ -109,15 +114,15 @@ export const cfg = {
   ttsUrl: 'https://api.xiaomimimo.com/v1/chat/completions',
   ttsKey: 'sk-在这里填你的MiMo-TTS密钥',
   ttsModel: 'mimo-v2.5-tts-voicedesign',
-  // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（默认 300）
+  // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（2026-10-23 指挥官定 300）
   ttsAutoVoiceChars: 300,
-  // 柴郡的声线：改这一句就能换音色（voicedesign 就是靠描述捏；官方口径=只写「是什么」、
-  // 别写否定句，带一个具象锚点最灵）
-  ttsVoiceDesign: '一位年轻的女性，说标准普通话，嗓音清甜柔软、中低音区带轻微气声，像贴在耳边说话的黑猫少女声优。语速快而机灵，句尾慵懒地拖长上勾，语气甜里透着狡黠的得意，爱卖关子逗人，偶尔轻轻笑出声。',
   // 唱歌（2026-10-23 上线）：唱歌是 mimo-v2.5-tts「预置音色」专属能力，
   // voicedesign 不支持（官方互斥设计）——说话用捏音，唱歌借预置嗓子
   ttsSingModel: 'mimo-v2.5-tts',
   ttsSingVoice: '茉莉',
+  // 柴郡的声线：改这一句就能换音色（voicedesign 就是靠描述捏）
+  // 语速写了两遍都强调快（10-23 指挥官反馈语速太慢）——voicedesign 对单个「偏快」不敏感
+  ttsVoiceDesign: '一位年轻的女性，说标准普通话，嗓音清甜柔软、中低音区带轻微气声，像贴在耳边说话的黑猫少女声优。语速快而机灵，句尾慵懒地拖长上勾，语气甜里透着狡黠的得意，爱卖关子逗人，偶尔轻轻笑出声。',
 
   // ── 网络搜索 / 网页抓取（Exa MCP Server，2026-10-17 从直连 REST 改为 MCP）──
   // 实测无需 API key 即可用；若被限流，可在 URL 后追加 ?exaApiKey=你的key
@@ -139,6 +144,19 @@ export const cfg = {
     '除非指挥官主动提到视频或画面内容，否则绝不主动提及视频——被问什么就答什么，别自己拐到视频上去。',
 };
 
+// ── 密钥下沉（2026-10-24）：真 Key 一律住运行时文件，本文件只留占位符 ──
+// secrets.json（gitignored）托管没有面板卡的密钥：llmKey（删 llmstate.json 回滚时的保险）
+// + OneBot 双令牌。先于 llmstate 读——面板写盘的值会盖在它上面。
+const SECRET_FILE = path.join(__dir, 'secrets.json');
+try {
+  const o = JSON.parse(fs.readFileSync(SECRET_FILE, 'utf8'));
+  for (const k of ['llmKey', 'obHttpToken', 'obWsToken']) {
+    if (typeof o[k] === 'string' && o[k] !== '') cfg[k] = o[k];
+  }
+} catch {
+  // 没有 secrets.json 就用上面的占位符——连接会失败，按提示填
+}
+
 // ── 运行时覆盖（#接口 / #切换 指令写出来的）──
 // 优先级：llmstate.json > 本文件里的默认值。
 // 这样换模型/换服务商不用改代码、不用重启，改坏了删掉这个 json 就恢复默认。
@@ -152,13 +170,16 @@ try {
   // 文件不存在 / 坏了 —— 用上面的默认值，不报错
 }
 
-// ── 生图/生视频 API 覆盖（API 面板写 mediaapi.json；改完重启 bot 生效）──
-// 同样删掉文件即回滚；两个来源（llmstate 式合并）不改 config.mjs 真身
+// ── 生图/生视频/语音 API 覆盖（API 面板写 mediaapi.json；改完重启 bot 生效）──
+// 同样删掉文件即回滚；合并式写入（陌键存活），不改 config.mjs 真身
+// tts* 七键 2026-10-24 收编进来（含声线描述/自动语音阈值/唱歌音色）
 const MEDIA_FILE = path.join(__dir, 'mediaapi.json');
 try {
   const o = JSON.parse(fs.readFileSync(MEDIA_FILE, 'utf8'));
   for (const k of ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
-                   'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds']) {
+                   'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
+                   'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign',
+                   'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingVoice']) {
     if (o[k] !== undefined && o[k] !== null && o[k] !== '') cfg[k] = o[k];
   }
 } catch {

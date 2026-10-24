@@ -24,7 +24,8 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
 const SWITCH_PATH = path.join(__dir, 'switches.json');
 const MEDIA_PATH = path.join(__dir, 'mediaapi.json');
 const SWITCH_KEYS = ['imggen', 'vidgenEnabled', 'bilibili', 'search', 'repeat', 'beacon'];
-const MEDIA_KEYS = ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize', 'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds'];
+const MEDIA_KEYS = ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize', 'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
+                    'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingVoice'];
 const PROMPT_PATH = path.join(__dir, 'prompt.json');
 const PROMPT_LIMIT = 8000;   // 提示词最长字符（防手滑把 10 万字灌进每条消息）
 const OPEN_BROWSER = process.argv.includes('--open');
@@ -192,6 +193,8 @@ async function route(req, port) {
     return json({
       imggen: { url: cfg.imggenUrl, keyMasked: maskKey(cfg.imggenKey), hasKey: Boolean(cfg.imggenKey), model: cfg.imggenModel, size: cfg.imggenSize },
       vidgen: { url: cfg.vidgenUrl, keyMasked: maskKey(cfg.vidgenKey), hasKey: Boolean(cfg.vidgenKey), model: cfg.vidgenModel, maxSeconds: cfg.vidgenMaxSeconds },
+      tts: { url: cfg.ttsUrl, keyMasked: maskKey(cfg.ttsKey), hasKey: Boolean(cfg.ttsKey), model: cfg.ttsModel,
+             voiceDesign: cfg.ttsVoiceDesign, autoChars: cfg.ttsAutoVoiceChars, singVoice: cfg.ttsSingVoice },
       note: 'Key 打码；改完重启 bot 生效',
     });
   }
@@ -202,7 +205,9 @@ async function route(req, port) {
     // key 空串 = 沿用现有；显式给了才覆盖
     for (const k of MEDIA_KEYS) {
       if (!(k in b)) continue;
-      const v = k === 'vidgenMaxSeconds' ? Math.max(1, Number(b[k]) || 15) : String(b[k] ?? '').trim();
+      const v = k === 'vidgenMaxSeconds' ? Math.max(1, Number(b[k]) || 15)
+        : k === 'ttsAutoVoiceChars' ? Math.max(1, Number(b[k]) || 300)   // 数字键防字符串落盘
+        : String(b[k] ?? '').trim();
       if (k.endsWith('Key')) { if (v) merged[k] = v; }
       else if (v !== '') merged[k] = v;
     }

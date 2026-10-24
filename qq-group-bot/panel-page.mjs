@@ -103,6 +103,17 @@ export const PAGE_HTML = `<!doctype html>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('vidgen')">保存生视频配置</button></div>
 <div class="hint">没放实测按钮——生视频按次计费，验证就烧一把额度；营业与否用「功能开关」里的生视频闸</div></div>
 
+<div class="card"><h2>语音 API（TTS）</h2>
+<table class="kv">
+<tr><td>端点</td><td><input id="t_url"></td></tr>
+<tr><td>Key</td><td><div class="row"><input id="t_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="ttoggle()">👁</button></div></td></tr>
+<tr><td>模型</td><td><input id="t_model" placeholder="mimo-v2.5-tts-voicedesign"></td></tr>
+<tr><td>声线描述</td><td><textarea id="t_design" rows="3" placeholder="自然语言捏音色：只写「是什么」，别写否定句，带一个具象锚点最灵"></textarea></td></tr>
+<tr><td>自动语音阈值</td><td><input id="t_chars" type="number" min="1"> <span class="hint">字（回复≤此长先发语音，文字版跟上）</span></td></tr>
+<tr><td>唱歌音色</td><td><input id="t_sing" placeholder="预置名：茉莉 / 冰糖 / 苏打 / 白桦…（唱歌是预置音色专属）"></td></tr></table>
+<div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('tts')">保存语音配置</button></div>
+<div class="hint">唱歌走预置音色（mimo-v2.5-tts），说话走捏的声线（voicedesign）——官方互斥设计；保存后重启机器人生效</div></div>
+
 <div class="card"><h2>自定义提示词</h2>
 <table class="kv">
 <tr><td>人设</td><td><textarea id="p_sys" rows="7" maxlength="8000"></textarea>
@@ -120,7 +131,7 @@ export const PAGE_HTML = `<!doctype html>
 <div class="row" style="margin-top:12px"><button class="pri" onclick="saveSw()">保存</button><button onclick="closeSw()">取消</button></div>
 </div></div>
 
-<div class="foot">写盘 = llmstate.json（运行时真源，删掉恢复 config.mjs 默认）· 功能开关 = switches.json · 生图/生视频 = mediaapi.json · 探测消耗 &lt;3K token/次 · 源码 qq-group-bot/api-panel.mjs</div>
+<div class="foot">写盘 = llmstate.json（运行时真源，删掉恢复 config.mjs 默认）· 功能开关 = switches.json · 生图/生视频/语音 = mediaapi.json · 探测消耗 &lt;3K token/次 · 源码 qq-group-bot/api-panel.mjs</div>
 <div id="bar"></div>
 <script>window.PT = "__PANEL_TOKEN__";</script>
 <script>
@@ -410,20 +421,27 @@ async function saveSw() {
 // ── 生图/生视频 API ──
 function mtoggle() { const k = $('m_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
 function vtoggle() { const k = $('v_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
+function ttoggle() { const k = $('t_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
+const MEDIA_NAME = { imggen: '生图', vidgen: '生视频', tts: '语音' };
 async function loadMedia() {
   try {
     const j = await api('/api/media');
     $('m_url').value = j.imggen.url || ''; $('m_model').value = j.imggen.model || ''; $('m_size').value = j.imggen.size || '';
     $('v_url').value = j.vidgen.url || ''; $('v_model').value = j.vidgen.model || ''; $('v_max').value = j.vidgen.maxSeconds || 15;
-  } catch (e) { bar('读生图/生视频配置失败：' + e.message, 'bad'); }
+    $('t_url').value = j.tts.url || ''; $('t_model').value = j.tts.model || ''; $('t_design').value = j.tts.voiceDesign || '';
+    $('t_chars').value = j.tts.autoChars || 300; $('t_sing').value = j.tts.singVoice || '';
+  } catch (e) { bar('读生图/生视频/语音配置失败：' + e.message, 'bad'); }
 }
 async function saveMedia(side) {
   const b = side === 'imggen'
     ? { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(), imggenSize: $('m_size').value.trim() }
-    : { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim(), vidgenMaxSeconds: Number($('v_max').value) || 15 };
+    : side === 'vidgen'
+    ? { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim(), vidgenMaxSeconds: Number($('v_max').value) || 15 }
+    : { ttsUrl: $('t_url').value.trim(), ttsKey: $('t_key').value, ttsModel: $('t_model').value.trim(),
+        ttsVoiceDesign: $('t_design').value.trim(), ttsAutoVoiceChars: Number($('t_chars').value) || 300, ttsSingVoice: $('t_sing').value.trim() };
   try {
     await api('/api/media', { method: 'POST', body: JSON.stringify(b) });
-    bar('已保存（' + (side === 'imggen' ? '生图' : '生视频') + '）——重启机器人后生效', 'ok');
+    bar('已保存（' + MEDIA_NAME[side] + '）——重启机器人后生效', 'ok');
     if (confirm('现在重启机器人让 API 配置生效？')) await doRestart(false, true);
   } catch (e) { bar('保存失败：' + e.message, 'bad'); }
 }
