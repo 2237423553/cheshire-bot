@@ -565,9 +565,12 @@ function stripFakeDrawMark(s) {
 /** 拆出末尾的「语气指令：…」行（动态语气，10-23 上线：防每条语音一个腔调）。
  *  必须在压平空白**之前**调——那行自己占一行，压平了就跟正文搅一起拆不开了。 */
 function splitToneLine(s) {
-  const tm = /(?:^|\n)[ \t]*语气指令\s*[:：][ \t]*([^\n]{1,60})/.exec(String(s ?? ''));
-  if (!tm) return { text: String(s ?? ''), tone: '' };
-  return { text: s.slice(0, tm.index).trim(), tone: tm[1].trim() };
+  const s0 = String(s ?? '');
+  const tm = /(?:^|\n)[ \t]*语气指令\s*[:：][ \t]*([^\n]{1,60})/.exec(s0);
+  if (!tm) return { text: s0, tone: '' };
+  // 只摘语气行本身，行后的内容原样保留——之前是 slice(0,index) 整段砍尾，
+  // 语气行写中间会把后面的〔视频描述〕等行话一并吞掉（10-24 评审）
+  return { text: (s0.slice(0, tm.index) + s0.slice(tm.index + tm[0].length)).trim(), tone: tm[1].trim() };
 }
 
 /** 把回话洗成能念的纯口语：剥代码块 / markdown 符号 / emoji / 内部注记，压平空白。
@@ -575,7 +578,7 @@ function splitToneLine(s) {
 function sanitizeForSpeech(s) {
   return String(s ?? '')
     .replace(/```[\s\S]*?```/g, '')
-    .replace(/[*_`~#>｜｜]/g, '')
+    .replace(/[*_`~#>｜|]/g, '')
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
     .replace(/〔[^〕]*〕/g, '')
     .replace(/\s+/g, ' ')
@@ -601,6 +604,13 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
       // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
       // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
       if (!drewImage && /画好|画完|图片已(生成|发)|图已(经)?(生成|发出|发到|发送)|\[?已画图|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
+        // 谎话原样回传再指责（10-24 评审）：不回传的话下轮模型看到的是「凭空被骂」，
+        // 不知道自己错在哪、容易答非所问白费轮次
+        messages.push({
+          role: 'assistant',
+          content,
+          ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+        });
         messages.push({
           role: 'user',
           content: '[系统提示：你说「画好了」，但这一轮你并没有真的调用 generate_image 工具，群里的图片并不存在。' +
@@ -653,13 +663,21 @@ async function compressHistory(gid) {
   const transcript = old.map((m) => `${m.role === 'user' ? '群友' : '柴郡'}: ${m.text ?? m.content}`).join('\n');
 
   try {
+    // 不走 askLLM（10-24 评审）：askLLM 会套 systemPrompt 人设（摘要可能带喵味）
+    // 和工具清单（理论上可能触发搜索白花钱）——压缩就是压缩，直调 callLLM 不带工具
     const summary = (
-      await askLLM(
+      await callLLM(
         `summary-${gid}`,
-        transcript,
-        '你是上下文压缩器。把下面的群聊记录压成简明中文摘要（300 字以内），' +
-          '必须保留：人物、话题、结论、未解决的问题、关键事实与数字。' +
-          '只输出摘要本身，不要客套、不要 markdown、不要标题。',
+        [
+          {
+            role: 'system',
+            content: '你是上下文压缩器。把下面的群聊记录压成简明中文摘要（300 字以内），' +
+              '必须保留：人物、话题、结论、未解决的问题、关键事实与数字。' +
+              '只输出摘要本身，不要客套、不要 markdown、不要标题。',
+          },
+          { role: 'user', content: transcript },
+        ],
+        false,
       )
     ).trim();
 
@@ -1557,19 +1575,20 @@ bot.onGroupMessage(async (event, ctx) => {
         + (featureOn('tts', true) ? TONE_HINT : ''),
     )).trim();
 
-    // 动态语气：先拆语气指令行（它在末尾），别让行话漏进正文/历史；拆完再摘视频描述
-    const { text: replyBody, tone: voiceTone } = splitToneLine(reply);
-    reply = replyBody;
-
-    // 摘走「〔视频描述〕」那行：正文发群，描述进上下文，原片不留
+    // 行话摘取改为顺序无关（10-24 评审）：TONE_HINT 和 VIDEO_DESC_HINT 没规定先后，
+    // 模型把〔视频描述〕写在语气行之后时，旧的「先拆语气再摘描述」会把描述整段吞掉——
+    // 而原片本来就不进上下文，那条视频就在记忆里消失了。现在两行各自独立正则摘除，
+    // 谁先谁后都拆得干净。
     let videoDesc = '';
     if (hasVideo) {
-      const m = /〔视频描述〕\s*([\s\S]*)$/.exec(reply);
+      const m = /(?:^|\n)\s*〔视频描述〕\s*([^\n]*)/.exec(reply);
       if (m) {
-        videoDesc = m[1].split('\n')[0].trim().slice(0, 60);   // 先取行再去空格，反了会留尾空格
-        reply = reply.slice(0, m.index).trim();
+        videoDesc = m[1].trim().slice(0, 60);   // 先去空格再截，行内只取一行不会带进语气行
+        reply = (reply.slice(0, m.index) + reply.slice(m.index + m[0].length)).trim();
       }
     }
+    const { text: replyBody, tone: voiceTone } = splitToneLine(reply);
+    reply = replyBody;
 
     // 模型看到上下文里全是「[回 xxx]」开头的记录，会有样学样自己也编一个（还常编错人）。
     // 发出去之前摘掉，署名统一由下面一行用正确的名字加。

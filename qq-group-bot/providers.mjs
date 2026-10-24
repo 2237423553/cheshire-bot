@@ -132,6 +132,7 @@ export async function fetchModels(chatUrl, key, extraHeaders, modelsUrl) {
       'Accept': 'application/json',
       'User-Agent': 'qq-group-bot/1.0',
     }, extraHeaders),
+    signal: AbortSignal.timeout(30 * 1000),   // 10-24 评审：对端挂起时别让面板一直转圈
   });
   const txt = await r.text();
   if (!r.ok) throw new Error(`拉模型列表失败 HTTP ${r.status}：${txt.slice(0, 140)}`);

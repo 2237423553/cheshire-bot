@@ -100,6 +100,9 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       // ③ 下载成片（站内相对路径）。任务已 done、费用已扣，下载失败绝不直接放弃：
       // 429/5xx/超时都重试（中转实测会在下载这步限流），最多 4 把
       const url = j.video?.url ?? `/v1/videos/${rid}/content`;
+      // 成片地址可能是站内相对路径，也可能返回绝对 URL——字符串硬拼会把绝对地址拼坏
+      //（10-24 评审）。绝对的原样用，相对的才挂 baseOf()
+      const dlUrl = /^https?:\/\//i.test(url) ? url : baseOf() + url;
       let buf = null;
       let dlErr = '';
       let drHeaders = {};   // 上一把下载响应的头（取 Retry-After 用）
@@ -111,7 +114,7 @@ export async function generateVideo(prompt, imageDataUrl = '') {
           await new Promise((res) => setTimeout(res, wait));
         }
         try {
-          const dr = await fetch(baseOf() + url, {
+          const dr = await fetch(dlUrl, {
             headers: { 'Authorization': `Bearer ${cfg.vidgenKey}` },
             signal: AbortSignal.timeout(120 * 1000),
           });

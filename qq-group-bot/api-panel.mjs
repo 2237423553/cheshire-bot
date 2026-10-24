@@ -51,7 +51,11 @@ function fail(e, status = 400) {
 function needToken(req) {
   if (req.headers.get('x-panel-token') !== TOKEN) throw Object.assign(new Error('面板令牌不对'), { status: 403 });
   const origin = req.headers.get('origin');
-  if (origin && !origin.startsWith(`http://127.0.0.1:`)) throw Object.assign(new Error('来源不对（拒绝跨面板调用）'), { status: 403 });
+  // 127.0.0.1 和 localhost 都认（10-24 评审：只认 127.0.0.1 前缀时用 localhost 打开面板会全程 403）；
+  // 端口不限死——面板端口会顺延。真正的门闩是上面的 X-Panel-Token。
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) {
+    throw Object.assign(new Error('来源不对（拒绝跨面板调用）'), { status: 403 });
+  }
 }
 async function bodyJson(req) {
   try { return await req.json(); } catch { return {}; }

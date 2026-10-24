@@ -252,8 +252,8 @@ function loadProfiles() {
         + '<br><span class="hint">' + esc(p.model || '') + ' · ' + esc(p.llmUrl) + '</span></td>'
         + '<td><span class="hint">探测</span> ' + esc(dots) + '</td>'
         + '<td style="text-align:right;white-space:nowrap">'
-        + '<button onclick="applyProf(\\'' + p.id + '\\')">启用</button>'
-        + '<button class="dan" onclick="delProf(\\'' + p.id + '\\')">删除</button></td></tr>');
+        + '<button onclick="applyProf(\\'' + esc(p.id) + '\\')">启用</button>'
+        + '<button class="dan" onclick="delProf(\\'' + esc(p.id) + '\\')">删除</button></td></tr>');
     }
     $('prof_tbl').innerHTML = rows.length ? rows.join('') : '<tr><td class="hint">还没有存过档案</td></tr>';
   }).catch((e) => bar('档案读取失败：' + e.message, 'bad'));

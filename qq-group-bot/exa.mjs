@@ -26,15 +26,26 @@ function parseSse(txt) {
 }
 
 async function rpc(method, params, id) {
-  const r = await fetch(cfg.exaMcpUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/event-stream',   // MCP 规范要求两个都给
-      ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', ...(id ? { id } : {}), method, ...(params ? { params } : {}) }),
-  });
+  // ⚠️ 必须带超时（10-24 评审）：MCP 端点一旦挂起不响应，无超时会让工具循环无限等待，
+  // 这条 @ 消息永远没回音也没报错。60s 够 Exa 慢慢想，不至于卡死整条回复。
+  let r;
+  try {
+    r = await fetch(cfg.exaMcpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',   // MCP 规范要求两个都给
+        ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', ...(id ? { id } : {}), method, ...(params ? { params } : {}) }),
+      signal: AbortSignal.timeout(60 * 1000),
+    });
+  } catch (e) {
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+      throw new Error('Exa 搜索 60 秒没响应，已掐断这次请求（是超时不是卡死）');
+    }
+    throw e;
+  }
   const s = r.headers.get('mcp-session-id');
   if (s) sessionId = s;
   return parseSse(await r.text());
