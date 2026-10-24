@@ -15,6 +15,7 @@ import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
 import * as imggen from './imggen.mjs';
 import * as vidgen from './vidgen.mjs';
+import * as tts from './tts.mjs';
 import { extractBvLink, summarizeVideo } from './bilibili.mjs';
 
 // ─────────── 限制 ───────────
@@ -493,6 +494,10 @@ async function generateImageTool(args, gid) {
     console.warn('[bot] 图片发送失败:', e.message);
     return `图已经画好了（${Math.round(buf.length / 1024)}KB）但发到群里失败：${e.message}`;
   }
+  // 工具路径画的图也要记进 lastDraw，否则 10 分钟内的「改一下」会捞到上上次的旧 prompt
+  // （10-23 事故：雪乃烟花图走工具路径没记账，改稿路由拿两轮前的火箭 prompt 重画了火箭）
+  // 键一律 Number()：意图路由存的是 event.group_id（数字），构造必须一致（坑 28）
+  if (gid != null) lastDrawByGroup.set(Number(gid), { prompt: args.prompt, subj: '(模型工具画)', at: Date.now() });
   return `图片已生成并发到群里（${Math.round(buf.length / 1024)}KB）。用一两句话告诉指挥官画的是什么即可。`;
 }
 
@@ -548,6 +553,35 @@ function cleanToolArtifacts(s) {
     .trim();
 }
 
+/** 「[已画图: X]」是画图路由记进上下文的内部格式；模型有样学样打出来就是谎报/漏账，
+ *  这种行话不许漏到群里（10-23 事故：模型没调工具直接印「[已画图: Blackhole8伸治]」装画好）。
+ *  出群前一律剥掉，括号带不带、全角半角、带不带冒号都覆盖。 */
+function stripFakeDrawMark(s) {
+  return String(s ?? '')
+    .replace(/\[已画图\s*[:：][^\]】\n]{0,80}\]|\[已画图\]|【已画图\s*[:：]?[^】\n]{0,80}】/g, '')
+    .trim();
+}
+
+/** 拆出末尾的「语气指令：…」行（动态语气，10-23 上线：防每条语音一个腔调）。
+ *  必须在压平空白**之前**调——那行自己占一行，压平了就跟正文搅一起拆不开了。 */
+function splitToneLine(s) {
+  const tm = /(?:^|\n)[ \t]*语气指令\s*[:：][ \t]*([^\n]{1,60})/.exec(String(s ?? ''));
+  if (!tm) return { text: String(s ?? ''), tone: '' };
+  return { text: s.slice(0, tm.index).trim(), tone: tm[1].trim() };
+}
+
+/** 把回话洗成能念的纯口语：剥代码块 / markdown 符号 / emoji / 内部注记，压平空白。
+ *  TTS 念不了那些东西；「语音路由」和「自动语音化」共用这一套口径。 */
+function sanitizeForSpeech(s) {
+  return String(s ?? '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/[*_`~#>｜｜]/g, '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
+    .replace(/〔[^〕]*〕/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function askLLM(sessionId, userContent, extraSystem = '') {
   const messages = [
     { role: 'system', content: buildSystem(sessionId, extraSystem) },
@@ -566,7 +600,7 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
       // 模型有样学样：上下文里全是「画好啦喵～」的成功句式，它就会跳过工具直接编一句。
       // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
       // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
-      if (!drewImage && /画好|画完|图片已(生成|发)|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
+      if (!drewImage && /画好|画完|图片已(生成|发)|图已(经)?(生成|发出|发到|发送)|\[?已画图|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
         messages.push({
           role: 'user',
           content: '[系统提示：你说「画好了」，但这一轮你并没有真的调用 generate_image 工具，群里的图片并不存在。' +
@@ -574,7 +608,9 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
         });
         continue;
       }
-      return content;
+      // 剥掉学样打出来的「[已画图: …]」行话——真画过的图由路由/工具路径自己发图+记账，
+      // 这串文字出现在回话里只能说明模型在装，露出去群里假到肉眼难辨
+      return stripFakeDrawMark(content);
     }
 
     // MiMo 官方要求：思考模式下带工具调用的 assistant 消息必须完整回传
@@ -600,7 +636,7 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     content: '[系统提示：工具调用次数已达上限，请不要再调用任何工具，直接给出最终回答]',
   });
   const final = await callLLM(sessionId, messages, true);
-  return cleanToolArtifacts(final.content ?? '');
+  return stripFakeDrawMark(cleanToolArtifacts(final.content ?? ''));
 }
 
 // ─────────── 上下文自动压缩 ───────────
@@ -742,6 +778,13 @@ const VIDEO_DESC_HINT =
   '\n【额外要求】回答完之后，另起一行写「〔视频描述〕」，后面跟一句对这段视频画面的客观描述（25 字以内）。' +
   '这一行由系统单独取走、不会发给群友，所以正文里别提到它。';
 
+/** 动态语气申报（10-23 随语音功能上线）：提示模型末尾附一行念法，系统拆走拼给 TTS */
+const TONE_HINT =
+  '\n【额外要求】回答完之后，另起一行用「语气指令：」开头，写一句 20~40 字的念法描述' +
+  '（情绪/音调/语速，贴合内容和当下的心情，每条不许雷同，' +
+  '例：得意洋洋语速快尾音上扬／困到不行慢半拍／气鼓鼓音调拔高）。' +
+  '这一行由系统单独取走、不会发给群友，所以正文里别提到它。';
+
 /** 思考强度的展示文案（启动日志和 #模型 指令共用，免得两处写得不一致） */
 function thinkingLabel() {
   return !cfg.thinking || cfg.thinking === 'default' ? '模型默认（不传参数）' : JSON.stringify(cfg.thinking);
@@ -863,6 +906,16 @@ async function translateVideoPrompt(sid, subj) {
 }
 
 /**
+ * 英文详单直通判定：主体基本是英文（CJK 字符占比 <15%）且够长，就当作现成的
+ * 细致英文 prompt——跳过翻译层原样发给生图模型（2026-10-22 指挥官指示：
+ * 这种 prompt 不许二次转手，转手只会丢细节），最多补画质词。
+ */
+function looksLikeEnglishPrompt(t) {
+  const cjk = (t.match(/[一-鿿]/g) ?? []).length;
+  return t.length >= 40 && cjk / t.length < 0.15;
+}
+
+/**
  * 画图意图识别（意图强制路由的闸门）。
  * 命中：@ 后「画…」开头（画一张/画个/画大凤…），或「生成/来/出 …图(片/照片)」句式。
  * 原则：**宁漏勿错** —— 文字类产物（代码/脚本/文档…）绝对不接画，闲聊疑似灵活放行。
@@ -886,6 +939,35 @@ function parseDrawIntent(raw) {
   const nounDraw = /(?:画|生成|来|出)\s*[^。？！]{0,50}(?:图|图片|照片)/.test(t);
   if (!headDraw && !counterDraw && !nounDraw) return null;
   return t;
+}
+
+/**
+ * 唱歌意图（唱歌路由的闸门）：「唱歌 xxx」「唱首/唱一段/唱个/来一首 xxx」，
+ * 裸「唱歌」也接（自由发挥）。返回话题原文（可为空串），不命中返回 null。
+ */
+function parseSongIntent(raw) {
+  const t = String(raw ?? '').trim();
+  const m = /^(?:唱歌|唱首|唱一段|唱个|来一首|来首歌)\s*[：:]?\s*([\s\S]{0,60})$/.exec(t);
+  if (m) return m[1].trim();
+  const m2 = /^(?:唱|来一首)\s*[：:]\s*([\s\S]{1,60})$/.exec(t);
+  return m2 ? m2[1].trim() : null;
+}
+
+/**
+ * 语音回复意图（语音路由的闸门）。返回**完整原文**当话题（不剥触发词）——
+ * 「用日语说一段小故事」这种语言/文风要求全在触发词里，剥了模型就不知道要念日语了。
+ * 命中三类：
+ *  ①「语音：xxx」「语音说 xxx」「用语音说 xxx」（显式点名要语音）
+ *  ②「用<某种话>说/念/讲 xxx」——用日语说一段小故事…（话种列表白名单，宁漏勿错）
+ *  ③「说/念/讲一段 xxx」——明确「要我开口」的句式（10-23 事故：被当文字诉求写成长文贴墙）
+ */
+function parseVoiceIntent(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t) return null;
+  if (/^(?:用语音说|语音说|语音)\s*[：:]?\s*[\s\S]{2,120}$/.test(t)) return t;
+  if (/^用(?:日语|中文|英文|英语|韩语|法语|德语|俄语|粤语|普通话|东北话|四川话|河南话|广东话|方言|文言)\s*(?:说|念|讲|来一段|开个腔)\s*[\s\S]{2,100}$/.test(t)) return t;
+  if (/^(?:说|念|讲)\s*一段\s*[\s\S]{2,100}$/.test(t)) return t;
+  return null;
 }
 
 /**
@@ -1098,11 +1180,11 @@ console.log(`[bot] 指令：#上下文（查记忆） · #压缩（手动压缩�
 console.log('[bot]      #战绩 <玩家名>（战争雷霆 K/D / 胜率，走 Thunderskill）');
 console.log(`[bot]      #吃什么（从 ${foodCount()} 道菜里真随机抽早/中/晚三餐，模型只写推荐语）`);
 console.log(`[bot] 复读：群里出现「+1 复读」时跟着复读一次（同一内容只跟一次，防死循环）`);
-console.log(`[bot] 支持：文字 / 图片 / 视频 | 语音暂不支持(QQ用SILK编码)`);
+console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（@ 说「语音：xxx」触发，MiMo TTS 合成）`);
 console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
 {
   // 开机打一眼当前开关状态（面板改了开关不用重启，这行只在启动时打一次快照）
-  const names = { imggen: '画画', vidgenEnabled: '生视频', bilibili: 'B站总结', search: '搜索', repeat: '复读', beacon: '信标' };
+  const names = { imggen: '画画', vidgenEnabled: '生视频', bilibili: 'B站总结', search: '搜索', repeat: '复读', beacon: '信标', tts: '语音' };
   const states = Object.entries(names).map(([k, l]) => `${l}=${featureOn(k, k === 'vidgenEnabled' ? cfg.vidgenEnabled !== false : true) ? '开' : '关'}`);
   console.log(`[bot] 功能开关：${states.join(' · ')}（switches.json，每条消息现读，面板改了即刻生效）`);
 }
@@ -1229,13 +1311,27 @@ bot.onGroupMessage(async (event, ctx) => {
   if (drawSubj) {
     const sid = `img-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
     try {
-      const prompt = await translateDrawPrompt(sid, drawSubj, isRedraw ? lastDraw.prompt : '');
+      // 英文详单直通：剥掉中文引导头（生成一张/画一张），原样发，最多补画质词；
+      // 改稿请求不直通（要结合上次 prompt 修改，必须过翻译层）
+      let prompt = null;
+      let englishDirect = false;
+      if (!isRedraw && looksLikeEnglishPrompt(drawSubj)) {
+        englishDirect = true;
+        prompt = drawSubj
+          .replace(/^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}(?:画|生成|来|出)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)?\s*/i, '')
+          .replace(/[。\s]+$/, '')
+          .trim();
+        if (!/detail|quality|sharp|8k|4k|high[- ]?res|photorealistic/i.test(prompt)) {
+          prompt += ', ultra-detailed, high quality, crisp detail';
+        }
+      }
+      if (!prompt) prompt = await translateDrawPrompt(sid, drawSubj, isRedraw ? lastDraw.prompt : '');
       if (!prompt) {
         // 翻译层否决：不是画图诉求，走正常对话继续
         drawVeto = true;
         console.log(`[bot] 群 ${gid} 画图意图被翻译层否决 <- ${drawSubj.slice(0, 18)}`);
       } else {
-        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : englishDirect ? '意图路由（英文直通）' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
         await ctx.reply(text(isRedraw
           ? `收到喵，按「${drawSubj.slice(0, 20)}」重新画，要等十几秒～`
           : `正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
@@ -1353,6 +1449,97 @@ bot.onGroupMessage(async (event, ctx) => {
     if (!vidVeto) return;
   }
 
+  // ── 唱歌路由（2026-10-23 上线）：(唱歌) 标签是 mimo-v2.5-tts「预置音色」专属，
+  // voicedesign 不能唱（官方互斥设计）——说话用捏的柴郡声线，唱歌借预置嗓子。
+  // 流程：LLM 写歌词（独立小会话）→ (唱歌) 合成 → record 发群 → 🎵 歌词跟上。
+  const songSubj = atMe ? parseSongIntent(userText) : null;
+  if (songSubj !== null) {   // 注意用 !== null：话题为空串（裸「唱歌」）也是命中
+    const sid = `sing-${gid}`;
+    try {
+      if (!featureOn('tts', true)) {
+        console.log(`[bot] 群 ${gid} 语音功能已暂停（含唱歌），直接回绝`);
+        await ctx.reply(text('语音功能暂停营业喵，恢复时间等指挥官通知～'));
+        return;
+      }
+      const sys = '你是歌词写手。按话题写一段中文歌词，直接输出歌词本身：2~4 句、每句不超过 14 字、'
+        + '总共 30~80 字，适合演唱、有记忆点；话题太小或太怪就自由发挥。无解释、无标题、无 markdown、无 emoji。'
+        + `话题：${songSubj || '柴郡（俏皮的猫系女仆）想让指挥官开心，写一首她的俏皮短歌'}`;
+      const raw = await callLLM(sid, [
+        { role: 'system', content: sys },
+        { role: 'user', content: songSubj || '随便来一段' },
+      ], false);
+      let lyrics = stripFakeDrawMark(raw.content ?? '')
+        .replace(/```[\s\S]*?```/g, '')
+        .replace(/[*_`#>]/g, '')
+        .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
+        .trim();
+      if (!lyrics) throw new Error('没写出能唱的词');
+      if (lyrics.length > 200) lyrics = lyrics.slice(0, 200);
+      console.log(`[bot] 🎵 唱歌路由接管 群 ${gid}：${lyrics.length} 字 <- ${songSubj.slice(0, 18) || '(自由发挥)'}`);
+      await ctx.reply(text('清清嗓子喵～歌要等十几秒就到～'));
+      const buf = await tts.generateSong(lyrics);
+      await http.raw('send_group_msg', {
+        group_id: Number(gid),
+        message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
+      }, { timeoutMs: 120 * 1000 });
+      await sendReply(ctx, `🎵 ${lyrics}`, { strip: cfg.stripMarkdown });
+      pushHistory(gid, 'user', songSubj || '(想听歌)', `${displayName(event)}: 想听${songSubj ? `「${songSubj}」` : '咱唱歌'} [要求唱歌]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已唱歌] 🎵 ${lyrics}`);
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 唱歌出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 没唱出去喵：${String(e.message).slice(0, 100)}`)); }
+      catch (e2) { console.error('[bot] 唱歌失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);
+    }
+    return;   // 接管成功或失败都到此为止
+  }
+
+  // ── 语音回复路由（2026-10-23 上线：MiMo TTS + SnowLuma record 自动转 SILK）──
+  // 触发：@ 说「语音：xxx」/「语音说 xxx」——脚本接管全程：LLM 出一段口语化回话
+  // -> TTS 合成 wav -> record 段发群 -> 文字版跟上。模型没有装成功的机会。
+  const voiceSubj = atMe ? parseVoiceIntent(userText) : null;
+  if (voiceSubj && !featureOn('tts', true)) {
+    console.log(`[bot] 群 ${gid} 语音功能已暂停，直接回绝 <- ${voiceSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('语音功能暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  if (voiceSubj) {
+    try {
+      // 让主 LLM 在现有群聊上下文里组织一句能念的回话（带本轮媒体，图片照常看得见）
+      // 动态语气（10-23）：要求它在末尾另起一行报「语气指令：…」，防每条语音一个腔调
+      const raw = await askLLM(`group-${gid}`, content.parts,
+        '指挥官要求用语音回复：你的这段回话会被合成语音念到群里。请控制在 100 字以内、'
+        + '纯口语——不许用 markdown、表情符号、编号或换行，那些 TTS 念出来很难听。'
+        + '然后在回话末尾另起一行，用「语气指令：」开头写一句 20~40 字的念法描述'
+        + '（情绪/音调/语速，要贴合内容和当下的心情，每条都不许雷同，'
+        + '例：得意洋洋语速快尾音上扬／困到不行慢半拍／气鼓鼓音调拔高）。'
+        + `要聊的话题：${voiceSubj}`);
+      // 先拆语气指令行、再洗成能念的口语（拆行必须在压平空白之前，见 splitToneLine 注释）
+      const tl = splitToneLine(stripFakeDrawMark(raw));
+      const tone = tl.tone;
+      let speak = sanitizeForSpeech(tl.text);
+      if (!speak) throw new Error('没拿到能念的话');
+      if (speak.length > 160) speak = speak.slice(0, 155) + '，后面没法念了喵。';
+      console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
+      const buf = await tts.generateSpeech(speak, tone);
+      await http.raw('send_group_msg', {
+        group_id: Number(gid),
+        message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
+      }, { timeoutMs: 120 * 1000 });
+      await sendReply(ctx, `🗣️ ${speak}`, { strip: cfg.stripMarkdown });
+
+      // 进对话线：user 记诉求、assistant 记语音说了什么，之后可以接着聊
+      pushHistory(gid, 'user', voiceSubj, `${displayName(event)}: ${voiceSubj} [要求语音回复]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发语音] ${speak}`);
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 语音出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 语音没发出去喵：${String(e.message).slice(0, 100)}`)); }
+      catch (e2) { console.error('[bot] 语音失败提示也发不出去：', e2.message); }
+    }
+    return;   // 接管成功或失败都到此为止
+  }
+
   try {
     await maybeCompress(gid);   // 上下文到阈值就先压缩，再进本轮
 
@@ -1364,8 +1551,15 @@ bot.onGroupMessage(async (event, ctx) => {
     let reply = (await askLLM(
       `group-${gid}`,
       content.parts,
-      lengthHint() + (hasVideo ? VIDEO_DESC_HINT : ''),
+      lengthHint() + (hasVideo ? VIDEO_DESC_HINT : '')
+        // 动态语气（10-23）：语音开关开着就让它顺手申报念法；拆行在下面统一做，
+        // 就算这轮回复太长没语音化，那行行话也会被摘走、不会漏到群里
+        + (featureOn('tts', true) ? TONE_HINT : ''),
     )).trim();
+
+    // 动态语气：先拆语气指令行（它在末尾），别让行话漏进正文/历史；拆完再摘视频描述
+    const { text: replyBody, tone: voiceTone } = splitToneLine(reply);
+    reply = replyBody;
 
     // 摘走「〔视频描述〕」那行：正文发群，描述进上下文，原片不留
     let videoDesc = '';
@@ -1399,10 +1593,30 @@ bot.onGroupMessage(async (event, ctx) => {
       reply = reply.slice(0, cfg.maxReplyChars) + '…';
     }
 
+    // ── 自动语音化（2026-10-23 指挥官指示）：≤300 字的回复先发语音，文字版跟上 ──
+    // TTS 挂了/被审核就回退纯文字，回话不能丢；长回复（>300）维持纯文字分段连发
+    let voiceOk = false;
+    if (reply.length <= cfg.ttsAutoVoiceChars && featureOn('tts', true)) {
+      try {
+        const speak = sanitizeForSpeech(reply);
+        if (speak) {
+          const buf = await tts.generateSpeech(speak, voiceTone);
+          await http.raw('send_group_msg', {
+            group_id: Number(gid),
+            message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
+          }, { timeoutMs: 120 * 1000 });
+          voiceOk = true;
+          console.log(`[bot] 🎙 群 ${gid} 自动语音：念 ${speak.length} 字${voiceTone ? `（语气：${voiceTone}）` : '（默认语气）'}`);
+        }
+      } catch (e) {
+        console.error('[bot] 自动语音失败，回退纯文字：', e.message);
+      }
+    }
+
     // 长回复自动分段连发，避免单条被 QQ 吞掉或挤成一坨
     const chunks = splitMessage(reply, cfg.chunkChars);
     for (let i = 0; i < chunks.length; i++) {
-      await ctx.reply(text(chunks[i]));
+      await ctx.reply(text((voiceOk && i === 0 ? '🗣️ ' : '') + chunks[i]));
       if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 500));
     }
     const tok = promptTokens.get(`group-${gid}`) ?? '?';

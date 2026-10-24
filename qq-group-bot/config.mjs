@@ -103,6 +103,22 @@ export const cfg = {
   vidgenMaxSeconds: 15,   // 成片时长上限（脚本硬检查，超了弃用不发；提交不带 duration 走自动时长省额度）
   vidgenEnabled: true,    // 生视频业务总闸：false = @ 点视频直接回歇业，不进普通对话；true = 正常营业
 
+  // ── 语音合成（MiMo 官方 TTS，OpenAI 兼容 chat/completions；2026-10-23 上线）──
+  // voicedesign：user 消息=音色设计描述（自然语言捏声线，不用参考音频），assistant 消息=要念的文本；
+  // 响应 choices[0].message.audio.data = base64 wav。TTS 系列限时免费。
+  ttsUrl: 'https://api.xiaomimimo.com/v1/chat/completions',
+  ttsKey: 'sk-在这里填你的MiMo-TTS密钥',
+  ttsModel: 'mimo-v2.5-tts-voicedesign',
+  // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（默认 300）
+  ttsAutoVoiceChars: 300,
+  // 柴郡的声线：改这一句就能换音色（voicedesign 就是靠描述捏；官方口径=只写「是什么」、
+  // 别写否定句，带一个具象锚点最灵）
+  ttsVoiceDesign: '一位年轻的女性，说标准普通话，嗓音清甜柔软、中低音区带轻微气声，像贴在耳边说话的黑猫少女声优。语速快而机灵，句尾慵懒地拖长上勾，语气甜里透着狡黠的得意，爱卖关子逗人，偶尔轻轻笑出声。',
+  // 唱歌（2026-10-23 上线）：唱歌是 mimo-v2.5-tts「预置音色」专属能力，
+  // voicedesign 不支持（官方互斥设计）——说话用捏音，唱歌借预置嗓子
+  ttsSingModel: 'mimo-v2.5-tts',
+  ttsSingVoice: '茉莉',
+
   // ── 网络搜索 / 网页抓取（Exa MCP Server，2026-10-17 从直连 REST 改为 MCP）──
   // 实测无需 API key 即可用；若被限流，可在 URL 后追加 ?exaApiKey=你的key
   exaMcpUrl: 'https://mcp.exa.ai/mcp',
