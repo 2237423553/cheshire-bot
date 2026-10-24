@@ -6,11 +6,16 @@
 //     重定向还有个好处 —— 出问题能在 bot.log / bot.err 里查到。
 //  （从 switch-model.mjs 原样搬出，别重写；两个 Windows 坑注释保留。）
 // ═══════════════════════════════════════════════════════════════════════
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
+
+// 优先用工作区自带的 bun（../tools/bun.exe）：PATH 里那把是 CherryStudio 捆绑的，
+// 它哪天升级/卸载会把机器人的启动链路一起带走（10-24 加固）。没有本地副本才退回 PATH。
+const LOCAL_BUN = path.join(__dir, '..', 'tools', 'bun.exe');
 
 /** 数正在跑的 bot.mjs 进程数（独立查询，不重定向子进程，可安全捕获输出） */
 export function countBotProcs() {
@@ -34,7 +39,7 @@ export function restartBot() {
     "$ErrorActionPreference='SilentlyContinue'",
     "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'bun.exe' -and $_.CommandLine -like '*bot.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
     'Start-Sleep -Seconds 1',
-    "$bun = (Get-Command bun).Source",
+    "$bun = " + (fs.existsSync(LOCAL_BUN) ? `'${LOCAL_BUN.replace(/'/g, "''")}'` : "(Get-Command bun).Source"),
     `Start-Process -FilePath $bun -ArgumentList 'run','bot.mjs' -WorkingDirectory '${__dir}' -WindowStyle Hidden -RedirectStandardOutput '${log}' -RedirectStandardError '${err}'`,
     'Start-Sleep -Seconds 4',
     "$n = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'bun.exe' -and $_.CommandLine -like '*bot.mjs*' }).Count",

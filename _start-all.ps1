@@ -14,9 +14,12 @@ Write-Output "======================================================="
 Write-Output ("workdir : " + $root)
 
 # ---- runtimes ---------------------------------------------------------
-$bun = (Get-Command bun -ErrorAction SilentlyContinue).Source
+# Prefer the workspace-local bun copy (tools\bun.exe) so the stack keeps
+# working even if the PATH bun (bundled with Cherry Studio) disappears.
+$bun = Join-Path $root "tools\bun.exe"
+if (-not (Test-Path $bun)) { $bun = (Get-Command bun -ErrorAction SilentlyContinue).Source }
 if (-not $bun) {
-    Write-Output "ERROR: 'bun' not found in PATH. Install bun first."
+    Write-Output "ERROR: bun not found (no tools\bun.exe, none in PATH). Install bun first."
     exit 1
 }
 # SnowLuma ships its own node.exe - the native addons in native/ are ABI-locked

@@ -5,7 +5,10 @@
 $dir = $PSScriptRoot
 Write-Output ("workdir : " + $dir)
 
-$bun = (Get-Command bun -ErrorAction SilentlyContinue).Source
+# Prefer the workspace-local bun copy (..\tools\bun.exe) so the bot keeps
+# starting even if the PATH bun (bundled with Cherry Studio) disappears.
+$bun = Join-Path (Split-Path $PSScriptRoot -Parent) "tools\bun.exe"
+if (-not (Test-Path $bun)) { $bun = (Get-Command bun -ErrorAction SilentlyContinue).Source }
 if (-not $bun) {
     Write-Output "ERROR: 'bun' not found in PATH. Install bun or fix PATH first."
     exit 1
