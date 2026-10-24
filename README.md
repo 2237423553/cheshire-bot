@@ -8,7 +8,8 @@
 A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself (playurl direct-stream → multimodal model) and summarizes it, asks her to **draw** something and the image lands right in the group (gpt-image-2), or generate **videos** from text and images (Grok Imagine, ≤15 s). She now **speaks** — replies ≤300 chars go out as voice first (MiMo TTS with natural-language voice design + per-message tone), and can even **sing** on request. Extras: web search (Exa MCP), context memory with auto-compression, admin commands, and a **local web config panel** with provider presets (OpenCode / DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama) and an automatic 4-point probe (basic generation / thinking modes / tool calling / vision).
 
 - **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM (default: MiMo)
-- **This repo contains no keys** — fill your own in `config.mjs` (placeholders marked); SnowLuma is a separate install
+- **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens, `mediaapi.json` / `llmstate.json` written by the panel); `config.mjs` ships placeholders only
+- Outbound requests on user-supplied URLs pass an SSRF gate (http/https only, loopback/private hosts rejected by literal check and DNS resolution); every external fetch has a hard timeout
 - Docs are in Chinese (docs/01–03 + 更新公告 with an English summary at top); code comments are Chinese too, but the code itself is straightforward to read
 
 > 中文文档从下一节开始 / Chinese docs start below ↓
@@ -60,10 +61,11 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
 
 1. **安装 SnowLuma**（第三方 QQ↔OneBot 桥，不在本仓库）到仓库根目录 `SnowLuma\`
    ⚠️ 非官方协议工具，接入 QQ 有封号风险；非商业许可，商用需其书面授权
-2. **填配置** `qq-group-bot/config.mjs`：
-   - `llmKey` → 你的 LLM API Key（OpenAI 兼容端点；默认端点需 `x-opencode-session` 会话头）
-   - `imggenKey` → 生图 Key（不用可留占位）
-   - `obHttpToken` / `obWsToken` → 与 SnowLuma 的 `config/onebot_<你的QQ号>.json` 一致
+2. **填配置**——真 Key 一律住 gitignored 运行时文件，`config.mjs` 只留占位符（密钥下沉，2026-10-24 起）：
+   - `qq-group-bot/secrets.json` → `llmKey`（LLM API Key；默认端点需 `x-opencode-session` 会话头，bot 自动带）
+     + `obHttpToken` / `obWsToken`（与 SnowLuma 的 `config/onebot_<你的QQ号>.json` 一致）
+   - 生图/生视频/语音的端点/Key → 面板「生图 API / 生视频 API / 语音 API」卡（写 `mediaapi.json`），或手改该文件
+   - LLM 端点/模型 → 面板或 `切换模型.cmd`（写 `llmstate.json`）
 3. **装依赖**：`cd qq-group-bot && bun install`
 4. **前置**：本机装 NTQQ（9.9.x；经典版不支持）并登录机器人的 QQ 号
 5. **双击 `一键启动.cmd`**：自动停旧实例 → 起 SnowLuma + 机器人 → 弹管理后台 → 12 项自检
@@ -81,7 +83,7 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
 - **更改人设 / 提示词**：全部集中在 `config.mjs`——`systemPrompt`（人设 + 铁律 + 能力边界）、
   `eatPrompt`（#吃什么 文案语气）、`beaconTrigger/beaconReply`（信标词）。
   改完重启生效，验证三步见 [docs/01 · 8.2](docs/01-部署与配置.md)
-- **功能开关**：面板「功能开关」子窗（即刻生效）或手改 `qq-group-bot/switches.json`；生图/生视频的端点/Key 在面板「生图 API / 生视频 API」卡里改（写 `mediaapi.json`，重启生效）
+- **功能开关**：面板「功能开关」子窗（即刻生效）或手改 `qq-group-bot/switches.json`；生图/生视频/语音的端点/Key/声线在面板「生图 API / 生视频 API / 语音 API」卡里改（写 `mediaapi.json`，重启生效）；LLM Key + OneBot 令牌在 `qq-group-bot/secrets.json`（手改，重启生效）
 
 ## 文档（细节都在这里）
 
@@ -96,7 +98,7 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
 
 ## 已知边界
 
-- QQ 语音消息（SILK v3）不支持，机器人会如实说听不了
+- 机器人**能发**语音（TTS 合成）但**听不懂**收到的语音消息，会如实说听不了
 - 视频 URL 直传上限 300MB（≈720P 20 分钟）；base64 兜底受 50MB 字符串限制
 - B站免登录 720P 封顶；会员/付费视频拿不到直链会明着报错
 - **视频请求的 prompt_tokens 是粗估值**，不能判断服务端是否真拉到了视频；
