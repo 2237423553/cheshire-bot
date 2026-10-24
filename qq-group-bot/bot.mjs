@@ -471,6 +471,26 @@ async function runTool(name, args, gid) {
 }
 
 /** 画图工具：生成 -> 直接发群 -> 回执给模型。失败把原因喂回去让它如实转告 */
+// ── 画图后小表情（2026-10-24 指挥官指示）：每次真画完图，跟一张「营业中」贴纸 ──
+// 文件在 assets/（gitignore 挡着、不进仓库）；读不到就静默跳过，绝不碍着画图主线
+let drawStickerB64 = '';
+function drawStickerSeg() {
+  if (drawStickerB64) return { type: 'image', data: { file: 'base64://' + drawStickerB64 } };
+  try {
+    drawStickerB64 = readFileSync(fileURLToPath(new URL('./assets/draw-done.gif', import.meta.url))).toString('base64');
+    return { type: 'image', data: { file: 'base64://' + drawStickerB64 } };
+  } catch { return null; }   // 没装贴纸 = 什么也不发
+}
+async function sendDrawSticker(gid) {
+  const seg = drawStickerSeg();
+  if (!seg) return;
+  try {
+    await http.raw('send_group_msg', { group_id: Number(gid), message: [seg] }, { timeoutMs: 60 * 1000 });
+  } catch (e) {
+    console.warn('[bot] 画图贴纸没发出去（不影响主线）:', e.message);
+  }
+}
+
 async function generateImageTool(args, gid) {
   if (!gid) return '这里不是群聊，没法发图。';
   console.log(`[bot] 🎨 画画：${args.prompt}`);
@@ -505,6 +525,7 @@ async function generateImageTool(args, gid) {
   // （10-23 事故：雪乃烟花图走工具路径没记账，改稿路由拿两轮前的火箭 prompt 重画了火箭）
   // 键一律 Number()：意图路由存的是 event.group_id（数字），构造必须一致（坑 28）
   if (gid != null) lastDrawByGroup.set(Number(gid), { prompt: args.prompt, subj: '(模型工具画)', at: Date.now() });
+  await sendDrawSticker(gid);   // 画完跟一张「营业中」贴纸（指挥官 10-24 指示）
   return `图片已生成并发到群里（${Math.round(buf.length / 1024)}KB）。用一两句话告诉指挥官画的是什么即可。`;
 }
 
@@ -1372,6 +1393,7 @@ bot.onGroupMessage(async (event, ctx) => {
           ? `改好啦喵～按「${drawSubj.slice(0, 30)}」重新画了一版`
           : `画好啦喵～给指挥官画的是：${drawSubj}`;
         await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+        await sendDrawSticker(gid);   // 画完跟一张「营业中」贴纸（意图/改稿两条线都在这）
 
         // 记下这次的 prompt：10 分钟内的「改一下/性别错了」能接着改稿
         lastDrawByGroup.set(gid, { prompt, subj: drawSubj, at: Date.now() });
