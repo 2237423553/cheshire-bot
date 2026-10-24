@@ -10,6 +10,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
+import { assertSafeUrl } from './providers.mjs';
 import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
@@ -166,7 +167,13 @@ async function toDataUrl(seg, fallbackMime) {
     let buf;
     let mime = guessMime(name, fallbackMime);
     if (/^https?:\/\//i.test(src)) {
-      const r = await fetch(src, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      // SSRF 闸（10-24 评审）：URL 是群友塞进来的，不许指向内网/本地面板；
+      // 顺手补超时——这里原先也没有，和 exa.rpc 是同一类「挂起静默卡死」隐患
+      await assertSafeUrl(src);
+      const r = await fetch(src, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(60 * 1000),
+      });
       if (!r.ok) {
         console.warn(`[bot] 媒体下载失败 HTTP ${r.status}: ${String(src).slice(0, 60)}`);
         return { dataUrl: null, reason: `下载失败 HTTP ${r.status}` };

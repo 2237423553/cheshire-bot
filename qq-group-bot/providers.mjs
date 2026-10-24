@@ -10,6 +10,52 @@
 //
 //  独立成文件是为了能脱离 QQ 单测：`bun run providers.mjs <url> <key>`
 // ═══════════════════════════════════════════════════════════════════════
+import dns from 'node:dns';
+
+// ── SSRF 闸（10-24 评审加固）──
+// 凡是「拿别人给的 URL 去 fetch」的地方都必须过这一道：只许 http/https，
+// 主机不许是环回/私网/链路本地（防群友塞 URL 打内网服务和本地面板）。
+// allowHosts = 显式白名单（填主机名或 host:port），给刻意支持的本地服务豁免（如 Ollama）。
+
+/** IP 字符串是否落在环回/私网/链路本地/CGNAT 段（IPv4 + IPv6） */
+export function isPrivateIp(ip) {
+  const v4 = String(ip);
+  if (/^(?:0\.|10\.|127\.|169\.254\.|192\.168\.)/.test(v4)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(v4)) return true;
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(v4)) return true;   // 100.64/10 CGNAT
+  const v6 = v4.replace(/^\[|\]$/g, '').toLowerCase();
+  if (v6 === '::1' || v6 === '::') return true;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
+  if (mapped) return isPrivateIp(mapped[1]);
+  return /^(?:f[cd]|fe[89ab])/.test(v6);   // fc00::/7 唯一本地 / fe80::/10 链路本地
+}
+
+/** 校验不通过抛 Error（人话）；通过返回解析好的 URL 对象 */
+export async function assertSafeUrl(raw, allowHosts = []) {
+  let u;
+  try { u = new URL(String(raw)); } catch { throw new Error('URL 格式不对'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error(`只支持 http/https 地址（收到 ${u.protocol}）`);
+  }
+  const h = u.hostname.toLowerCase();
+  const hp = `${h}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+  if (allowHosts.includes(h) || allowHosts.includes(hp)) return u;   // 白名单豁免（本地 Ollama 等）
+  if (h === 'localhost' || h === '::1' || h.startsWith('fc') || h.startsWith('fd') ||
+      /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.)/.test(h) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)) {
+    throw new Error(`拒绝请求内网/本机地址（${u.hostname}）`);
+  }
+  // 域名也得查——可能解析到私网（DNS rebinding）；查不到域名就把错留给 fetch 自然报
+  try {
+    const addrs = await dns.promises.lookup(u.hostname, { all: true });
+    if (addrs.some((a) => isPrivateIp(a.address))) {
+      throw new Error(`域名 ${u.hostname} 解析到了内网地址，拒绝请求`);
+    }
+  } catch (e) {
+    if (String(e?.message).includes('内网')) throw e;
+  }
+  return u;
+}
 
 /** 官网控制台页面不是 API 地址，按域名映射到真正的端点 */
 const PRESETS = [

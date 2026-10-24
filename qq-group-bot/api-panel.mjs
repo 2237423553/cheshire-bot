@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { cfg } from './config.mjs';
-import { normalizeChatUrl, modelsUrlOf, mediaModelsUrlOf, fetchModels, probeModel, maskKey } from './providers.mjs';
+import { normalizeChatUrl, modelsUrlOf, mediaModelsUrlOf, fetchModels, probeModel, maskKey, assertSafeUrl } from './providers.mjs';
 import { loadState, saveState, listProfiles, upsertProfile, deleteProfile, applyProfile, writeJsonAtomic, readJson } from './llm-state.mjs';
 import { restartBot, isBotRunning } from './botctl.mjs';
 import { runProbeSuite } from './probe-suite.mjs';
@@ -83,6 +83,9 @@ function resolveForm({ url, key, headers }) {
   return { chatUrl, useKey, hdrs };
 }
 
+// SSRF 闸白名单（10-24 评审）：刻意支持的本地服务——Ollama 默认端口
+const LOCAL_URL_HOSTS = ['127.0.0.1:11434', 'localhost:11434'];
+
 async function route(req, port) {
   const u = new URL(req.url);
   const path = u.pathname;
@@ -109,12 +112,14 @@ async function route(req, port) {
   if (path === '/api/models' && req.method === 'POST') {
     const b = await bodyJson(req);
     const { chatUrl, useKey, hdrs } = resolveForm(b);
+    await assertSafeUrl(chatUrl, LOCAL_URL_HOSTS);   // SSRF 闸：拉列表会对 URL 发请求
     const models = await fetchModels(chatUrl, useKey, hdrs);
     return json({ ok: true, models, modelsUrl: modelsUrlOf(chatUrl) });
   }
   if (path === '/api/probe' && req.method === 'POST') {
     const b = await bodyJson(req);
     const { chatUrl, useKey, hdrs } = resolveForm(b);
+    await assertSafeUrl(chatUrl, LOCAL_URL_HOSTS);   // SSRF 闸：四件套对 URL 发请求
     const model = String(b.model ?? '').trim();
     if (!model) return json({ error: '没给模型 ID' }, 400);
     const out = await runProbeSuite(chatUrl, useKey, model, hdrs);
@@ -221,6 +226,7 @@ async function route(req, port) {
     const side = b.side === 'vidgen' ? 'vidgen' : 'imggen';
     const url = String(b.url ?? '').trim() || (side === 'imggen' ? cfg.imggenUrl : cfg.vidgenUrl);
     const key = String(b.key ?? '') || (side === 'imggen' ? cfg.imggenKey : cfg.vidgenKey);
+    await assertSafeUrl(mediaModelsUrlOf(url), LOCAL_URL_HOSTS);   // SSRF 闸：校验的是真要请求的 /models 地址
     const models = await fetchModels(url, key, undefined, mediaModelsUrlOf(url));
     return json({ ok: true, models });
   }
