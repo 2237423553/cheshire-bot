@@ -121,8 +121,8 @@ export const cfg = {
   // 唱歌是 MiMo 预置音色专属（豆包不会唱）：说话切豆包后，唱歌用这对独立的端点+Key 借道 MiMo
   ttsSingUrl: 'https://api.xiaomimimo.com/v1/chat/completions',
   ttsSingKey: 'sk-在这里填你的MiMo-TTS密钥',
-  // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（2026-10-23 指挥官定 300）
-  ttsAutoVoiceChars: 300,
+  // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（2026-10-27 指挥官定 50，原 300）
+  ttsAutoVoiceChars: 50,
   // 唱歌（2026-10-23 上线）：唱歌是 mimo-v2.5-tts「预置音色」专属能力，
   // voicedesign 不支持（官方互斥设计）——说话用捏音，唱歌借预置嗓子
   ttsSingModel: 'mimo-v2.5-tts',
