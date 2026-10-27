@@ -114,6 +114,13 @@ export const cfg = {
   ttsUrl: 'https://api.xiaomimimo.com/v1/chat/completions',
   ttsKey: 'sk-在这里填你的MiMo-TTS密钥',
   ttsModel: 'mimo-v2.5-tts-voicedesign',
+  // 豆包语音大模型（火山引擎官方 seed-tts 协议，非 OpenAI 兼容）：
+  // ttsUrl 指到 openspeech.bytedance.com 时 tts.mjs 自动切官方协议——
+  // 此时 ttsModel 存资源 ID（seed-tts-2.0）、ttsKey 存豆包 API Key、ttsVoice 存音色库的音色 ID
+  ttsVoice: 'zh_female_roumeinvyou_uranus_bigtts',   // 2026-10-27 指挥官指定：柔美女友
+  // 唱歌是 MiMo 预置音色专属（豆包不会唱）：说话切豆包后，唱歌用这对独立的端点+Key 借道 MiMo
+  ttsSingUrl: 'https://api.xiaomimimo.com/v1/chat/completions',
+  ttsSingKey: 'sk-在这里填你的MiMo-TTS密钥',
   // 自动语音化阈值：普通回复 ≤ 此长度先发语音（文字版跟上）；超长仍纯文字分段（2026-10-23 指挥官定 300）
   ttsAutoVoiceChars: 300,
   // 唱歌（2026-10-23 上线）：唱歌是 mimo-v2.5-tts「预置音色」专属能力，
@@ -178,8 +185,8 @@ try {
   const o = JSON.parse(fs.readFileSync(MEDIA_FILE, 'utf8'));
   for (const k of ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
                    'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
-                   'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign',
-                   'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingVoice']) {
+                   'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsVoice',
+                   'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingUrl', 'ttsSingKey', 'ttsSingVoice']) {
     if (o[k] !== undefined && o[k] !== null && o[k] !== '') cfg[k] = o[k];
   }
 } catch {
