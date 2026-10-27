@@ -11,6 +11,7 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
 - **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens, `mediaapi.json` / `llmstate.json` written by the panel); `config.mjs` ships placeholders only
 - Outbound requests on user-supplied URLs pass an SSRF gate (http/https only, loopback/private hosts rejected by literal check and DNS resolution); every external fetch has a hard timeout
 - Docs are in Chinese (docs/01–03 + 更新公告 with an English summary at top); code comments are Chinese too, but the code itself is straightforward to read
+- Every knob is listed in the **自定义 (Customization)** section below: which config key, which file (`config.mjs` / `mediaapi.json` / `switches.json` / `secrets.json`), and what needs a restart to take effect
 
 > 中文文档从下一节开始 / Chinese docs start below ↓
 
@@ -43,6 +44,9 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
   多人插话不串线的回复署名
 - 🛠 **管理指令**：`#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
 - ✅ **12 项自检**：进程 / 端口 / QQ 身份 / LLM / 搜索 / 抽签全打勾
+
+> 上面每一项功能怎么配置、怎么自定义、改哪个文件哪个键、要不要重启——
+> 全部列在下面的**「自定义」**一节（配置键 + 位置 + 生效方式的完整对照表）。
 
 ## 架构
 
@@ -78,16 +82,75 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
 或 `切换模型.cmd`（命令行：先验证再写盘）；
 日志在 `qq-group-bot/bot.log`（正常）和 `bot.err`（报错走 stderr）。
 
-## 自定义
+## 自定义（想改什么 → 改哪个键 → 在哪 → 怎么生效）
 
-- **更换 LLM API**：双击「切换面板.cmd」（推荐，本地网页：表单 + 模型下拉 + **四件套自动探测**
-  基础/思考档/工具/视觉 + 配置档案管理），或「切换模型.cmd」命令行（掩码输 Key、`--probe`
-  四件套、`--list`），或直接改 `config.mjs` 默认值。
-  回滚 = 删掉 `llmstate.json`。换服务商要探的四件事已自动化（面板/`--probe`）
-- **更改人设 / 提示词**：全部集中在 `config.mjs`——`systemPrompt`（人设 + 铁律 + 能力边界）、
-  `eatPrompt`（#吃什么 文案语气）、`beaconTrigger/beaconReply`（信标词）。
-  改完重启生效，验证三步见 [docs/01 · 8.2](docs/01-部署与配置.md)
-- **功能开关**：面板「功能开关」子窗（即刻生效）或手改 `qq-group-bot/switches.json`；生图/生视频/语音的端点/Key/声线在面板「生图 API / 生视频 API / 语音 API」卡里改（写 `mediaapi.json`，重启生效）；LLM Key + OneBot 令牌在 `qq-group-bot/secrets.json`（手改，重启生效）
+**配置文件分三层**，优先级从高到低（高层的键盖住低层）：
+
+| 层 | 文件（都在 `qq-group-bot/`） | 谁写 | 生效 |
+|---|---|---|---|
+| 运行时状态 | `llmstate.json` | 面板 / 切换模型.cmd | 改完重启 bot |
+| 媒体与语音 | `mediaapi.json` | 面板媒体卡 / 手改 | 改完重启 bot |
+| 出厂默认 | `config.mjs`（含占位符，不含真 Key） | 手改 | 改完重启 bot |
+
+另外：`secrets.json` = LLM Key + OneBot 双令牌（手改，重启生效）；`prompt.json` = 人设/提示词覆盖（面板写，重启生效）；`switches.json` = 功能开关（**每条消息现读，即刻生效**，不用重启）。
+**回滚万能法：删掉对应 json 文件再重启 bot，就回到 `config.mjs` 默认值。**
+
+### 换 LLM（对话模型）
+
+- 推荐双击 **`切换面板.cmd`**（本地网页：填端点/Key → 拉模型列表 → **四件套自动探测**基础/思考档/工具/视觉 → 一键切换+重启，还能把配置**另存档案**随时启用）
+- 命令行党用 **`切换模型.cmd`**（掩码输 Key、`--probe` 探测、`--list` 拉列表、`--restart` 才重启）
+- 也可以手改 `config.mjs` 的 `llmUrl/llmKey/model/llmHeaders/thinking` 默认值
+- 换服务商不需要改代码：任何 OpenAI 兼容端点都行；预设映射（DeepSeek/Kimi/智谱/SiliconFlow/OpenRouter/Ollama 等）在 `qq-group-bot/providers.mjs` 的 `PRESETS`，想加一家就在那里添一行正则
+
+### 语音（TTS）——说话
+
+| 配置键 | 位置 | 说明 |
+|---|---|---|
+| `ttsUrl` / `ttsKey` | `mediaapi.json`（面板「语音 API」卡） | **端点可插拔**：指到 OpenAI 兼容 chat/completions 即走「自然语言捏声线」协议；URL 里含 `openspeech.bytedance.com` 则自动切豆包官方 seed-tts 协议（头/请求体/流式解析全自动换挡），不用改代码 |
+| `ttsModel` | 同上 | OpenAI 兼容端点填模型 ID；豆包协议填资源 ID（如 `seed-tts-2.0`） |
+| `ttsVoice` | 同上 | 豆包协议专用：音色库的音色 ID（控制台「音色库」页搜音色名可拿） |
+| `ttsVoiceDesign` | 同上 | **声线 = 一段自然语言描述**（音色/语速/语气/口癖都写在里面），改这一句就换嗓子 |
+| `ttsAutoVoiceChars` | 同上 | 自动语音化阈值：普通回复 ≤ 此字数先发语音+文字版跟上，超长纯文字分段（0 = 关闭自动语音化） |
+| `tts` 开关 | `switches.json`（面板「功能开关」） | 语音业务总闸，关了 @ 也只回文字 |
+
+- 动态语气不用配置：LLM 每条回话末尾自动申报「语气指令：…」，触发那句原话也会喂进语境
+- 想调语气规则的措辞/白名单话种：`qq-group-bot/bot.mjs` 的语音路由段（搜 `parseVoiceIntent`）
+
+### 唱歌——独立通道
+
+| 配置键 | 位置 | 说明 |
+|---|---|---|
+| `ttsSingUrl` / `ttsSingKey` | `mediaapi.json` | **和说话完全独立**的一对端点/Key——说话和唱歌可以各用各的服务商 |
+| `ttsSingModel` | 同上 | 唱歌模型：prompt 驱动的音频生成模型（如豆包 Seed Audio 系）或带 `(唱歌)` 标签的 TTS 预置音色模型均可，客户端按端点自动判请求形状 |
+| `ttsSingVoice` | 同上 | 预置音色方案专用：预置音色名（如茉莉/冰糖） |
+
+- 演唱引导词（声线+风格的组合措辞）：`qq-group-bot/tts.mjs` 的 `generateSong`，改那一句模板即可
+- 歌词规格（句数/字数）：`qq-group-bot/bot.mjs` 唱歌路由段（搜 `唱歌路由`）里那段歌词写手 system
+
+### 生图 / 生视频
+
+| 配置键 | 位置 | 说明 |
+|---|---|---|
+| `imggenUrl` / `imggenKey` / `imggenModel` | `mediaapi.json`（面板「生图 API」卡） | OpenAI 兼容 `/v1/images/generations`；面板卡上有实测按钮 |
+| `imggenSize` / `imggenQuality` / `imggenAspectRatio` / `imggenResolution` | 同上 | **参数两套体系**：OpenAI gpt-image 系认 `imggenSize`+`imggenQuality`；Grok 系认 `imggenAspectRatio`+`imggenResolution`（且不传 quality=auto=最低档，切 Grok 前记得调） |
+| `vidgenUrl` / `vidgenKey` / `vidgenModel` / `vidgenMaxSeconds` | `mediaapi.json`（面板「生视频 API」卡） | 异步任务制；`vidgenMaxSeconds` 是成片时长硬上限（超了不发） |
+| `vidgenEnabled` | `switches.json` | 生视频业务总闸，关了 @ 也直接回歇业 |
+
+### 人设 / 文案 / 其他
+
+| 想改什么 | 配置键 | 位置 | 生效 |
+|---|---|---|---|
+| 人设/铁律/能力边界 | `systemPrompt` | `config.mjs` 或 `prompt.json`（面板写） | 重启 |
+| #吃什么 推荐语风格 | `eatPrompt` | 同上 | 重启 |
+| 信标词（喊 A 回 B） | `beaconTrigger` / `beaconReply` | `config.mjs` | 重启 |
+| 消息分段长度/条数/冷却 | `chunkChars` / `maxReplyChunks` / `cooldownMs` | `config.mjs` | 重启 |
+| 单媒体大小上限/关联窗口 | `maxMediaBytes` / `mediaMemoryWindow` / `mediaHistoryMaxBytes` | `config.mjs` | 重启 |
+| 搜索条数/抓取字数/每日上限 | `searchResults` / `searchTextChars` / `fetchTextChars` / `searchDailyLimit` | `config.mjs` | 重启 |
+| 饭食清单 | — | `qq-group-bot/foods.mjs`（368 道，自己加菜） | 重启 |
+| 上下文压缩触发点 | `contextTokenLimit` / `compressRatio` / `keepRecent` | `config.mjs` | 重启 |
+
+验证改完是否正常：`cd qq-group-bot && bun run selfcheck.mjs`（12 项）；
+更深的排错见 [docs/03-坑与排错.md](docs/03-坑与排错.md)。
 
 ## 文档（细节都在这里）
 
