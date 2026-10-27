@@ -3,17 +3,162 @@
 > QQ 群聊机器人：@ 对话（文字/图片/视频）、**B站链接自动总结**、联网搜索、上下文记忆。
 > **仓库不含任何密钥**，也不含 SnowLuma 本体（需单独安装）。
 
-## 🇬🇧 English Quick Look
+---
 
-A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself (playurl direct-stream → multimodal model) and summarizes it, asks her to **draw** something and the image lands right in the group (gpt-image-2), or generate **videos** from text and images (Grok Imagine, ≤15 s). She now **speaks** — replies shorter than a configurable threshold go out as voice first. The TTS endpoint is pluggable: point `ttsUrl` at any OpenAI-compatible chat/completions (voice designed in natural language) or at ByteDance's official seed-tts protocol — the client auto-detects which from the URL. Per-message tone directives plus the triggering message fed back as context keep the mood matching; a separate, independently-configured sing endpoint lets her **sing** on request. Extras: web search (Exa MCP), context memory with auto-compression, admin commands, and a **local web config panel** with provider presets (OpenCode / DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama) and an automatic 4-point probe (basic generation / thinking modes / tool calling / vision).
+# 🇬🇧 English
+
+A QQ group chat bot playing Cheshire (Azur Lane). **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself, ask her to **draw**, **make videos**, **speak** or even **sing**. Runs fully on your own machine; every AI capability talks to a provider you plug in yourself, and this README tells you exactly **which key, in which file, and what takes effect after a restart**.
+
+## What it does
+
+- 🗨️ **@ chat (text / image / video)**: videos go **URL-direct** — QQ's original download link is passed straight to the multimodal model (zero download, zero transcode, up to 300 MB, sidesteps the 50 MB base64 limit)
+- 📺 **Bilibili link auto-summary**: drop a `b23.tv` / BV link **without @** and she fetches the playurl combined audio+video mp4 stream (no Referer check, login-free 720P cap) and feeds it to the model to "watch" — summary is archived into context for follow-up questions; refuses politely + retries on failures. CLI entry `bilibili-summarize.mjs` shares the same engine
+- 🔎 **Web search**: Exa MCP Server (`web_search` / `fetch_webpage`), no API key needed
+- 🎙 **Voice replies**: ordinary replies shorter than `ttsAutoVoiceChars` (default 50) go out **as voice first**, with a text copy right after; the **TTS endpoint is pluggable** — point `ttsUrl` at any OpenAI-compatible chat/completions (voice designed in natural language) or at ByteDance's official seed-tts protocol (the client auto-detects which from the URL and switches request shape/parsing). The voice itself is a natural-language description you can rewrite anytime; every reply carries a per-message tone directive and the triggering message is fed back as context, so the mood matches the conversation. Explicit triggers too: `语音：…` / `说一段…` / `用日语说…`. If TTS breaks, replies fall back to plain text
+- 🎵 **Singing**: @ her with `唱歌 / 唱首 / 来一首 xxx` — an LLM writes lyrics, then a **dedicated sing channel** synthesizes: `ttsSingUrl / ttsSingKey / ttsSingModel / ttsSingVoice` are configured independently from speech, so talking and singing can use different providers; both a prompt-driven audio-generation model and a `(唱歌)`-tag preset-voice model work (request shape auto-detected per endpoint)
+- 🖼 **Text-to-image**: `画一张××` triggers an **intent-forced route** (script takes over: prompt translation → generate → post to group; the model never gets a chance to fake success); within 10 minutes say `改一下` and the **redraw route** reuses the last prompt; audit blocks / rate limits are reported honestly
+- 🎬 **Text-to-video / image-to-video**: `生成××视频` triggers the same forced route (async task: submit → poll → download → post); quoting an image auto-routes to **image-to-video**; clips capped at 15 s (`vidgenMaxSeconds` hard check); download auto-retries; `vidgenEnabled` master switch
+- 📡 **Beacon**: shout the beacon phrase and get an instant scripted reply — zero tokens, proves she's alive
+- 🔁 **+1 echo**: repeats a repeated message once (four anti-loop guards)
+- 🧠 **Context memory**: auto-compression (triggers at 120k × 0.9), media association window (counts interactions with the bot), per-person reply attribution so cross-talk doesn't tangle
+- 🛠 **Admin commands**: `#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
+- ✅ **12-point self-check**: processes / ports / QQ identity / LLM / search / menu lottery all ticked
+
+## Stack & safety
 
 - **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM (default: MiMo)
-- **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens, `mediaapi.json` / `llmstate.json` written by the panel); `config.mjs` ships placeholders only
-- Outbound requests on user-supplied URLs pass an SSRF gate (http/https only, loopback/private hosts rejected by literal check and DNS resolution); every external fetch has a hard timeout
+- **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens; `mediaapi.json` / `llmstate.json` / `prompt.json` written by the panel); `config.mjs` ships placeholders only
+- Outbound requests on user-supplied URLs pass an **SSRF gate** (http/https only, loopback/private hosts rejected by literal check *and* DNS resolution, anti-rebinding); every external fetch has a hard timeout
+- Honest-error policy: audit blocks, rate limits, quota exhaustion and "couldn't reach the API" are reported as-is, never retried into silence
 - Docs are in Chinese (docs/01–03 + 更新公告 with an English summary at top); code comments are Chinese too, but the code itself is straightforward to read
-- Every knob is listed in the **自定义 (Customization)** section below: which config key, which file (`config.mjs` / `mediaapi.json` / `switches.json` / `secrets.json`), and what needs a restart to take effect
 
-> 中文文档从下一节开始 / Chinese docs start below ↓
+## Quick start
+
+1. **Install SnowLuma** (third-party QQ↔OneBot bridge, **not in this repo**) into the repo root `SnowLuma\`
+   ⚠️ unofficial protocol tool — using it carries a QQ account ban risk; non-commercial license, written authorization required for commercial use
+2. **Fill in config** — real keys always live in gitignored runtime files; `config.mjs` ships placeholders only:
+   - `qq-group-bot/secrets.json` → `llmKey` (LLM API key; the default endpoint also needs an `x-opencode-session` header, added automatically) + `obHttpToken` / `obWsToken` (must match SnowLuma's `config/onebot_<your QQ>.json`)
+   - image / video / TTS endpoints & keys → the panel's "生图 API / 生视频 API / 语音 API" cards (writes `mediaapi.json`), or hand-edit that file
+   - LLM endpoint / model → panel or `切换模型.cmd` (writes `llmstate.json`)
+3. **Install deps**: `cd qq-group-bot && bun install`
+4. **Prerequisite**: NTQQ (9.9.x; the classic edition won't work) installed and the bot's QQ account logged in
+5. **Double-click `一键启动.cmd`**: stops stale instances → starts SnowLuma + the bot → opens the admin WebUI → runs the 12-point self-check
+
+Daily ops: re-run the same launcher to restart (idempotent); switch models via **`切换面板.cmd`** (local web page: form → model list → 4-point probe → one-click switch, for mouse people) or `切换模型.cmd` (CLI: verify first, then write). Logs: `qq-group-bot/bot.log` (stdout) and `bot.err` (stderr).
+
+## Customization: what → which key → where → effect
+
+**Config lives in three layers**, highest priority first (a key in a higher layer overrides lower ones):
+
+| Layer | File (all in `qq-group-bot/`) | Written by | Effect |
+|---|---|---|---|
+| Runtime state | `llmstate.json` | panel / switch-model CLI | restart the bot |
+| Media & voice | `mediaapi.json` | panel media cards / hand-edit | restart the bot |
+| Factory defaults | `config.mjs` (placeholders, no real keys) | hand-edit | restart the bot |
+
+Also: `secrets.json` = LLM key + both OneBot tokens (hand-edit, restart); `prompt.json` = persona/prompt overrides (panel-written, restart); `switches.json` = feature switches (**re-read on every message, instant, no restart**).
+**Universal rollback: delete the json file, restart, and you're back to the `config.mjs` defaults.**
+
+### Swapping the LLM (chat model)
+
+- Recommended: double-click **`切换面板.cmd`** (local web page: endpoint/key form → pull model list → **automatic 4-point probe** basic/thinking/tool-calling/vision → one-click switch + restart; save configurations as **profiles** and re-enable anytime)
+- CLI: **`切换模型.cmd`** (masked key input, `--probe`, `--list`, `--restart` to actually restart)
+- Or hand-edit the `llmUrl / llmKey / model / llmHeaders / thinking` defaults in `config.mjs`
+- No code changes needed for a new provider — any OpenAI-compatible endpoint works; the preset URL mappings (DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama…) live in `PRESETS` in `qq-group-bot/providers.mjs`, add a regex line to support another
+
+### Voice (TTS) — talking
+
+| Key | Where | Meaning |
+|---|---|---|
+| `ttsUrl` / `ttsKey` | `mediaapi.json` (panel "语音 API" card) | **Pluggable endpoint**: point it at an OpenAI-compatible chat/completions for natural-language voice design; if the URL contains `openspeech.bytedance.com` the client auto-switches to ByteDance's official seed-tts protocol (headers, body wrapper, streamed parsing — all automatic) |
+| `ttsModel` | same | Model ID on OpenAI-compatible endpoints; resource ID (e.g. `seed-tts-2.0`) on the Doubao protocol |
+| `ttsVoice` | same | Doubao protocol only: a timbre ID from the voice library (search the voice name in the console's voice-library page) |
+| `ttsVoiceDesign` | same | **The voice = one natural-language description** (timbre, speed, mood, verbal tics) — rewrite that one sentence to change it |
+| `ttsAutoVoiceChars` | same | Auto-voicing threshold: replies ≤ this many chars go voice-first + text copy, longer ones stay as chunked text (0 = disable auto-voicing) |
+| `tts` switch | `switches.json` (panel "功能开关") | Voice master switch; off = text-only even when @-mentioned |
+
+- Dynamic tone needs no config: the LLM appends a per-reply "tone directive" automatically, and the triggering message is quoted into context
+- To tweak the tone-line wording / allowed language varieties: the voice-route section of `qq-group-bot/bot.mjs` (search `parseVoiceIntent`)
+
+### Singing — a separate channel
+
+| Key | Where | Meaning |
+|---|---|---|
+| `ttsSingUrl` / `ttsSingKey` | `mediaapi.json` | **Fully independent** from speech — talking and singing may use different providers |
+| `ttsSingModel` | same | The singing model: a prompt-driven audio-generation model, or a TTS model whose preset voices accept the `(唱歌)` tag — the client detects the request shape from the endpoint |
+| `ttsSingVoice` | same | Preset-voice route only: a preset timbre name |
+
+- The singing prompt template (voice + style phrasing): `generateSong` in `qq-group-bot/tts.mjs` — edit that one sentence
+- Lyric spec (lines / length): the lyric-writer system prompt in `qq-group-bot/bot.mjs`'s singing route (search `唱歌路由`)
+
+### Image / video generation
+
+| Key | Where | Meaning |
+|---|---|---|
+| `imggenUrl` / `imggenKey` / `imggenModel` | `mediaapi.json` (panel "生图 API" card) | OpenAI-compatible `/v1/images/generations`; the panel card has a live test button |
+| `imggenSize` / `imggenQuality` / `imggenAspectRatio` / `imggenResolution` | same | **Two parameter systems**: OpenAI gpt-image-family reads `imggenSize` + `imggenQuality`; xAI Grok family reads `imggenAspectRatio` + `imggenResolution` (and omitting quality = auto = lowest tier, so raise it before switching to Grok) |
+| `vidgenUrl` / `vidgenKey` / `vidgenModel` / `vidgenMaxSeconds` | `mediaapi.json` (panel "生视频 API" card) | Async-task based; `vidgenMaxSeconds` is a hard cap (longer clips are discarded, not sent) |
+| `vidgenEnabled` | `switches.json` | Video master switch; off = @ requests get a polite "closed" reply |
+
+### Persona / copy / misc
+
+| What | Key | Where | Effect |
+|---|---|---|---|
+| Persona / rules / capability bounds | `systemPrompt` | `config.mjs` or `prompt.json` (panel) | restart |
+| `#吃什么` recommendation style | `eatPrompt` | same | restart |
+| Beacon phrase (shout A, reply B) | `beaconTrigger` / `beaconReply` | `config.mjs` | restart |
+| Message chunking / cooldown | `chunkChars` / `maxReplyChunks` / `cooldownMs` | `config.mjs` | restart |
+| Media size caps / association window | `maxMediaBytes` / `mediaMemoryWindow` / `mediaHistoryMaxBytes` | `config.mjs` | restart |
+| Search counts / fetch chars / daily cap | `searchResults` / `searchTextChars` / `fetchTextChars` / `searchDailyLimit` | `config.mjs` | restart |
+| Food list | — | `qq-group-bot/foods.mjs` (368 dishes, add your own) | restart |
+| Context compression triggers | `contextTokenLimit` / `compressRatio` / `keepRecent` | `config.mjs` | restart |
+
+Verify after changing anything: `cd qq-group-bot && bun run selfcheck.mjs` (12 checks);
+deeper troubleshooting in [docs/03-坑与排错.md](docs/03-坑与排错.md) (Chinese).
+
+## Architecture
+
+    QQ (NTQQ 9.9.x)  ←  SnowLuma hook injection
+      └ SnowLuma      WebUI :5099 ｜ OneBot HTTP :3000 ｜ OneBot WS :3001
+          └ qq-group-bot (this repo)
+              ├ bot.mjs        main: message flow / tool loop / commands / media / context
+              ├ bilibili.mjs   bilibili watcher (direct-stream + refuse-detection retry)
+              ├ exa.mjs        Exa MCP client (search / fetch)
+              ├ api-panel.mjs / panel-page.mjs   local API config panel (web)
+              ├ probe-suite.mjs                  4-point probe (basic/thinking/tools/vision)
+              ├ llm-state.mjs / botctl.mjs       sole state writer / bot process control
+              ├ wt.mjs         War Thunder stats (Thunderskill)
+              ├ imggen.mjs     image generation client
+              ├ vidgen.mjs     video generation client (submit → poll → download)
+              ├ tts.mjs        speech synthesis (dual protocol) + singing client
+              └ foods.mjs      368 dishes, truly random draw (the model only writes blurbs)
+          LLM: any OpenAI-compatible endpoint (default OpenCode Go / mimo-v2.6-flash, thinking auto)
+
+## Docs & known limits
+
+| Doc | Content |
+|---|---|
+| [docs/更新公告.md](docs/更新公告.md) | **changelog by date** (English summary at top — start here) |
+| [docs/01-部署与配置.md](docs/01-部署与配置.md) | architecture, launcher, model-switch tooling, 12-point self-check, full config table (Chinese) |
+| [docs/02-功能与机制.md](docs/02-功能与机制.md) | trigger rules, media handling, context & compression, bilibili engine, search (Chinese) |
+| [docs/03-坑与排错.md](docs/03-坑与排错.md) | **real-world pitfalls** + quick troubleshooting table + common commands (Chinese) |
+
+Known limits:
+
+- She can **send** voice (TTS) but cannot **understand** incoming voice messages — and says so honestly
+- Video URL-direct caps at 300 MB (≈720P / 20 min); base64 fallback limited to 50 MB strings
+- Bilibili login-free tops out at 720P; paid/members-only videos error out loudly when no stream is available
+- For video requests `prompt_tokens` is a rough estimate and can't prove the server actually fetched the video; occasional silent fetch failures with the model "pretending not to see" — the engine has refuse-detection + re-fetch retries built in
+- Context lives in memory only and resets on restart (by design)
+
+## License
+
+The bot code is yours to use and modify freely; SnowLuma is a third-party component under its own EULA
+(see its release page — non-commercial license, written authorization required for commercial use or automated deployment).
+
+---
+
+# 🇨🇳 中文文档
 
 ## 功能一览
 
