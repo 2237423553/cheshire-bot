@@ -188,21 +188,20 @@ export async function generateSpeech(text, tone = '', upstream = '') {
   });
 }
 
-/** 唱一段歌词，返回 wav Buffer。唱歌是 mimo-v2.5-tts（预置音色）专属能力，
- *  嗓子是预置音色（ttsSingVoice，非柴郡捏音——官方互斥设计，没法两全）。
- *  说话切到豆包后（ttsUrl 指向 bytedance），唱歌仍借道 MiMo：
- *  用独立的 ttsSingUrl / ttsSingKey，不再共用被豆包占走的 ttsUrl/ttsKey。
- *  style（可选）：演唱风格指令（「欢快地唱」「悲伤地唱」…），走 user 消息。 */
+/** 唱一段歌词，返回音频 Buffer。两条路：
+ *  ①说话走豆包时（isVolc）→ Seed Audio 1.0（豆包音频生成模型，prompt 驱动，真测 2026-10-27 可唱小段；
+ *    免费试用 60 分钟额度）——声线+风格+歌词写进一条自然语言 prompt
+ *  ②非火山场景（克隆用户）→ 借道 MiMo mimo-v2.5-tts 预置音色（ttsSingVoice，(唱歌) 标签专属能力）。
+ *  style（可选）：演唱风格指令（「欢快地唱」「悲伤地唱」…）。 */
 export async function generateSong(lyrics, style = '') {
   const l = String(lyrics ?? '').trim();
   if (!l) throw new Error('没给要唱的歌词');
   if (l.length > 600) throw new Error('歌词太长了（上限 600 字）');
-  // 说话切到豆包时唱歌借道 MiMo；Key 没配就如实报（唱歌是 MiMo 专属能力）
-  const singUrl = isVolc() && cfg.ttsSingUrl ? cfg.ttsSingUrl : cfg.ttsUrl;
-  const singKey = isVolc() && cfg.ttsSingKey ? cfg.ttsSingKey : cfg.ttsKey;
-  if (isVolc() && (!cfg.ttsSingKey || /在这里填/.test(String(cfg.ttsSingKey)))) {
-    throw new Error('唱歌还差 MiMo 的 Key（ttsSingKey 没配）——唱歌是 MiMo 专属能力喵');
+
+  if (isVolc()) {
+    return singCreate(`用一位清甜俏皮的年轻女声、轻轻带点气声，${style ? `${String(style).trim().slice(0, 30)}地` : '欢快投入地'}唱下面这段歌词，把词咬清楚：\n${l}`);
   }
+
   // (唱歌) 标签必须在目标文本最开头；歌词中文效果最好（官方口径）
   return ttsRequest({
     model: cfg.ttsSingModel,
@@ -211,5 +210,43 @@ export async function generateSong(lyrics, style = '') {
       { role: 'assistant', content: `(唱歌)${l}` },
     ],
     audio: { format: 'wav', voice: cfg.ttsSingVoice },
-  }, { url: singUrl, key: singKey });
+  }, { url: cfg.ttsUrl, key: cfg.ttsKey });
+}
+
+/** Seed Audio 1.0 合成（豆包音频生成模型）：POST /api/v3/tts/create，
+ *  扁平请求体 { model, text_prompt }，响应 JSON { audio: base64 wav }——
+ *  和 TTS 的 req_params 嵌套不是一套形状（10-27 实测）。 */
+async function singCreate(textPrompt) {
+  if (!cfg.ttsKey || /在这里填/.test(String(cfg.ttsKey))) {
+    throw new Error('唱歌还差豆包的 API Key（ttsKey 没配）喵');
+  }
+  // 只认指向 bytedance 的自定义端点（config 默认给的是 MiMo 借道地址，别喂进来）
+  const url = /openspeech\.bytedance\.com/i.test(String(cfg.ttsSingUrl))
+    ? cfg.ttsSingUrl
+    : 'https://openspeech.bytedance.com/api/v3/tts/create';
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': cfg.ttsKey,
+        'X-Api-Resource-Id': cfg.ttsSingModel || 'seed-audio-1.0',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: cfg.ttsSingModel || 'seed-audio-1.0', text_prompt: textPrompt }),
+      signal: AbortSignal.timeout(180 * 1000),
+    });
+  } catch (e) {
+    throw new Error(e.name === 'TimeoutError' ? '唱歌合成超时（超过 3 分钟）' : `连不上唱歌接口：${e.message}`);
+  }
+  const j = await r.json().catch(() => ({}));
+  if (j.audio) return Buffer.from(j.audio, 'base64');
+  const msg = String(j.message ?? j.msg ?? `HTTP ${r.status}`);
+  if (/安全|审核|sensitive|moderation/i.test(msg)) {
+    throw new Error('⛔ 这段词被安全审核拦了——唱不了，换个歌词试试吧');
+  }
+  if (/quota|额度|余额|欠费|没钱/i.test(msg)) {
+    throw new Error('⛔ 唱歌接口没钱了——等指挥官去控制台处理');
+  }
+  throw new Error(`唱歌合成失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
 }
