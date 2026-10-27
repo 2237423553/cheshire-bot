@@ -5,7 +5,7 @@
 
 ## 🇬🇧 English Quick Look
 
-A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself (playurl direct-stream → multimodal model) and summarizes it, asks her to **draw** something and the image lands right in the group (gpt-image-2), or generate **videos** from text and images (Grok Imagine, ≤15 s). She now **speaks** — replies ≤50 chars go out as voice first (Doubao voice model 2.0 via its official protocol, per-message tone directives plus the triggering message fed back as context so the mood matches), and can even **sing** on request (Seed Audio 1.0, prompt-driven). Extras: web search (Exa MCP), context memory with auto-compression, admin commands, and a **local web config panel** with provider presets (OpenCode / DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama) and an automatic 4-point probe (basic generation / thinking modes / tool calling / vision).
+A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself (playurl direct-stream → multimodal model) and summarizes it, asks her to **draw** something and the image lands right in the group (gpt-image-2), or generate **videos** from text and images (Grok Imagine, ≤15 s). She now **speaks** — replies shorter than a configurable threshold go out as voice first. The TTS endpoint is pluggable: point `ttsUrl` at any OpenAI-compatible chat/completions (voice designed in natural language) or at ByteDance's official seed-tts protocol — the client auto-detects which from the URL. Per-message tone directives plus the triggering message fed back as context keep the mood matching; a separate, independently-configured sing endpoint lets her **sing** on request. Extras: web search (Exa MCP), context memory with auto-compression, admin commands, and a **local web config panel** with provider presets (OpenCode / DeepSeek / Kimi / BigModel / SiliconFlow / OpenRouter / Ollama) and an automatic 4-point probe (basic generation / thinking modes / tool calling / vision).
 
 - **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM (default: MiMo)
 - **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens, `mediaapi.json` / `llmstate.json` written by the panel); `config.mjs` ships placeholders only
@@ -23,11 +23,14 @@ A QQ group chat bot playing Cheshire (Azur Lane): **@-mention** her for text / i
   零下载零转存、免登录 720P、带提问模式、拒答检测 + 自动重试；
   总结自动存档并进上下文，之后可继续追问。命令行入口 `bilibili-summarize.mjs` 共用同一引擎
 - 🔎 **联网搜索**：Exa MCP Server（`web_search` / `fetch_webpage`），无需 API key
-- 🎙 **语音回复**：普通回复 ≤50 字**先发语音**、文字版跟上（豆包语音大模型 2.0 官方协议，柔美女友音色 +
-  每条动态语气申报，触发那句原话一并喂进语境——腔调跟着内容走）；@ 说「语音：/说一段/用日语说」也开口；
-  TTS 挂了自动回退纯文字
-- 🎵 **唱歌**：@ 说「唱歌/唱首/来一首 xxx」——LLM 现写歌词 + Seed Audio 1.0 合成
-  （豆包音频生成模型，prompt 驱动；非火山场景保留 MiMo 预置音色回退）
+- 🎙 **语音回复**：普通回复 ≤`ttsAutoVoiceChars`（默认 50）字**先发语音**、文字版跟上；
+  **TTS 端点可插拔**——`ttsUrl` 指到 OpenAI 兼容 chat/completions（自然语言捏声线）或
+  豆包官方 seed-tts 协议（客户端按 URL 自动识别切协议）；声线=自然语言描述可随时改，
+  每条动态语气申报、触发那句原话一并喂进语境——腔调跟着内容走；
+  @ 说「语音：/说一段/用日语说」也开口；TTS 挂了自动回退纯文字
+- 🎵 **唱歌**：@ 说「唱歌/唱首/来一首 xxx」——LLM 现写歌词后走**唱歌专用通道**：
+  `ttsSingUrl/ttsSingModel/ttsSingKey` 独立配置，prompt 驱动的音频生成模型或
+  `(唱歌)` 标签预置音色都能接（按端点自动判形状）；说话和唱歌可各用各的服务商
 - 🖼 **文生图**：@ 说「画一张××」触发**意图强制路由**（脚本接管：prompt 翻译 → 生图 → 发群，
   模型没有装成功的机会）；10 分钟内说「改一下/性别错了」走**改稿路由**带上次 prompt 重画；
   审核拦截/限流都如实转告
