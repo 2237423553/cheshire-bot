@@ -1569,7 +1569,8 @@ bot.onGroupMessage(async (event, ctx) => {
       if (!speak) throw new Error('没拿到能念的话');
       if (speak.length > 160) speak = speak.slice(0, 155) + '，后面没法念了喵。';
       console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
-      const buf = await tts.generateSpeech(speak, tone);
+      // 豆包「引用上文」：把指挥官的语音诉求当语境喂给 TTS，模型自己承接情绪（10-27）
+      const buf = await tts.generateSpeech(speak, tone, voiceSubj);
       await http.raw('send_group_msg', {
         group_id: Number(gid),
         message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
@@ -1648,7 +1649,8 @@ bot.onGroupMessage(async (event, ctx) => {
       try {
         const speak = sanitizeForSpeech(reply);
         if (speak) {
-          const buf = await tts.generateSpeech(speak, voiceTone);
+          // 豆包「引用上文」：把触发回复的那句用户原话当语境喂给 TTS（自动语音化 10-27 升级）
+          const buf = await tts.generateSpeech(speak, voiceTone, content.rawText);
           await http.raw('send_group_msg', {
             group_id: Number(gid),
             message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],

@@ -157,17 +157,20 @@ async function ttsRequest(body, ep = {}) {
 }
 
 /** 把一段文本合成为语音，返回音频 Buffer（mp3；OneBot record 段交给 SnowLuma 的 ffmpeg 转）。失败抛 Error（消息直接给群里看）。
- *  tone（可选）：本轮的动态语气描述——MiMo voicedesign 拼进音色描述；
- *  豆包模式转成「语音指令」（context_texts，不计费），底色+动态语气两条都进。 */
-export async function generateSpeech(text, tone = '') {
+ *  tone（可选）：本轮的动态语气描述——MiMo voicedesign 拼进音色描述；豆包模式并进语音指令。
+ *  upstream（可选）：触发这条语音的那句用户原话——豆包「引用上文」用法（context_texts 里
+ *  引用而不合成，模型自动承接语境情绪，10-27 官方文档查证）。
+ *  ⚠️ 官方口径：context_texts 数组只第一个元素生效——底色/动态语气/上文必须拼成一条，分两条第二条会被静默丢弃。 */
+export async function generateSpeech(text, tone = '', upstream = '') {
   const t = String(text ?? '').trim();
   if (!t) throw new Error('没给要念的文本');
   if (t.length > 800) throw new Error('要念的文本太长了（上限 800 字）');
 
   if (isVolc()) {
-    const instructions = [String(cfg.ttsVoiceDesign).trim(),
-      ...(tone ? [`这一次的语气：${String(tone).trim().slice(0, 80)}`] : [])].filter(Boolean);
-    return volcRequest(t, instructions);
+    const ctx = String(cfg.ttsVoiceDesign).trim()
+      + (tone ? `这一次的语气：${String(tone).trim().slice(0, 80)}。` : '')
+      + (upstream ? `说话的语境：对方刚说：「${String(upstream).trim().slice(0, 120)}」。` : '');
+    return volcRequest(t, [ctx]);
   }
 
   // 底色在前保住「柴郡是谁」，动态语气在后只改这次的情绪/语速
