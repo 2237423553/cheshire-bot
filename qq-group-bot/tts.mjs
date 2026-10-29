@@ -69,7 +69,7 @@ async function volcRequest(text, instructions) {
       signal: AbortSignal.timeout(TIMEOUT),
     });
   } catch (e) {
-    throw new Error(e.name === 'TimeoutError' ? '语音合成超时（超过 2 分钟）' : `连不上 TTS 接口：${e.message}`);
+    throw new Error((e.name === 'TimeoutError' || e.name === 'AbortError') ? '语音合成超时（超过 2 分钟）' : `连不上 TTS 接口：${e.message}`);
   }
 
   const raw = await r.text();
@@ -124,7 +124,7 @@ async function ttsRequest(body, ep = {}) {
         signal: AbortSignal.timeout(TIMEOUT),
       });
     } catch (e) {
-      throw new Error(e.name === 'TimeoutError' ? '语音合成超时（超过 2 分钟）' : `连不上 TTS 接口：${e.message}`);
+      throw new Error((e.name === 'TimeoutError' || e.name === 'AbortError') ? '语音合成超时（超过 2 分钟）' : `连不上 TTS 接口：${e.message}`);
     }
 
     const j = await r.json().catch(() => ({}));
@@ -237,7 +237,7 @@ async function singCreate(textPrompt) {
       signal: AbortSignal.timeout(180 * 1000),
     });
   } catch (e) {
-    throw new Error(e.name === 'TimeoutError' ? '唱歌合成超时（超过 3 分钟）' : `连不上唱歌接口：${e.message}`);
+    throw new Error((e.name === 'TimeoutError' || e.name === 'AbortError') ? '唱歌合成超时（超过 3 分钟）' : `连不上唱歌接口：${e.message}`);
   }
   const j = await r.json().catch(() => ({}));
   if (j.audio) return Buffer.from(j.audio, 'base64');

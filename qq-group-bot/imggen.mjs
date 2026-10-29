@@ -50,7 +50,8 @@ async function generateImageInner(prompt, attempt) {
       signal: AbortSignal.timeout(TIMEOUT),
     });
   } catch (e) {
-    throw new Error(e.name === 'TimeoutError' ? '生图超时（超过 3 分钟）' : `连不上生图接口：${e.message}`);
+    // TimeoutError/AbortError 异名同源（不同运行时叫法不同），都按超时翻成人话
+    throw new Error(e.name === 'TimeoutError' || e.name === 'AbortError' ? '生图超时（超过 3 分钟）' : `连不上生图接口：${e.message}`);
   }
 
   const j = await r.json().catch(() => ({}));

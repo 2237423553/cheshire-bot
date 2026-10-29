@@ -68,7 +68,7 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       rid = j.request_id;
     } catch (e) {
       // 终局错误（审核/401/429/其它明确报错）直接抛；瞬时问题记下最后一搏
-      if (e.name === 'TimeoutError') { lastErr = '提交超时'; continue; }
+      if ((e.name === 'TimeoutError' || e.name === 'AbortError')) { lastErr = '提交超时'; continue; }
       throw e;
     }
   }
@@ -124,7 +124,7 @@ export async function generateVideo(prompt, imageDataUrl = '') {
           if (!b.length) { dlErr = '下载到 0 字节'; continue; }
           buf = b;
         } catch (e) {
-          dlErr = e.name === 'TimeoutError' ? '下载超时' : String(e.message ?? e).slice(0, 80);
+          dlErr = (e.name === 'TimeoutError' || e.name === 'AbortError') ? '下载超时' : String(e.message ?? e).slice(0, 80);
         }
       }
       drHeaders = {};

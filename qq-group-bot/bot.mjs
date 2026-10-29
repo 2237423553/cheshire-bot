@@ -557,6 +557,9 @@ async function callLLM(sessionId, messages, useTools) {
       ...(cfg.llmHeaders ?? {}),
     },
     body: JSON.stringify(body),
+    // ⚠️ 必须带超时（2026-10-29 实锤：这里是主线唯一的无闸 fetch——对端挂起会让
+    // 这条 @ 永远悬着）。5 分钟是思考模型+长上下文的安全上限，正常回复 5~60s 内回。
+    signal: AbortSignal.timeout(5 * 60 * 1000),
   });
   const j = await r.json();
   if (j.error) throw new Error(`LLM ${r.status}: ${JSON.stringify(j.error)}`);
@@ -1750,10 +1753,14 @@ bot.onGroupMessage(async (event, ctx) => {
     const tok = promptTokens.get(`group-${gid}`) ?? '?';
     console.log(`[bot] 群 ${gid}${describeMedia(content.parts)} <- ${content.rawText.slice(0, 18) || '[媒体]'}  ->  ${reply.slice(0, 22)} | tok=${tok}${chunks.length > 1 ? ` 已分${chunks.length}条` : ''}`);
   } catch (e) {
-    console.error(`[bot] 群 ${gid} 出错：`, e.message);
+    // 超时类错误先翻译成人话（2026-10-29：裸英文「The operation timed out.」曾直接漏到群里）
+    const msg = e.name === 'TimeoutError' || e.message === 'The operation timed out.'
+      ? '对端半天没回话，这次请求超时了（服务缓一缓再试）'
+      : e.message;
+    console.error(`[bot] 群 ${gid} 出错：`, msg);
     // 出错也要回一句，别让群里静悄悄（媒体过大、接口拒收时尤其需要）
     try {
-      await ctx.reply(text(`柴郡这边卡住了一下喵：${String(e.message).slice(0, 80)}`));
+      await ctx.reply(text(`柴郡这边卡住了一下喵：${String(msg).slice(0, 80)}`));
     } catch { /* 连回复都失败就算了 */ }
   }
 });
