@@ -1017,6 +1017,60 @@ function parseVoiceIntent(raw) {
 }
 
 /**
+ * 随机柴郡图意图（2026-10-29 指挥官指示）：「随机柴郡图」「来张柴郡猫猫」「抽一张柴郡表情包」…
+ * 必须「柴郡」+「图/表情」+ 随机词三样齐全、句子短——裸「柴郡图」不抓（可能是闲聊），
+ * 长句（问怎么画的）也不抓。返回原文，不命中 null。
+ */
+function parseCatIntent(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t || t.length > 20) return null;
+  if (!/柴郡/.test(t)) return null;
+  if (!/(图|图片|表情|动图|猫猫)/.test(t)) return null;
+  if (!/随机|[抽发]一?张|来[一]?张|换[一]?张|换[个张]/.test(t)) return null;
+  return t;
+}
+
+// ── 随机柴郡图图源：GitHub 仓库 1143520/chaijun（「柴郡 の 小窝」mao.1143520.xyz 的后端）──
+// ⚠️ 下载全程走 api.github.com（2026-10-29 实测：raw/jsdelivr/gitmirror 在本机网络全被掐，
+// 只有 api.github.com 通）——列表用 git/trees，文件用 contents 接口 + raw 媒体类型（base64 不用解，
+// Accept: raw 直接回字节流）。contents 通道实测 ≤1MB 稳通、大档超时 → 随机池限定 ≤1MB（956/1000 张）
+let chaijunCache = { at: 0, files: [] };
+let chaijunLastPick = '';   // 连着抽不重样：同一张躲一次
+async function chaijunFiles() {
+  if (Date.now() - chaijunCache.at < 60 * 60 * 1000 && chaijunCache.files.length) return chaijunCache.files;
+  const r = await fetch('https://api.github.com/repos/1143520/chaijun/git/trees/main?recursive=1', {
+    signal: AbortSignal.timeout(20 * 1000),
+  });
+  if (!r.ok) throw new Error(`图源列表拉取失败 HTTP ${r.status}`);
+  const j = await r.json();
+  const files = (j.tree ?? [])
+    .filter((t) => t.type === 'blob' && /\.(gif|png|jpe?g|webp)$/i.test(t.path) && (t.size ?? 0) <= 1024 * 1024)
+    .map((t) => ({ p: t.path, s: t.size ?? 0 }));
+  if (!files.length) throw new Error('图源列表是空的（仓库可能改了）');
+  chaijunCache = { at: Date.now(), files };
+  return files;
+}
+/** 真随机抽一张并下载成 Buffer（随机在脚本里掷，模型没有插手的环节） */
+async function randomCheshireImage() {
+  const files = await chaijunFiles();
+  let pick = files[Math.floor(Math.random() * files.length)];
+  if (pick.p === chaijunLastPick && files.length > 1) {
+    pick = files[Math.floor(Math.random() * files.length)];   // 重样就再掷一把，还不重样就认命
+  }
+  chaijunLastPick = pick.p;
+  const r = await fetch('https://api.github.com/repos/1143520/chaijun/contents/' +
+    pick.p.split('/').map(encodeURIComponent).join('/'), {
+    headers: { 'Accept': 'application/vnd.github.raw' },   // raw 媒体类型 = 直接回字节流，省 base64 解码
+    signal: AbortSignal.timeout(60 * 1000),
+  });
+  if (r.status === 403) throw new Error('GitHub 限流了（匿名 60 次/小时），过会儿再抽喵');
+  if (!r.ok) throw new Error(`图源下载失败 HTTP ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!buf.length) throw new Error('图源下载到 0 字节');
+  return buf;
+}
+
+/**
  * 把画图诉求翻成英文生图 prompt（独立小会话，不吃群记忆、不占上下文、不带工具）。
  * 翻译层带否决权：根本不是画图诉求时回复 NO，路由退回正常对话（双保险）。
  * prevPrompt 有值 = 改稿模式：这是对上一次成图的修改请求，翻成「修改版 prompt」。
@@ -1338,6 +1392,30 @@ bot.onGroupMessage(async (event, ctx) => {
   // 全程模型没有「装成功」的机会（翻 prompt 那步模型只当翻译器）。
   // 改稿路由：刚画过的 10 分钟内，「性别错了/改一下/重画」这类没有画图句式的
   // 追加意见也接管重画（沿用上次 prompt + 用户反馈），否则模型只会嘴上答应不干活。
+  // ── 随机柴郡图路由（2026-10-29 指挥官指示）：脚本直抓直发、不过模型——
+  // 随机在脚本里掷、图在脚本里下载，模型没有「嘴上发了」的机会（坑 34 同族预防）。
+  // 必须排在画图路由前面：「来张柴郡图」会被画图闸的 nounDraw 规则捞走。
+  const catSubj = atMe ? parseCatIntent(userText) : null;
+  if (catSubj) {
+    try {
+      await ctx.reply(text('Nyahallo～去猫窝里翻一张出来喵，稍等～'));
+      const buf = await randomCheshireImage();
+      await http.raw('send_group_msg', {
+        group_id: Number(gid),
+        message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
+      }, { timeoutMs: 120 * 1000 });
+      // 进上下文一条轻记录，之后可以接着聊这张猫猫
+      pushHistory(gid, 'user', userText, `${displayName(event)}: ${userText} [要求随机柴郡图]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发随机柴郡图] Nyahallo～这张猫猫归你了喵`);
+      console.log(`[bot] 🐾 群 ${gid} 随机柴郡图已发`);
+    } catch (e) {
+      console.error('[bot] 随机柴郡图失败:', e.message);
+      try { await ctx.reply(text(`⚠️ 猫窝暂时翻不动了喵：${String(e.message).slice(0, 80)}`)); }
+      catch (e2) { console.error('[bot] 猫图失败提示也发不出去：', e2.message); }
+    }
+    return;
+  }
+
   const lastDraw = lastDrawByGroup.get(gid);
   const drawSubj = atMe ? (parseDrawIntent(userText)
     ?? (lastDraw
