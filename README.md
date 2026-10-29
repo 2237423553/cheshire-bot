@@ -16,6 +16,7 @@ A QQ group chat bot playing Cheshire (Azur Lane). **@-mention** her for text / i
 - 🔎 **Web search**: Exa MCP Server (`web_search` / `fetch_webpage`), no API key needed
 - 🎙 **Voice replies**: ordinary replies shorter than `ttsAutoVoiceChars` (default 50) go out **as voice first**, with a text copy right after; the **TTS endpoint is pluggable** — point `ttsUrl` at any OpenAI-compatible chat/completions (voice designed in natural language) or at ByteDance's official seed-tts protocol (the client auto-detects which from the URL and switches request shape/parsing). The voice itself is a natural-language description you can rewrite anytime; every reply carries a per-message tone directive and the triggering message is fed back as context, so the mood matches the conversation. Explicit triggers too: `语音：…` / `说一段…` / `用日语说…`. If TTS breaks, replies fall back to plain text
 - 🎵 **Singing**: @ her with `唱歌 / 唱首 / 来一首 xxx` — an LLM writes lyrics, then a **dedicated sing channel** synthesizes: `ttsSingUrl / ttsSingKey / ttsSingModel / ttsSingVoice` are configured independently from speech, so talking and singing can use different providers; both a prompt-driven audio-generation model and a `(唱歌)`-tag preset-voice model work (request shape auto-detected per endpoint)
+- 🐾 **Random Cheshire meme**: @ her with `随机柴郡图 / 来张柴郡猫猫 / 抽一张柴郡表情包` and she fetches a random image from a GitHub-hosted meme repo and posts it — fully scripted (real dice roll in code, the model never involved); the meme pool, its GitHub-API transport and the no-repeat guard are documented in the code
 - 🖼 **Text-to-image**: `画一张××` triggers an **intent-forced route** (script takes over: prompt translation → generate → post to group; the model never gets a chance to fake success); within 10 minutes say `改一下` and the **redraw route** reuses the last prompt; audit blocks / rate limits are reported honestly
 - 🎬 **Text-to-video / image-to-video**: `生成××视频` triggers the same forced route (async task: submit → poll → download → post); quoting an image auto-routes to **image-to-video**; clips capped at 15 s (`vidgenMaxSeconds` hard check); download auto-retries; `vidgenEnabled` master switch
 - 📡 **Beacon**: shout the beacon phrase and get an instant scripted reply — zero tokens, proves she's alive
@@ -177,6 +178,9 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 - 🎵 **唱歌**：@ 说「唱歌/唱首/来一首 xxx」——LLM 现写歌词后走**唱歌专用通道**：
   `ttsSingUrl/ttsSingModel/ttsSingKey` 独立配置，prompt 驱动的音频生成模型或
   `(唱歌)` 标签预置音色都能接（按端点自动判形状）；说话和唱歌可各用各的服务商
+- 🐾 **随机柴郡图**：@ 说「随机柴郡图/来张柴郡猫猫/抽一张柴郡表情包」即从图源仓库
+  （GitHub 托管的柴郡表情包库）随机抓一张发群——脚本全程接管，骰子在脚本里掷、
+  模型没有插手环节；连抽不重样、限流人话报错（触发需「柴郡+图+随机词」三样齐全）
 - 🖼 **文生图**：@ 说「画一张××」触发**意图强制路由**（脚本接管：prompt 翻译 → 生图 → 发群，
   模型没有装成功的机会）；10 分钟内说「改一下/性别错了」走**改稿路由**带上次 prompt 重画；
   审核拦截/限流都如实转告
