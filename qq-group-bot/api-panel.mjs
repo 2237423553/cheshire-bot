@@ -11,11 +11,12 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { cfg } from './config.mjs';
+import { cfg, MEDIA_OVERRIDE_KEYS } from './config.mjs';
 import { normalizeChatUrl, modelsUrlOf, mediaModelsUrlOf, fetchModels, probeModel, maskKey, assertSafeUrl } from './providers.mjs';
 import { loadState, saveState, listProfiles, upsertProfile, deleteProfile, applyProfile, writeJsonAtomic, readJson } from './llm-state.mjs';
 import { restartBot, isBotRunning } from './botctl.mjs';
 import { runProbeSuite } from './probe-suite.mjs';
+import { SWITCHES } from './switches-meta.mjs';
 import * as imggen from './imggen.mjs';
 import { PAGE_HTML } from './panel-page.mjs';
 
@@ -23,9 +24,10 @@ const TOKEN = crypto.randomUUID();
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const SWITCH_PATH = path.join(__dir, 'switches.json');
 const MEDIA_PATH = path.join(__dir, 'mediaapi.json');
-const SWITCH_KEYS = ['imggen', 'vidgenEnabled', 'bilibili', 'search', 'repeat', 'beacon'];
-const MEDIA_KEYS = ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize', 'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
-                    'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingVoice'];
+// 键清单唯一来源（10-30 评审：手抄清单已漂移——面板漏 tts 开关和 TTS 三键）
+const SWITCH_KEYS = SWITCHES.map((s) => s.key);
+const MEDIA_KEYS = MEDIA_OVERRIDE_KEYS;
+const MEDIA_URL_KEYS = ['imggenUrl', 'vidgenUrl', 'ttsUrl', 'ttsSingUrl'];   // 落盘前必须过 SSRF 闸的键
 const PROMPT_PATH = path.join(__dir, 'prompt.json');
 const PROMPT_LIMIT = 8000;   // 提示词最长字符（防手滑把 10 万字灌进每条消息）
 const OPEN_BROWSER = process.argv.includes('--open');
@@ -86,6 +88,17 @@ function resolveForm({ url, key, headers }) {
 // SSRF 闸白名单（10-24 评审）：刻意支持的本地服务——Ollama 默认端口
 const LOCAL_URL_HOSTS = ['127.0.0.1:11434', 'localhost:11434'];
 
+/** 归一化面板传来的思考档。**字符串单字 auto/enabled/disabled 也认**——
+ *  10-30 评审：radio 发的是字符串、旧代码按对象判断恒走兜底=「保持现状」，
+ *  面板上三个档全是摆设。'keep'/空 = 沿用当前生效值；'default' = 不传思考参数。 */
+function normalizeThinking(v) {
+  if (v === 'keep' || v == null || v === '') return cfg.thinking ?? 'default';
+  if (v === 'default') return 'default';
+  if (typeof v === 'string' && ['auto', 'enabled', 'disabled'].includes(v)) return { type: v };
+  if (v && typeof v === 'object' && typeof v.type === 'string') return v;
+  return cfg.thinking ?? 'default';
+}
+
 async function route(req, port) {
   const u = new URL(req.url);
   const path = u.pathname;
@@ -128,13 +141,11 @@ async function route(req, port) {
   if (path === '/api/save' && req.method === 'POST') {
     const b = await bodyJson(req);
     const { chatUrl, useKey, hdrs } = resolveForm(b);
+    // ★ SSRF 闸覆盖写盘口（10-30 评审：读口都防了、写口才是 Key 的最终去向）
+    await assertSafeUrl(chatUrl, LOCAL_URL_HOSTS);
     const model = String(b.model ?? '').trim();
     if (!model) return json({ error: '没给模型 ID' }, 400);
-    // 思考档：'keep' = 写当前生效值；'default' = 不传；其余传 {type:...}
-    const thinking = b.thinking === 'keep' ? (cfg.thinking ?? 'default')
-      : b.thinking === 'default' ? 'default'
-      : b.thinking && b.thinking.type ? b.thinking
-      : (cfg.thinking ?? 'default');
+    const thinking = normalizeThinking(b.thinking);
     let modelName = null;
     if (b.name) {
       // 快速验证一把再入档案（学报过头的 key 只存验证能跑的组合）
@@ -154,7 +165,8 @@ async function route(req, port) {
   if (path === '/api/profiles' && req.method === 'POST') {
     const b = await bodyJson(req);
     const { chatUrl, useKey, hdrs } = resolveForm(b);
-    const p = upsertProfile({ id: b.id, name: b.name, llmUrl: chatUrl, llmKey: useKey, model: b.model, llmHeaders: hdrs });
+    await assertSafeUrl(chatUrl, LOCAL_URL_HOSTS);   // SSRF 闸：档案里的 URL 之后也会被 bot 拿真 Key 请求
+    const p = upsertProfile({ id: b.id, name: b.name, llmUrl: chatUrl, llmKey: useKey, model: b.model, thinking: normalizeThinking(b.thinking), llmHeaders: hdrs });
     return json({ ok: true, id: p.id });
   }
   if (path === '/api/profiles' && req.method === 'DELETE') {
@@ -164,9 +176,10 @@ async function route(req, port) {
   }
   if (path === '/api/profiles/apply' && req.method === 'POST') {
     const b = await bodyJson(req);
+    const p2 = listProfiles().profiles.find((x) => x.id === b.id);
+    if (!p2) return json({ error: '没这个档案' }, 404);
+    await assertSafeUrl(p2.llmUrl, LOCAL_URL_HOSTS);   // SSRF 闸：不论验不验，enable 都写盘
     if (b.verify) {
-      const p2 = listProfiles().profiles.find((x) => x.id === b.id);
-      if (!p2) return json({ error: '没这个档案' }, 404);
       await probeModel(p2.llmUrl, p2.llmKey, p2.model, p2.llmHeaders ?? {});   // 启用前快验一把
     }
     applyProfile(b.id);
@@ -178,7 +191,8 @@ async function route(req, port) {
     const saved = readJson(SWITCH_PATH) ?? {};
     const vidDflt = cfg.vidgenEnabled !== false;   // 生视频的缺省跟 config 真身（其余键缺省=开）
     return json({
-      switches: Object.fromEntries(SWITCH_KEYS.map((k) => [k, saved[k] ?? (k === 'vidgenEnabled' ? vidDflt : true)])),
+      switches: Object.fromEntries(SWITCHES.map((s) => [s.key, saved[s.key] ?? (s.def === 'config' ? vidDflt : true)])),
+      meta: SWITCHES.map((s) => ({ key: s.key, label: s.label })),   // 标签随下发 —— 前端不再自抄第三份清单
       defaults: { vidgenEnabled: vidDflt },
       hint: 'vidgenEnabled 缺省跟 config.mjs 的 vidgenEnabled，其余缺省=开',
     });
@@ -199,7 +213,9 @@ async function route(req, port) {
       imggen: { url: cfg.imggenUrl, keyMasked: maskKey(cfg.imggenKey), hasKey: Boolean(cfg.imggenKey), model: cfg.imggenModel, size: cfg.imggenSize },
       vidgen: { url: cfg.vidgenUrl, keyMasked: maskKey(cfg.vidgenKey), hasKey: Boolean(cfg.vidgenKey), model: cfg.vidgenModel, maxSeconds: cfg.vidgenMaxSeconds },
       tts: { url: cfg.ttsUrl, keyMasked: maskKey(cfg.ttsKey), hasKey: Boolean(cfg.ttsKey), model: cfg.ttsModel,
-             voiceDesign: cfg.ttsVoiceDesign, autoChars: cfg.ttsAutoVoiceChars, singVoice: cfg.ttsSingVoice },
+             voice: cfg.ttsVoice, voiceDesign: cfg.ttsVoiceDesign, autoChars: cfg.ttsAutoVoiceChars,
+             singUrl: cfg.ttsSingUrl, singKeyMasked: maskKey(cfg.ttsSingKey), hasSingKey: Boolean(cfg.ttsSingKey),
+             singModel: cfg.ttsSingModel, singVoice: cfg.ttsSingVoice },
       note: 'Key 打码；改完重启 bot 生效',
     });
   }
@@ -211,10 +227,15 @@ async function route(req, port) {
     for (const k of MEDIA_KEYS) {
       if (!(k in b)) continue;
       const v = k === 'vidgenMaxSeconds' ? Math.max(1, Number(b[k]) || 15)
-        : k === 'ttsAutoVoiceChars' ? Math.max(1, Number(b[k]) || 300)   // 数字键防字符串落盘
+        : k === 'ttsAutoVoiceChars' ? Math.max(1, Number(b[k]) || 50)   // 数字键防字符串落盘（缺省跟 config=50）
         : String(b[k] ?? '').trim();
       if (k.endsWith('Key')) { if (v) merged[k] = v; }
       else if (v !== '') merged[k] = v;
+    }
+    // ★ SSRF 闸补媒体 URL 键（10-30 评审：bot 重启后会带着这些 Key 请求它们）
+    for (const k of MEDIA_URL_KEYS) {
+      const v = String(merged[k] ?? '').trim();
+      if (v) await assertSafeUrl(v, LOCAL_URL_HOSTS);
     }
     writeJsonAtomic(MEDIA_PATH, merged);
     console.log('[panel] 生图/生视频 API 配置已保存（重启 bot 生效）');

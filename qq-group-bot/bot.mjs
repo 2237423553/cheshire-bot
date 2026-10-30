@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
 import { assertSafeUrl } from './providers.mjs';
+import { SWITCHES } from './switches-meta.mjs';
 import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
@@ -58,6 +59,12 @@ function toolsNow() {
 }
 const eatHistory = new Map();     // gid -> 最近推过的菜名，用来避免老推同样的几样
 const lastDrawByGroup = new Map(); // gid -> 最近一次画图 { prompt, subj, at }，供「改一下/重画」改稿路由用
+
+/** 本地日期键（YYYY-MM-DD）：搜索「每日上限」跨天归零用 */
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 /**
  * content 可以是字符串（纯文字），也可以是 parts 数组（带图片/视频）。
@@ -111,9 +118,28 @@ function historyForApi(sessionId) {
       break;
     }
   }
-  return arr.map((e, i) => (i < keepFrom
-    ? { role: e.role, content: e.text }
-    : { role: e.role, content: e.content }));
+  // 露窗的历史在「进请求前」就地降级为纯文字：把几十 MB 的 base64 字符串
+  // 从 history 里真正放掉（10-30 评审：只在返回值里降级的话，内存一点没省）
+  for (let i = 0; i < keepFrom; i++) {
+    const e = arr[i];
+    if (Array.isArray(e.content)) e.content = e.text;
+  }
+  // 窗口内也要有总量预算：从新到旧累计 base64 字节，超预算的旧图整条降级为纯文字。
+  // 群聊高峰一张带三张图的 @ 很多，不设上限单请求能背几十 MB。
+  let budget = cfg.mediaWindowTotalBytes;
+  return arr.map((e, i) => {
+    if (i < keepFrom) return { role: e.role, content: e.text };
+    if (Array.isArray(e.content)) {
+      let bytes = 0;
+      for (const p of e.content) {
+        const u = p?.image_url?.url ?? '';
+        if (u.startsWith('data:')) bytes += Math.floor((u.length * 3) / 4);
+      }
+      if (bytes > budget) { e.content = e.text; return { role: e.role, content: e.text }; }
+      budget -= bytes;
+    }
+    return { role: e.role, content: e.content };
+  });
 }
 
 // ─────────── 媒体工具 ───────────
@@ -432,10 +458,14 @@ const TOOLS = [
   },
 ];
 
-let searchCount = 0;   // 当日搜索计数（简单保护）
+let searchCount = 0;        // 当日搜索计数（简单保护）
+let searchCountDate = '';   // 计数所属日期 —— 跨天归零，「每日」限额才名副其实
+                            // （10-30 评审：此前只增不清，挂机几周搜索就永久哑掉））
 
 // 搜索/抓取都走 Exa MCP Server（exa.mjs），不再直连 REST API
 async function exaSearch(query, objective) {
+  const day = todayKey();
+  if (searchCountDate !== day) { searchCount = 0; searchCountDate = day; }
   if (cfg.searchDailyLimit > 0 && searchCount >= cfg.searchDailyLimit) {
     return '搜索次数已达今日上限，请直接根据已有知识回答。';
   }
@@ -551,7 +581,8 @@ async function callLLM(sessionId, messages, useTools) {
       'Authorization': `Bearer ${cfg.llmKey}`,
       'Content-Type': 'application/json',
       'User-Agent': 'qq-group-bot/1.0',
-      // OpenCode Go 要求每个会话带稳定的会话 ID（路由 + 提示词缓存），缺失不影响调用但官方明确建议
+      // OpenCode Go 要求每个会话带稳定的会话 ID（路由 + 提示词缓存）；
+      // 其他服务商不理会这个头，实测（10-30 Token Plan）带上也无碍
       'x-opencode-session': sessionId,
       // 自定义头放最后 —— 允许覆盖上面任何一条（有些中转商要自己的鉴权头）
       ...(cfg.llmHeaders ?? {}),
@@ -561,8 +592,18 @@ async function callLLM(sessionId, messages, useTools) {
     // 这条 @ 永远悬着）。5 分钟是思考模型+长上下文的安全上限，正常回复 5~60s 内回。
     signal: AbortSignal.timeout(5 * 60 * 1000),
   });
-  const j = await r.json();
-  if (j.error) throw new Error(`LLM ${r.status}: ${JSON.stringify(j.error)}`);
+  // 先查 r.ok 再解析（10-30 评审）：网关 502 返 HTML 时裸 r.json() 会抛
+  // 「Unexpected token」乱码出群；非 200 且无 error 字段则静默空回复
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    const detail = String(j?.error?.message ?? (typeof j?.message === 'string' ? j.message : '') ?? '').trim()
+      || JSON.stringify(j ?? {}).slice(0, 100);
+    throw new Error(`LLM 接口 HTTP ${r.status}：${detail}`);
+  }
+  if (j?.error) throw new Error(`LLM ${r.status}: ${String(j.error?.message ?? JSON.stringify(j.error)).slice(0, 120)}`);
+  if (!j?.choices?.[0]?.message) {
+    throw new Error(`LLM 返回结构不对（HTTP ${r.status}）：${JSON.stringify(j ?? {}).slice(0, 80)}`);
+  }
 
   // 记下真实 prompt_tokens，用来判断何时该压缩（比按字数估算准）
   const pt = j.usage?.prompt_tokens;
@@ -572,16 +613,30 @@ async function callLLM(sessionId, messages, useTools) {
 }
 
 /**
- * 清理「工具调用被当文本吐出来」的残留。
- * 如果中途没传 tools，模型会用文本伪造 `` 这种语法，
- * 这里兜底删掉，免得发到群里。
+ * 清理「工具调用被当文本吐出来」的残留 —— 但只清真残留，不碰正常代码。
+ *
+ * 旧版无条件剥所有代码围栏和行内代码，群友问技术问题的答案在出群前
+ * 被静默删掉（10-30 评审）。真实残留的指纹是「内容长成工具调用 JSON 的围栏」
+ * 或伪标签语法 —— 围栏里命不中指纹就原样保留。
  */
 function cleanToolArtifacts(s) {
-  return s
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/`[^`]*`/g, '')
-    .replace(/<[^>]+>[\s\S]*?<\/[a-z_]+>/gi, '')
-    .trim();
+  let out = String(s ?? '');
+  // ① 围栏块：内容像工具调用 JSON（带 "name"+"arguments"/"function"）或者是
+  //    伪标签语法才删；真代码（脚本/配置片段）原样保留
+  out = out.replace(/```[a-z]*\n?([\s\S]*?)```/gi, (m, body) => {
+    const looksLikeToolCall = /"(?:name|function|arguments)"|<tool_call>|<\/tool/i.test(body);
+    return looksLikeToolCall ? '' : m;
+  });
+  // ② 行内代码只删除内容确实是工具调用的（比如 `{"name":"web_search",...}`），
+  //    普通行像 `config.mjs` 一律放行
+  out = out.replace(/`([^`\n]+)`/g, (m, body) => (
+    /^\s*[{<]|"name"|tool/i.test(body.trim()) ? '' : m
+  ));
+  // ③ 伪标签对（<tool_call>…</tool_call> 或任意 <tag>{json}</tag> 包工具调用的）照删：
+  //    这类语法群里正常聊天不会出现，剥了也不伤普通内容
+  out = out.replace(/<tool_call>[\s\S]*?<\/tool(?:_call)?>/gi, '');
+  out = out.replace(/<([a-z_]+)>\s*\{[\s\S]{0,300}?"(?:name|arguments)"[\s\S]{0,300}?\}\s*<\/\1>/gi, '');
+  return out.trim();
 }
 
 /** 「[已画图: X]」是画图路由记进上下文的内部格式；模型有样学样打出来就是谎报/漏账，
@@ -1287,8 +1342,8 @@ console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（@ 说「�
 console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
 {
   // 开机打一眼当前开关状态（面板改了开关不用重启，这行只在启动时打一次快照）
-  const names = { imggen: '画画', vidgenEnabled: '生视频', bilibili: 'B站总结', search: '搜索', repeat: '复读', beacon: '信标', tts: '语音' };
-  const states = Object.entries(names).map(([k, l]) => `${l}=${featureOn(k, k === 'vidgenEnabled' ? cfg.vidgenEnabled !== false : true) ? '开' : '关'}`);
+  // 键与标签来自 switches-meta.mjs（唯一来源，10-30 评审：之前两处手抄已漂移）
+  const states = SWITCHES.map((s) => `${s.label}=${featureOn(s.key, s.def === 'config' ? cfg.vidgenEnabled !== false : s.def) ? '开' : '关'}`);
   console.log(`[bot] 功能开关：${states.join(' · ')}（switches.json，每条消息现读，面板改了即刻生效）`);
 }
 
@@ -1389,7 +1444,37 @@ bot.onGroupMessage(async (event, ctx) => {
     return;
   }
 
-  // ── 画图意图强制路由（2026-10-20 上线；10-21 加改稿路由）──
+  // ── 群级串行闸（2026-10-30 评审）：正事排队跑，不让第二条流水线并发 ──
+  // 之前每组 @ 是独立的 fire-and-forget 异步任务，LLM 回复要 5~60s、生视频几分钟，
+  // 冷却闸（1s）根本拦不住第二个 @ —— 两条流水线并发会双写 history 打乱上下文顺序。
+  // B站路由有自己的 bvBusy 防重入、复读/信标/指令都是纯脚本秒出，都不受此闸影响。
+  // 忙时不静默丢弃：先回一句「在忙」，这条照样进队列。
+  if (busyGroups.has(gid)) {
+    try { await ctx.reply(text('柴郡在忙前一条喵，这条排在后面了，稍等～')); } catch { /* 发不出去就算了 */ }
+  }
+  enqueueHeavy(gid, () => handleAtMe(event, ctx, gid, userText, atMe, cmd))
+    .catch((e) => console.error(`[bot] 群 ${gid} 正事链异常：`, e.message));
+});
+
+// 每群一个任务链：只有「正事」（画图/视频/唱歌/语音/主对话）才排队；
+// 前一任失败不毒化后任（catch 吞掉只留日志，真实错误已在路由里自行上报过）。
+const groupJobs = new Map();   // gid -> 链尾 Promise（永不 reject，失败已吞）
+const busyGroups = new Set();  // gid 有正事在跑（含排队）就记进来，供「在忙」提示判断
+function enqueueHeavy(gid, job) {
+  const slot = groupJobs.get(gid) ?? { tail: Promise.resolve() };
+  groupJobs.set(gid, slot);
+  busyGroups.add(gid);   // 排队也算忙（不然排队的人不知道自己为什么还没被理）
+  const run = Promise.resolve(slot.tail).then(job);
+  // 链尾判空闲：只有自己是最新尾时才摘 busy 标记 —— 后面还有人排队时不摘
+  const tail = run.catch(() => {}).finally(() => { if (slot.tail === tail) busyGroups.delete(gid); });
+  slot.tail = tail;
+  return run;
+}
+
+// @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来以便排队）；
+// 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。
+async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
+
   // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
   // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
   // 全程模型没有「装成功」的机会（翻 prompt 那步模型只当翻译器）。
@@ -1670,7 +1755,8 @@ bot.onGroupMessage(async (event, ctx) => {
   }
 
   try {
-    await maybeCompress(gid);   // 上下文到阈值就先压缩，再进本轮
+    // 压缩改到回复发出**之后**再跑（10-30 评审，见本 try 块末尾）：
+    // 撞上阈值的那轮不让用户先干等 30~90s 的压缩调用
 
     const hasVideo = content.parts.some((p) => p.type === 'video_url');
     const baseText = `${displayName(event)}: ${content.rawText || '[发来一条媒体消息]'}`;
@@ -1752,6 +1838,11 @@ bot.onGroupMessage(async (event, ctx) => {
     }
     const tok = promptTokens.get(`group-${gid}`) ?? '?';
     console.log(`[bot] 群 ${gid}${describeMedia(content.parts)} <- ${content.rawText.slice(0, 18) || '[媒体]'}  ->  ${reply.slice(0, 22)} | tok=${tok}${chunks.length > 1 ? ` 已分${chunks.length}条` : ''}`);
+
+    // 回复发完了才压缩（10-30 评审）：撞上阈值的那轮用户已经拿到回复，
+    // 后台这段压缩谁也不用等；还在 enqueueHeavy 的 job 里同步执行，
+    // 群级串行闸保证它跑完之前下一条 @ 只是排队 —— 不会跟下一轮对话并发打架
+    await maybeCompress(gid);
   } catch (e) {
     // 超时类错误先翻译成人话（2026-10-29：裸英文「The operation timed out.」曾直接漏到群里）
     const msg = e.name === 'TimeoutError' || e.message === 'The operation timed out.'
@@ -1763,7 +1854,8 @@ bot.onGroupMessage(async (event, ctx) => {
       await ctx.reply(text(`柴郡这边卡住了一下喵：${String(msg).slice(0, 80)}`));
     } catch { /* 连回复都失败就算了 */ }
   }
-});
+}
+// handleAtMe 到此为止 —— 它被 onGroupMessage 里的 enqueueHeavy 排队执行（见上方「群级串行闸」）
 
 await bot.connect();
 console.log('[bot] 事件流已连接，等待 @ …');

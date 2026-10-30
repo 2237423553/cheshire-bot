@@ -108,11 +108,15 @@ export const PAGE_HTML = `<!doctype html>
 <tr><td>端点</td><td><input id="t_url"></td></tr>
 <tr><td>Key</td><td><div class="row"><input id="t_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="ttoggle()">👁</button></div></td></tr>
 <tr><td>模型</td><td><input id="t_model" placeholder="mimo-v2.5-tts-voicedesign"></td></tr>
+<tr><td>音色 ID</td><td><input id="t_voice" placeholder="端点指向 bytedance（豆包官方协议）时用：控制台「音色库」页的音色 ID"></td></tr>
 <tr><td>声线描述</td><td><textarea id="t_design" rows="3" placeholder="自然语言捏音色：只写「是什么」，别写否定句，带一个具象锚点最灵"></textarea></td></tr>
 <tr><td>自动语音阈值</td><td><input id="t_chars" type="number" min="1"> <span class="hint">字（回复≤此长先发语音，文字版跟上）</span></td></tr>
-<tr><td>唱歌音色</td><td><input id="t_sing" placeholder="预置名：茉莉 / 冰糖 / 苏打 / 白桦…（唱歌是预置音色专属）"></td></tr></table>
+<tr><td>唱歌端点/Key</td><td><input id="t_sing_url" placeholder="唱歌端点（留空 = 用官方默认；指向 bytedance 才被采信）">
+  <div class="row" style="margin-top:4px"><input id="t_sing_key" type="password" placeholder="唱歌 Key（留空 = 沿用当前）"><button class="eye" onclick="tstoggle()">👁</button></div></td></tr>
+<tr><td>唱歌模型/音色</td><td><input id="t_sing_model" placeholder="唱歌模型 ID（prompt 驱动音频生成 / 预置音色 TTS 均可）">
+  <input id="t_sing" placeholder="预置名：茉莉 / 冰糖 / 苏打 / 白桦…（预置音色专属通道用）" style="margin-top:4px"></td></tr></table>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('tts')">保存语音配置</button></div>
-<div class="hint">唱歌走预置音色（mimo-v2.5-tts），说话走捏的声线（voicedesign）——官方互斥设计；保存后重启机器人生效</div></div>
+<div class="hint">说话和唱歌可各用各的服务商（ttsSingUrl/ttsSingKey/ttsSingModel 独立）；端点指向 bytedance.com 自动切豆包官方协议；保存后重启机器人生效</div></div>
 
 <div class="card"><h2>自定义提示词</h2>
 <table class="kv">
@@ -382,24 +386,21 @@ async function delProf(id) {
 }
 
 // ── 功能开关子窗 ──
-const SW_LABELS = {
-  imggen: '画画 / 改稿路由（关了 @ 点画图回「暂停营业」）',
-  vidgenEnabled: '生视频（文生 + 图生）',
-  bilibili: 'B站链接免 @ 总结',
-  search: '联网搜索（Exa，关了模型就没搜索工具）',
-  repeat: '+1 复读',
-  beacon: '寻呼信标「柴郡柴郡」',
-};
+// 标签清单不再手抄：GET /api/switches 自带 meta（单一来源在 switches-meta.mjs，
+// 10-30 评审：之前面板这份手抄漏了 tts 开关，面板上根本没法关语音）
+let SW_LABELS = {};
 function swSummary(sw) {
-  const on = Object.keys(SW_LABELS).filter((k) => sw[k]);
-  const off = Object.keys(SW_LABELS).filter((k) => !sw[k]);
+  const keys = Object.keys(SW_LABELS);
+  const on = keys.filter((k) => sw[k]);
+  const off = keys.filter((k) => !sw[k]);
   return '开：' + (on.length ? on.map((k) => SW_LABELS[k].split('（')[0].split('「')[0]).join(' · ') : '无')
     + (off.length ? '　｜　关：' + off.map((k) => SW_LABELS[k].split('（')[0].split('「')[0]).join(' · ') : '');
 }
 async function openSw() {
   try {
     const j = await api('/api/switches');
-    $('sw_list').innerHTML = Object.entries(SW_LABELS).map(([k, l]) =>
+    SW_LABELS = Object.fromEntries((j.meta ?? []).map((m) => [m.key, m.label]));
+    $('sw_list').innerHTML = (j.meta ?? []).map(({ key: k, label: l }) =>
       '<label style="display:block;margin:7px 0"><input type="checkbox" id="sw_' + k + '"' + (j.switches[k] ? ' checked' : '') + '> '
       + esc(l) + (k === 'vidgenEnabled' ? ' <span class="hint">（缺省跟 config：' + j.defaults.vidgenEnabled + '）</span>' : '') + '</label>').join('');
     $('sw_txt').textContent = swSummary(j.switches);
@@ -422,6 +423,7 @@ async function saveSw() {
 function mtoggle() { const k = $('m_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
 function vtoggle() { const k = $('v_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
 function ttoggle() { const k = $('t_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
+function tstoggle() { const k = $('t_sing_key'); k.type = k.type === 'password' ? 'text' : 'password'; }
 const MEDIA_NAME = { imggen: '生图', vidgen: '生视频', tts: '语音' };
 async function loadMedia() {
   try {
@@ -429,18 +431,32 @@ async function loadMedia() {
     $('m_url').value = j.imggen.url || ''; $('m_model').value = j.imggen.model || ''; $('m_size').value = j.imggen.size || '';
     $('v_url').value = j.vidgen.url || ''; $('v_model').value = j.vidgen.model || ''; $('v_max').value = j.vidgen.maxSeconds || 15;
     $('t_url').value = j.tts.url || ''; $('t_model').value = j.tts.model || ''; $('t_design').value = j.tts.voiceDesign || '';
-    $('t_chars').value = j.tts.autoChars || 300; $('t_sing').value = j.tts.singVoice || '';
+    $('t_chars').value = j.tts.autoChars || ''; $('t_voice').value = j.tts.voice || '';
+    $('t_sing_url').value = j.tts.singUrl || ''; $('t_sing_model').value = j.tts.singModel || '';
+    $('t_sing').value = j.tts.singVoice || '';
   } catch (e) { bar('读生图/生视频/语音配置失败：' + e.message, 'bad'); }
 }
+/** 数字输入框：空串**不发送该键**（10-30 评审：旧版空值兜底 300 把 config 默认 50 无声改写） */
+function numField(id, key, out) {
+  const raw = $(id).value.trim();
+  if (raw !== '' && Number(raw) > 0) out[key] = Number(raw);
+}
 async function saveMedia(side) {
-  const b = side === 'imggen'
-    ? { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(), imggenSize: $('m_size').value.trim() }
-    : side === 'vidgen'
-    ? { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim(), vidgenMaxSeconds: Number($('v_max').value) || 15 }
-    : { ttsUrl: $('t_url').value.trim(), ttsKey: $('t_key').value, ttsModel: $('t_model').value.trim(),
-        ttsVoiceDesign: $('t_design').value.trim(), ttsAutoVoiceChars: Number($('t_chars').value) || 300, ttsSingVoice: $('t_sing').value.trim() };
+  const t = {};
+  if (side === 'imggen') {
+    Object.assign(t, { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(), imggenSize: $('m_size').value.trim() });
+  } else if (side === 'vidgen') {
+    Object.assign(t, { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim() });
+    numField('v_max', 'vidgenMaxSeconds', t);
+  } else {
+    Object.assign(t, { ttsUrl: $('t_url').value.trim(), ttsKey: $('t_key').value, ttsModel: $('t_model').value.trim(),
+      ttsVoice: $('t_voice').value.trim(), ttsVoiceDesign: $('t_design').value.trim(),
+      ttsSingUrl: $('t_sing_url').value.trim(), ttsSingKey: $('t_sing_key').value, ttsSingModel: $('t_sing_model').value.trim(),
+      ttsSingVoice: $('t_sing').value.trim() });
+    numField('t_chars', 'ttsAutoVoiceChars', t);
+  }
   try {
-    await api('/api/media', { method: 'POST', body: JSON.stringify(b) });
+    await api('/api/media', { method: 'POST', body: JSON.stringify(t) });
     bar('已保存（' + MEDIA_NAME[side] + '）——重启机器人后生效', 'ok');
     if (confirm('现在重启机器人让 API 配置生效？')) await doRestart(false, true);
   } catch (e) { bar('保存失败：' + e.message, 'bad'); }

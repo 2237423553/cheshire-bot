@@ -66,29 +66,52 @@ export async function generateVideo(prompt, imageDataUrl = '') {
         throw new Error(`提交生视频任务失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
       }
       rid = j.request_id;
+      // 10-30 评审：ok 但拿不到 request_id（响应体解析失败 / 接口改版）**立刻抛**，
+      // 不能当瞬时错误重试 —— 首次提交可能已被受理，原样再提一单就是双倍计费
+      if (!rid) throw new Error('生视频接口没返回 request_id，可能改版了');
     } catch (e) {
-      // 终局错误（审核/401/429/其它明确报错）直接抛；瞬时问题记下最后一搏
+      // 终局错误（审核/401/429/改版/其它明确报错）直接抛；瞬时问题记下最后一搏
       if ((e.name === 'TimeoutError' || e.name === 'AbortError')) { lastErr = '提交超时'; continue; }
       throw e;
     }
   }
   if (!rid) throw new Error(`提交生视频任务失败（重试 3 次都不行：${lastErr}）——稍后再试`);
-  if (!rid) throw new Error('生视频接口没返回 request_id，可能改版了');
   console.log(`[bot] 🎬 生视频任务已提交：${rid}`);
 
-  // ② 轮询到出片
+  // ② 轮询到出片（间隔递增 5s→×1.5 封顶 15s：几十秒内的小任务保证响应速度，
+  // 后面每把多半只带回同一个 progress，白转 96 次没必要）
   const deadline = Date.now() + POLL_MAX;
+  let interval = POLL_INTERVAL;
+  let notFound = 0;   // 连续 404 计数：任务在服务端被清了就别再傻等
   while (Date.now() < deadline) {
-    await new Promise((res) => setTimeout(res, POLL_INTERVAL));
-    let j;
+    await new Promise((res) => setTimeout(res, interval));
+    interval = Math.min(interval * 1.5, 15000);
+    let j = null, ok = false, status = 0;
     try {
       const r = await fetch(baseOf() + `/v1/videos/${rid}`, {
         headers: authHeaders(),
         signal: AbortSignal.timeout(30 * 1000),
       });
-      j = await r.json().catch(() => ({}));
+      ok = r.ok; status = r.status;
+      j = await r.json().catch(() => null);
     } catch {
       continue;   // 单次轮询失败不放弃，下一轮再试
+    }
+    // 10-30 评审：轮询也要看状态 —— 失效任务不再白转满 8 分钟报误导性「超时」
+    if (status === 404) {
+      if (++notFound >= 2) throw new Error('生视频任务已不存在（任务可能被服务端清掉或超时清理）——重新生成一次吧');
+      continue;   // 单次 404 容忍一把（中转偶发抖动）
+    }
+    if (!ok || j?.error) {
+      const msg = String(j?.error?.message ?? j?.error ?? `HTTP ${status}`);
+      if (/安全策略|合规|moderation|审核/i.test(msg)) {
+        throw new Error('⛔ 这个描述被生视频服务的安全审核拒绝了——生成不了，换个描述试试吧');
+      }
+      if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+        throw new Error('⛔ 生视频 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
+      }
+      if (j?.error) throw new Error(`生视频任务失败：${msg.slice(0, 120)}`);
+      continue;   // 轮询侧非 2xx（401/429/5xx）但没带 error 体：真挂账下次再试一把，下一轮继续
     }
     if (j.status === 'done') {
       // 指挥官限额：成片最长 15 秒（2026-10-21 加）。超限就弃用不发（费用照扣，但绝不让超长片进群）
@@ -131,7 +154,10 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       if (!buf) throw new Error(`视频下载失败（重试 3 次都不行：${dlErr}）——成片还在服务器上，稍后让柴郡重发或换个说法再生成一次`);
       return buf;
     }
-    if (j.status && j.status !== 'pending' && j.status !== 'done') {
+    // 状态白名单化（10-30 评审）：done 已在上方处理；检测到明确失败态才抛；
+    // [pending]/running/processing/queued 乃至服务商自造的其它「还在跑」词一律继续等
+    // ——旧版非 pending/done 一律当失败抛，会误杀正在跑的正常任务
+    if (j.status && /fail|error|cancel|reject/i.test(String(j.status))) {
       throw new Error(`生视频任务失败：${String(j.error?.message ?? j.status).slice(0, 120)}`);
     }
   }

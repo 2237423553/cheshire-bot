@@ -74,15 +74,21 @@ export const cfg = {
   maxMediaBytes: 100 * 1024 * 1024,
 
   // 图片/视频与文字的「关联」只保留最近 N 次「与机器人的互动」。
-  // 群里不 @ 机器人的闲聊不算数、不会把图挤掉；第 1 条的图到第 11 次互动才不再关联。
-  // 更早的只剩纯文字 —— 既保住「刚才那张图里有几个人」的细节，又不撑爆上下文。
-  mediaMemoryWindow: 10,
+  // 群里不 @ 机器人的闲聊不算数、不会把图挤掉；更早的只剩纯文字。
+  // 窗口内所有图每次请求都会重传 —— 10 轮窗口在群聊高峰能背几十张图，
+  // 每请求白烧几万 token（10-30 评审）；6 轮足够回答「刚才那张图里有几个人」，
+  // 6 轮外这类问题本来就没人问了。
+  mediaMemoryWindow: 6,
 
   // 单个媒体超过这个体积，就不进「关联窗口」（只在当轮可见）。
-  // 必要性：maxMediaBytes 允许 100MB，若一个 100MB 视频留在窗口里，
-  // 接下来 10 次请求每次都要重传 133MB base64，直接把请求撑爆。
-  // 8MB 覆盖绝大多数图片和短视频，巨型媒体自动降级为「只看一眼」。
-  mediaHistoryMaxBytes: 8 * 1024 * 1024,
+  // 2MB 覆盖绝大多数群聊截图/缩略图（QQ 原图常见 3~5MB，那种清楚不清楚
+  // 模型也分不出更多细节）；更大就降级「只看一眼」，别让它常驻内存
+  // （字符串是 UTF-16，8MB 图≈21MB 常驻，攒几十张直接吃光内存，10-30 评审）。
+  mediaHistoryMaxBytes: 2 * 1024 * 1024,
+
+  // 「关联窗口」里所有图片的 base64 总量预算（字节）——窗口内从新到旧累计，
+  // 超预算的更旧图自动降级为纯文字。防单请求带上几十张图被上限拒收。
+  mediaWindowTotalBytes: 24 * 1024 * 1024,
 
   stripMarkdown: false,        // 保留模型的 markdown（**加粗** 等是情景模拟的产物，不是垃圾）
 
@@ -179,14 +185,18 @@ try {
 
 // ── 生图/生视频/语音 API 覆盖（API 面板写 mediaapi.json；改完重启 bot 生效）──
 // 同样删掉文件即回滚；合并式写入（陌键存活），不改 config.mjs 真身
-// tts* 七键 2026-10-24 收编进来（含声线描述/自动语音阈值/唱歌音色）
+// ★ 白名单导出成 MEDIA_OVERRIDE_KEYS（面板 api-panel.mjs 从这里 import）——
+//   之前 bot/面板两处手抄已经漂移（面板漏了 TTS 三键），加键只改这里（10-30 评审）
+export const MEDIA_OVERRIDE_KEYS = [
+  'imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
+  'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
+  'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsVoice',
+  'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingUrl', 'ttsSingKey', 'ttsSingVoice',
+];
 const MEDIA_FILE = path.join(__dir, 'mediaapi.json');
 try {
   const o = JSON.parse(fs.readFileSync(MEDIA_FILE, 'utf8'));
-  for (const k of ['imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
-                   'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
-                   'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsVoice',
-                   'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingUrl', 'ttsSingKey', 'ttsSingVoice']) {
+  for (const k of MEDIA_OVERRIDE_KEYS) {
     if (o[k] !== undefined && o[k] !== null && o[k] !== '') cfg[k] = o[k];
   }
 } catch {
