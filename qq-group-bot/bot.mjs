@@ -1527,32 +1527,54 @@ bot.onGroupMessage(async (event, ctx) => {
     return;
   }
 
+  // ── 只读指令**立即答、不排队**（10-30 实战反馈：B站长任务在跑时连 #上下文
+  // 都要排在后面吃「在忙」，太憋屈）。#吃什么 用独立会话、#模型/#上下文 纯读——
+  // 都不写 history，串行闸管不着它们；写 history 的 #压缩/#清空 仍排队（与对话串行才安全）。
+  if (cmd && ![ 'compress', 'clear' ].includes(cmd)) {
+    try {
+      await handleCommand(cmd, gid, ctx);
+    } catch (e) {
+      console.error(`[bot] 指令 ${cmd} 出错：`, e.message);
+      try { await ctx.reply(text(`指令执行失败：${humanizeError(e)}`)); } catch { /* 连回复都失败就算了 */ }
+    }
+    return;
+  }
+
   // ── 群级串行闸（2026-10-30 评审）：正事排队跑，不让第二条流水线并发 ──
   // 之前每组 @ 是独立的 fire-and-forget 异步任务，LLM 回复要 5~60s、生视频几分钟，
   // 冷却闸（1s）根本拦不住第二个 @ —— 两条流水线并发会双写 history 打乱上下文顺序。
-  // B站路由有自己的 bvBusy 防重入、复读/信标/指令都是纯脚本秒出，都不受此闸影响。
-  // 忙时不静默丢弃：先回一句「在忙」，这条照样进队列。
+  // B站路由有自己的 bvBusy 防重入、复读/信标/只读指令都是纯脚本秒出，都不受此闸影响。
+  // 忙时不静默丢弃：先报「在忙+前面排着几件」，这条照样进队列。
   if (busyGroups.has(gid)) {
-    try { await ctx.reply(text('柴郡在忙前一条喵，这条排在后面了，稍等～')); } catch { /* 发不出去就算了 */ }
+    const n = groupQueueLen(gid);
+    try {
+      await ctx.reply(text(n > 1 ? `柴郡在忙前一条喵，前面还有 ${n - 1} 件正事排着，这条在队尾，稍等～`
+        : '柴郡在忙前一条喵，这条排在后面了，稍等～'));
+    } catch { /* 发不出去就算了 */ }
   }
   enqueueHeavy(gid, () => handleAtMe(event, ctx, gid, userText, atMe, cmd))
     .catch((e) => console.error(`[bot] 群 ${gid} 正事链异常：`, e.message));
 });
 
-// 每群一个任务链：只有「正事」（画图/视频/唱歌/语音/主对话）才排队；
+// 每群一个任务链：只有「正事」（画图/视频/唱歌/语音/主对话/压缩清空）才排队；
 // 前一任失败不毒化后任（catch 吞掉只留日志，真实错误已在路由里自行上报过）。
-const groupJobs = new Map();   // gid -> 链尾 Promise（永不 reject，失败已吞）
+const groupJobs = new Map();   // gid -> { tail: 链尾 Promise(永不 reject), n: 队列里还有几件 }
 const busyGroups = new Set();  // gid 有正事在跑（含排队）就记进来，供「在忙」提示判断
 function enqueueHeavy(gid, job) {
-  const slot = groupJobs.get(gid) ?? { tail: Promise.resolve() };
+  const slot = groupJobs.get(gid) ?? { tail: Promise.resolve(), n: 0 };
   groupJobs.set(gid, slot);
+  slot.n = (slot.n ?? 0) + 1;
   busyGroups.add(gid);   // 排队也算忙（不然排队的人不知道自己为什么还没被理）
   const run = Promise.resolve(slot.tail).then(job);
   // 链尾判空闲：只有自己是最新尾时才摘 busy 标记 —— 后面还有人排队时不摘
-  const tail = run.catch(() => {}).finally(() => { if (slot.tail === tail) busyGroups.delete(gid); });
+  const tail = run.catch(() => {}).finally(() => {
+    if (slot.tail === tail) { busyGroups.delete(gid); slot.n = 0; }
+  });
   slot.tail = tail;
   return run;
 }
+/** 该群队列里还压着几件正事（含在跑的那件），供「在忙」提示报数 */
+function groupQueueLen(gid) { return groupJobs.get(gid)?.n ?? 0; }
 
 // @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来以便排队）；
 // 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。

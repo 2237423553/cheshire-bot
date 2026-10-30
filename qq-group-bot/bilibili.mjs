@@ -105,24 +105,40 @@ export function fmtDur(sec) {
 }
 
 async function callLLM(body) {
-  const r = await fetch(cfg.llmUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${cfg.llmKey}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'bilibili-summarize/1.0',
-      'x-opencode-session': 'bilibili-summarize', // 稳定会话 ID（OpenCode 要求，坑8）
-      ...(cfg.llmHeaders ?? {}),                  // 自定义头放最后，允许覆盖
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15 * 60_000), // 视频理解慢，给足 15 分钟
-  });
-  // 同上：LLM 网关过载可能回非 JSON，裸 json() 抛 SyntaxError（10-30 评审同修）
-  const j = await r.json().catch(() => null);
-  if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${String(j?.error?.message ?? '').slice(0, 200)}`);
-  if (j?.error) throw new Error(`LLM 错误: ${JSON.stringify(j.error).slice(0, 300)}`);
-  if (!j) throw new Error('LLM 返回不是 JSON（网关可能过载或返回了 HTML 状态页）');
-  return j;
+  const payload = JSON.stringify(body);
+  // 视频理解是分钟级长请求，网关偶发回非 JSON/截断包（10-30 实战实锤：200+非 JSON，
+  // 同视频最小复现立刻成功——纯瞬时故障）。解析失败**重试一把**；现场原文头落 stderr
+  // 留证（不外发）；HTTP 硬错重试价值不大直接抛人话。
+  let goodBody = '';
+  let r = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await new Promise((res) => setTimeout(res, 4000));   // 网关缓一缓再打
+      console.warn('[bilibili] LLM 响应解析失败，4s 后重试一把');
+    }
+    r = await fetch(cfg.llmUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.llmKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'bilibili-summarize/1.0',
+        'x-opencode-session': 'bilibili-summarize', // 稳定会话 ID（OpenCode 要求，坑8；Token Plan 无视此头）
+        ...(cfg.llmHeaders ?? {}),                  // 自定义头放最后，允许覆盖
+      },
+      body: payload,
+      signal: AbortSignal.timeout(15 * 60_000), // 视频理解慢，给足 15 分钟
+    });
+    goodBody = await r.text();
+    let j = null;
+    try { j = JSON.parse(goodBody.length ? goodBody : 'null'); }
+    catch { continue; }   // 非 JSON：下一把再试（现场在 goodBody，循环外留证）
+    if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${String(j?.error?.message ?? goodBody.slice(0, 120))}`);
+    if (j?.error) throw new Error(`LLM 错误: ${JSON.stringify(j.error).slice(0, 300)}`);
+    if (!j?.choices) throw new Error(`LLM 返回结构不对（HTTP ${r.status}）：${goodBody.slice(0, 100)}`);
+    return j;
+  }
+  console.error('[bilibili] LLM 两次都无法解析成 JSON：status=', r?.status, 'body头300字=', goodBody.slice(0, 300));
+  throw new Error('LLM 返回不是 JSON（重试一把也不行——网关抖动，过几分钟再试喵）');
 }
 
 // ── 存档：总结落盘到 ../B站总结/，之后可批量进知识库。失败不影响主流程 ──
