@@ -23,7 +23,7 @@ A QQ group chat bot playing Cheshire (Azur Lane). **@-mention** her for text / i
 - 🔁 **+1 echo**: repeats a repeated message once (four anti-loop guards)
 - 🧠 **Context memory**: auto-compression (triggers at 120k × 0.9), media association window (counts interactions with the bot), per-person reply attribution so cross-talk doesn't tangle
 - 🛠 **Admin commands**: `#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
-- ✅ **12-point self-check**: processes / ports / QQ identity / LLM / search / menu lottery all ticked
+- ✅ **8-point self-check**: runtime / config / processes / LLM / search / menu lottery all ticked (QQ injection & link state deliberately not part of the report — check the admin WebUI for that)
 
 ## Stack & safety
 
@@ -43,7 +43,7 @@ A QQ group chat bot playing Cheshire (Azur Lane). **@-mention** her for text / i
    - LLM endpoint / model → panel or `切换模型.cmd` (writes `llmstate.json`)
 3. **Install deps**: `cd qq-group-bot && bun install`
 4. **Prerequisite**: NTQQ (9.9.x; the classic edition won't work) installed and the bot's QQ account logged in
-5. **Double-click `一键启动.cmd`**: stops stale instances → starts SnowLuma + the bot → opens the admin WebUI → runs the 12-point self-check
+5. **Double-click `一键启动.cmd`**: stops stale instances → starts SnowLuma + the bot → opens the admin WebUI → runs the 8-point self-check
 
 Daily ops: re-run the same launcher to restart (idempotent); switch models via **`切换面板.cmd`** (local web page: form → model list → 4-point probe → one-click switch, for mouse people) or `切换模型.cmd` (CLI: verify first, then write). Logs: `qq-group-bot/bot.log` (stdout) and `bot.err` (stderr).
 
@@ -114,7 +114,7 @@ Also: `secrets.json` = LLM key + both OneBot tokens (hand-edit, restart); `promp
 | Food list | — | `qq-group-bot/foods.mjs` (368 dishes, add your own) | restart |
 | Context compression triggers | `contextTokenLimit` / `compressRatio` / `keepRecent` | `config.mjs` | restart |
 
-Verify after changing anything: `cd qq-group-bot && bun run selfcheck.mjs` (12 checks);
+Verify after changing anything: `cd qq-group-bot && bun run selfcheck.mjs` (8 checks);
 deeper troubleshooting in [docs/03-坑与排错.md](docs/03-坑与排错.md) (Chinese).
 
 ## Architecture
@@ -140,7 +140,7 @@ deeper troubleshooting in [docs/03-坑与排错.md](docs/03-坑与排错.md) (Ch
 | Doc | Content |
 |---|---|
 | [docs/更新公告.md](docs/更新公告.md) | **changelog by date** (English summary at top — start here) |
-| [docs/01-部署与配置.md](docs/01-部署与配置.md) | architecture, launcher, model-switch tooling, 12-point self-check, full config table (Chinese) |
+| [docs/01-部署与配置.md](docs/01-部署与配置.md) | architecture, launcher, model-switch tooling, 8-point self-check, full config table (Chinese) |
 | [docs/02-功能与机制.md](docs/02-功能与机制.md) | trigger rules, media handling, context & compression, bilibili engine, search (Chinese) |
 | [docs/03-坑与排错.md](docs/03-坑与排错.md) | **real-world pitfalls** + quick troubleshooting table + common commands (Chinese) |
 
@@ -192,7 +192,8 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 - 🧠 **上下文记忆**：自动压缩（120k×0.9 触发）、图片关联窗口（按互动计数）、
   多人插话不串线的回复署名
 - 🛠 **管理指令**：`#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
-- ✅ **12 项自检**：进程 / 端口 / QQ 身份 / LLM / 搜索 / 抽签全打勾
+- ✅ **8 项自检**：运行时 / 配置 / 进程 / LLM / 搜索 / 抽签全打勾
+  （2026-10-30 起 QQ 注入/监听/身份**不进自检表**——链路状态看管理后台 WebUI）
 
 > 上面每一项功能怎么配置、怎么自定义、改哪个文件哪个键、要不要重启——
 > 全部列在下面的**「自定义」**一节（配置键 + 位置 + 生效方式的完整对照表）。
@@ -225,7 +226,7 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
    - LLM 端点/模型 → 面板或 `切换模型.cmd`（写 `llmstate.json`）
 3. **装依赖**：`cd qq-group-bot && bun install`
 4. **前置**：本机装 NTQQ（9.9.x；经典版不支持）并登录机器人的 QQ 号
-5. **双击 `一键启动.cmd`**：自动停旧实例 → 起 SnowLuma + 机器人 → 弹管理后台 → 12 项自检
+5. **双击 `一键启动.cmd`**：自动停旧实例 → 起 SnowLuma + 机器人 → 弹管理后台 → 8 项自检
 
 日常：重启就再点一次（幂等）；换模型双击 **「切换面板.cmd」**（本地网页：表单填 API → 拉模型列表 → 四件套探测 → 一键切换，适合不想碰命令行）、
 或 `切换模型.cmd`（命令行：先验证再写盘）；
@@ -298,7 +299,7 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 | 饭食清单 | — | `qq-group-bot/foods.mjs`（368 道，自己加菜） | 重启 |
 | 上下文压缩触发点 | `contextTokenLimit` / `compressRatio` / `keepRecent` | `config.mjs` | 重启 |
 
-验证改完是否正常：`cd qq-group-bot && bun run selfcheck.mjs`（12 项）；
+验证改完是否正常：`cd qq-group-bot && bun run selfcheck.mjs`（8 项）；
 更深的排错见 [docs/03-坑与排错.md](docs/03-坑与排错.md)。
 
 ## 文档（细节都在这里）
@@ -306,7 +307,7 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 | 文档 | 内容 |
 |---|---|
 | [docs/更新公告.md](docs/更新公告.md) | **按日期的改动公告**（最新版本来这里看） |
-| [docs/01-部署与配置.md](docs/01-部署与配置.md) | 架构总览、一键启动、换模型工具、自检 12 项、全部配置参数表 |
+| [docs/01-部署与配置.md](docs/01-部署与配置.md) | 架构总览、一键启动、换模型工具、自检 8 项、全部配置参数表 |
 | [docs/02-功能与机制.md](docs/02-功能与机制.md) | 触发规则、媒体处理（URL 直传/关联窗口）、上下文与压缩、B站总结引擎、搜索 |
 | [docs/03-坑与排错.md](docs/03-坑与排错.md) | **35 个真实踩坑** + 故障速查表 + 常用命令（排错先看这个） |
 

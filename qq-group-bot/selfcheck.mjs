@@ -1,14 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  自检报告 —— 打印一张「按项目打勾」的体检表
+//  自检报告 —— 打印一张「按项目打勾」的体检表（8 项）
 //
 //  用法：  bun run selfcheck.mjs      （或双击工作区的「复检.cmd」）
 //  说明：  基础自检 = 本地检查，秒出
 //          功能自检 = 真的打一次 LLM / 搜索接口（消耗极少量额度）
+//  2026-10-30（指挥官指示）：不再检查 QQ 注入链（管理后台监听 / OneBot HTTP/WS /
+//          QQ 身份）——SnowLuma 与 QQ 没开是常态，别让自检表全红吓人；
+//          链路通不通看管理后台 WebUI 的连接状态
 //  安全：  本文件只做探测 —— 不发群消息、不改任何数据
 // ═══════════════════════════════════════════════════════════════════════
-import net from 'node:net';
 import { execFileSync } from 'node:child_process';
-import { SnowLumaHttpClient } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
 
 // foods.mjs 用动态导入包一层 —— 万一清单文件被改坏了，自检要能报「清单加载失败」，
@@ -33,9 +34,8 @@ try {
 // ─────────── 结果收集 ───────────
 const OK = 'ok';       // 通过      √
 const BAD = 'bad';     // 异常      ×
-const WAIT = 'wait';   // 等你注入  ·
 
-const GLYPH = { ok: '√', bad: '×', wait: '·' };
+const GLYPH = { ok: '√', bad: '×' };
 const rows = [];
 const add = (group, name, state, detail = '') => rows.push({ group, name, state, detail });
 
@@ -43,17 +43,6 @@ const add = (group, name, state, detail = '') => rows.push({ group, name, state,
 const width = (s) => [...s].reduce((n, c) => n + (c.codePointAt(0) > 0x2e80 ? 2 : 1), 0);
 const pad = (s, w) => s + ' '.repeat(Math.max(0, w - width(s)));
 const clip = (s, n) => String(s ?? '').replace(/\s+/g, ' ').slice(0, n);
-
-// ─────────── 探测工具 ───────────
-function tcpProbe(host, port, timeout = 1500) {
-  return new Promise((resolve) => {
-    const s = net.connect({ host, port });
-    const done = (ok) => { try { s.destroy(); } catch { /* 忽略 */ } resolve(ok); };
-    s.setTimeout(timeout, () => done(false));
-    s.on('connect', () => done(true));
-    s.on('error', () => done(false));
-  });
-}
 
 function ps(script) {
   try {
@@ -129,18 +118,6 @@ async function probeExa() {
   }
 }
 
-// ─────────── 功能自检：QQ 身份（要 OneBot 活着）───────────
-async function probeIdentity() {
-  try {
-    const http = new SnowLumaHttpClient({ baseUrl: cfg.obHttp, accessToken: cfg.obHttpToken });
-    const me = await http.getLoginInfo();
-    if (!me?.user_id) return { state: BAD, detail: '返回里没有 user_id' };
-    return { state: OK, detail: `${me.nickname} (UIN ${me.user_id})` };
-  } catch (e) {
-    return { state: BAD, detail: clip(e.message, 40) };
-  }
-}
-
 // ─────────── 功能自检：#吃什么 的饭食抽签器 ───────────
 // 真跑 6 轮抽签（共 18 道），验证：清单能加载、真随机不重复、中西搭配正常。
 // 不联网、不调模型，瞬间出结果。
@@ -191,27 +168,19 @@ function print() {
   }
 
   const ok = rows.filter((r) => r.state === OK).length;
-  const wait = rows.filter((r) => r.state === WAIT).length;
   const bad = rows.filter((r) => r.state === BAD).length;
 
   console.log('');
   console.log(thin);
-  console.log(`  结果：${ok} / ${rows.length} 通过` +
-    (wait ? `　·　${wait} 项待注入` : '') + (bad ? `　·　${bad} 项异常` : ''));
+  console.log(`  结果：${ok} / ${rows.length} 通过` + (bad ? `　·　${bad} 项异常` : ''));
   console.log('');
 
-  if (wait) {
-    console.log('  👉 带 · 的项目，去管理后台点一下「进程注入」就会变绿：');
-    console.log('       http://127.0.0.1:5099');
-    console.log('  👉 点完机器人会自动连上，不用重启；之后双击「复检.cmd」看全绿');
-    console.log('');
-  }
   if (bad) {
     console.log('  👉 带 × 的项目看上面详情；还是不行就查 bot.err / SnowLuma.err');
     console.log('');
   }
-  if (!wait && !bad) {
-    console.log('  🎉 全部通过，机器人已经在群里待命了喵~');
+  if (!bad) {
+    console.log('  🎉 全部通过（QQ 注入/监听/身份不在此表 —— 连接状态看管理后台 WebUI）');
     console.log('');
   }
   console.log(line);
@@ -251,38 +220,10 @@ async function main() {
   add('基础自检', '机器人进程', proc.bot > 0 ? OK : BAD,
     proc.bot > 0 ? '运行中' : '没启动 —— 跑「一键启动.cmd」');
 
-  // ② 功能自检（联网，三条一起发省时间）
-  // WebUI 端口不写死 5099：5099 被占时 SnowLuma 会自动退到 5100，
-  // 只盯 5099 会把「起在 5100 的那个实例」误判成没启动。
-  const webPorts = Array.from({ length: 11 }, (_, i) => 5099 + i);
-  const [webHits, obHttp, obWs, llm, exa] = await Promise.all([
-    Promise.all(webPorts.map(async (p) => (await tcpProbe('127.0.0.1', p)) ? p : 0)),
-    tcpProbe('127.0.0.1', 3000),
-    tcpProbe('127.0.0.1', 3001),
-    probeLLM(),
-    probeExa(),
-  ]);
-  const webui = webHits.filter(Boolean);
-
-  if (webui.length === 1) {
-    add('功能自检', '管理后台', OK, `http://127.0.0.1:${webui[0]} 已监听`);
-  } else if (webui.length > 1) {
-    add('功能自检', '管理后台', BAD,
-      `同时开着 ${webui.length} 个后台（${webui.join(' / ')}）—— 有重复实例，只能留 1 个`);
-  } else {
-    add('功能自检', '管理后台', BAD, '5099-5109 都没监听 —— SnowLuma 未启动');
-  }
-  add('功能自检', 'OneBot HTTP', obHttp ? OK : WAIT,
-    obHttp ? `${cfg.obHttp} 已监听` : '3000 没监听 → 等你点「进程注入」');
-  add('功能自检', 'OneBot WS', obWs ? OK : WAIT,
-    obWs ? `${cfg.obWs} 已监听` : '3001 没监听 → 等你点「进程注入」');
-
-  if (obHttp) {
-    const id = await probeIdentity();
-    add('功能自检', 'QQ 身份', id.state, id.detail);
-  } else {
-    add('功能自检', 'QQ 身份', WAIT, '跳过 —— OneBot 还没注入，连不上');
-  }
+  // ② 功能自检（联网）
+  // 2026-10-30 起不再检查 QQ 注入链（管理后台监听 / OneBot HTTP/WS / QQ 身份）：
+  // SnowLuma 和 QQ 没开是常态，注入状态去管理后台 WebUI 看。
+  const [llm, exa] = await Promise.all([probeLLM(), probeExa()]);
 
   add('功能自检', 'LLM 对话', llm.state, llm.detail);
   add('功能自检', '网络搜索', exa.state, exa.detail);
