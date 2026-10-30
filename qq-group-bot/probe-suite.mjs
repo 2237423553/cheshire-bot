@@ -13,7 +13,7 @@
 //  命令行自测：bun run probe-suite.mjs <url> <key> [model] [headers]
 // ═══════════════════════════════════════════════════════════════════════
 import zlib from 'node:zlib';
-import { chatOnce } from './providers.mjs';
+import { chatOnce, classifyUpstreamError } from './providers.mjs';
 
 const T_BASIC = 45 * 1000, T_THINK = 60 * 1000;
 const SESSION = 'probe-suite';
@@ -54,7 +54,17 @@ function mkItem(kind, detail = '', extra = {}) {
   return { kind, detail: String(detail).slice(0, 200), ...extra };
 }
 
-/** 基础生成：通过 = 2xx ∧ 无 error ∧ content 或 reasoning_content 非空 */
+/** 兼容各家的 message 形态（10-30 评审）：content 可能是字符串，也可能是
+ *  [{type:'text',text:…}] 数组；思考字段可能叫 reasoning_content 也可能叫 reasoning。 */
+function msgText(msg) {
+  const c = msg?.content;
+  const text = typeof c === 'string' ? c
+    : Array.isArray(c) ? c.map((p) => p?.text ?? '').join('')
+    : '';
+  return `${text} ${msg?.reasoning_content ?? msg?.reasoning ?? ''}`.trim();
+}
+
+/** 基础生成：通过 = 2xx ∧ 无 error ∧ content 或 reasoning 非空 */
 async function probeBasic(chatUrl, key, model, extra) {
   const t0 = Date.now();
   let r;
@@ -64,11 +74,12 @@ async function probeBasic(chatUrl, key, model, extra) {
     }, extra, { session: SESSION, timeoutMs: T_BASIC });
   } catch (e) { return mkItem(e.kind ?? 'http', e.message, { ok: false }); }
   if (!r.ok) return mkItem('http', `HTTP ${r.status} ${r.txt.slice(0, 100)}`, { ok: false });
-  if (r.json?.error) return mkItem('error-field', JSON.stringify(r.json.error).slice(0, 140), { ok: false });
+  if (r.json?.error) return mkItem('error-field', classifyUpstreamError(r.status, r.json.error) === 'other'
+    ? JSON.stringify(r.json.error).slice(0, 140) : `HTTP ${r.status}`, { ok: false });
   const msg = r.json?.choices?.[0]?.message;
-  const out = (msg?.content ?? '') + (msg?.reasoning_content ?? '');
-  if (!msg || !(out ?? '').trim()) return mkItem('shape', '响应结构不对/内容为空', { ok: false, latencyMs: r.latencyMs });
-  return mkItem('ok', `回复：${String(msg.content ?? '').slice(0, 20) || '(纯思考)'}`,
+  const out = msgText(msg);
+  if (!msg || !out) return mkItem('shape', '响应结构不对/内容为空', { ok: false, latencyMs: r.latencyMs });
+  return mkItem('ok', `回复：${out.slice(0, 20) || '(纯思考)'}`,
     { ok: true, latencyMs: r.latencyMs, usage: r.json?.usage });
 }
 
@@ -90,7 +101,12 @@ async function probeThinking(chatUrl, key, model, extra) {
       continue;
     }
     const errTxt = JSON.stringify(r.json?.error ?? '');
-    if (!r.ok && r.status >= 400 && r.status < 500 && /thinking|unrecognized|unknown|invalid/i.test(errTxt + r.txt)) {
+    // 10-30 评审收紧：旧正则 /thinking|unrecognized|unknown|invalid/ 连 invalid_api_key
+    // 「max_tokens invalid」都命中——坏 Key/欠费被误判成「参数被拒」（显示成正常拒绝）。
+    // 现在必须文案**明确指名 thinking 参数**，且不像鉴权/限流类错误
+    const mentionsThinking = /\bthinking\b|思考/i.test(errTxt + r.txt);
+    const looksAuthish = /api[._ ]?key|unauthorized|quota|credit|limit|auth|permission/i.test(errTxt + r.txt);
+    if (!r.ok && r.status >= 400 && r.status < 500 && mentionsThinking && !looksAuthish) {
       tiers[t] = { accepted: false, kind: 'param-rejected', detail: `HTTP ${r.status} ${errTxt.slice(0, 80)}` };
     } else if (!r.ok) {
       tiers[t] = { accepted: false, kind: 'http', detail: `HTTP ${r.status} ${r.txt.slice(0, 80)}` };
@@ -100,7 +116,7 @@ async function probeThinking(chatUrl, key, model, extra) {
       errors.push(`thinking:${t}`);
     } else {
       const msg = r.json?.choices?.[0]?.message ?? {};
-      tiers[t] = { accepted: true, reasoningPresent: Boolean(msg?.reasoning_content), latencyMs: r.latencyMs };
+      tiers[t] = { accepted: true, reasoningPresent: Boolean(msg?.reasoning_content ?? msg?.reasoning), latencyMs: r.latencyMs };
     }
   }
   const acc = Object.entries(tiers).filter(([, v]) => v.accepted).map(([k]) => k);
@@ -160,10 +176,29 @@ async function probeVision(chatUrl, key, model, extra) {
   if (!r.ok) return mkItem('http', `HTTP ${r.status} ${r.txt.slice(0, 100)}`, { ok: false });
   if (r.json?.error) return mkItem('error-field', JSON.stringify(r.json.error).slice(0, 140), { ok: false });
   const msg = r.json?.choices?.[0]?.message ?? {};
-  const ans = `${msg.content ?? ''} ${msg.reasoning_content ?? ''}`.trim();
+  const ans = msgText(msg);
   if (!ans) return mkItem('shape', '响应结构不对/内容为空', { ok: false, latencyMs: r.latencyMs });
   if (/red|红/i.test(ans)) return mkItem('ok', `答「${ans.slice(0, 30)}」—— 看图没问题`, { ok: true, latencyMs: r.latencyMs });
   return mkItem('ok', `视觉通了，但答「${ans.slice(0, 30)}」（红色图没答对，宽松通过）`, { ok: true, kindExtra: 'ok-loose', latencyMs: r.latencyMs });
+}
+
+/** 四件套结果 → 文本行（**渲染唯一来源**，10-30 评审：CLI 两处渲染逻辑已互相漂移）。
+ *  返回无 ANSI 的行数组；CLI傻瓜染色（含×标红/⚠标黄/总评加粗），面板继续用汇总 JSON 自己渲 HTML。 */
+export function formatSuite(out) {
+  const it = out.items ?? {};
+  const sym = (ok, warn) => (ok === true && !warn ? '√' : ok === true && warn ? '⚠' : '×');
+  const lines = [];
+  lines.push(`基础生成 ${sym(it.basic?.ok)} ${it.basic?.detail ?? ''}${it.basic?.latencyMs ? `(${Math.round(it.basic.latencyMs)}ms)` : ''}`);
+  for (const [t, v] of Object.entries(it.thinking?.tiers ?? {})) {
+    lines.push(`thinking.${String(t).padEnd(8)} ${v.accepted ? '√ 接受' : '× ' + v.kind}${v.reasoningPresent ? '（有思考）' : ''}${v.latencyMs ? ` ${Math.round(v.latencyMs)}ms` : ''}`);
+  }
+  lines.push(`推荐思考档 ${JSON.stringify(it.thinking?.recommended ?? 'default')} ${it.thinking?.detail ?? ''}`);
+  lines.push(`工具调用 ${sym(it.tools?.ok, it.tools?.warning)} ${it.tools?.detail ?? ''}`);
+  lines.push(`图片视觉 ${sym(it.vision?.ok, it.vision?.kindExtra === 'ok-loose')} ${it.vision?.detail ?? ''}`);
+  if (out.warnings?.length) lines.push(`⚠ 警告 ${out.warnings.join('；')}`);
+  if (out.errors?.length) lines.push(`✗ 错误 ${out.errors.join('；')}`);
+  lines.push(`总评：${out.allOk ? '全绿，可以放心切' : '有失败项 —— 请对照确认再决定'} · 耗时 ${Math.round((out.durationMs ?? 0) / 1000)}s`);
+  return lines;
 }
 
 /** 跑完整四件套，返回汇总 JSON（面板 /api/probe 与 CLI --probe 共用） */

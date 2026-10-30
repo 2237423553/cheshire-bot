@@ -64,8 +64,10 @@ export async function fetchView(bvid) {
     headers: { 'User-Agent': UA_API },
     signal: AbortSignal.timeout(30_000),
   });
-  const j = await r.json();
-  if (j.code !== 0) throw new Error(`view API 失败 code=${j.code}：${j.message}`);
+  // B 站风控/网关异常时会回 HTML 状态页 —— 裸 r.json() 抛 SyntaxError 进群很难看
+  //（10-30 评审），统一兜 {} 并按「拿不到数据」翻人话
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.code !== 0) throw new Error(`view API 没拿到数据（HTTP ${r.status}，疑似风控/网关问题）：${String(j.message ?? '').slice(0, 80)}`);
   const d = j.data;
   return {
     title: d.title,
@@ -84,8 +86,8 @@ export async function fetchDirectUrl(bvid, cid, log = () => {}) {
       headers: { 'User-Agent': UA_API, Referer: 'https://www.bilibili.com/' },
       signal: AbortSignal.timeout(30_000),
     });
-    const j = await r.json();
-    if (j.code !== 0) throw new Error(`playurl API 失败 code=${j.code}：${j.message}`);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.code !== 0) throw new Error(`playurl API 没拿到数据（HTTP ${r.status}，疑似风控/网关问题）：${String(j.message ?? '').slice(0, 80)}`);
     const durl = j.data?.durl?.[0];
     if (!durl?.url) throw new Error('playurl 返回里没有 durl.url（视频可能是会员/付费/充电专属，走不通）');
     const mb = ((durl.size ?? 0) / 1024 / 1024).toFixed(1);
@@ -115,8 +117,11 @@ async function callLLM(body) {
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(15 * 60_000), // 视频理解慢，给足 15 分钟
   });
-  const j = await r.json();
-  if (j.error) throw new Error(`LLM ${r.status}: ${JSON.stringify(j.error).slice(0, 300)}`);
+  // 同上：LLM 网关过载可能回非 JSON，裸 json() 抛 SyntaxError（10-30 评审同修）
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${String(j?.error?.message ?? '').slice(0, 200)}`);
+  if (j?.error) throw new Error(`LLM 错误: ${JSON.stringify(j.error).slice(0, 300)}`);
+  if (!j) throw new Error('LLM 返回不是 JSON（网关可能过载或返回了 HTML 状态页）');
   return j;
 }
 

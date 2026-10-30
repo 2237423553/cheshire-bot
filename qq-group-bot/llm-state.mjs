@@ -110,11 +110,14 @@ export function deleteProfile(id) {
   return true;
 }
 
-/** 启用档案：六字段整体覆盖写 llmstate + 记录 activeId（两次原子写，state 先落） */
+/** 启用档案：六字段整体覆盖写 llmstate + 记录 activeId（两次原子写，state 先落）。
+ *  10-30 评审补回滚：第二笔（profiles 记 activeId）写失败时，把第一笔的状态**原样恢复**
+ *  —— 否则留下「state 已换、activeId 还指旧档」的中间态，重新启用都没法自愈。 */
 export function applyProfile(id) {
   const db = loadProfiles();
   const p = db.profiles.find((x) => x.id === id);
   if (!p) throw new Error('没这个档案');
+  const prev = { ...readJson(STATE_PATH) };   // 换档前的完整旧状态，失败时恢复用
   saveState({
     llmUrl: p.llmUrl,
     llmKey: p.llmKey ?? '',
@@ -125,7 +128,17 @@ export function applyProfile(id) {
   });
   db.activeId = id;
   p.updatedAt = new Date().toISOString();
-  writeAtomic(PROFILES_PATH, db);
+  try {
+    writeAtomic(PROFILES_PATH, db);
+  } catch (e) {
+    // 第二笔失败 → 立刻把旧 state 写回去，两处口径保持一致
+    try {
+      writeAtomic(STATE_PATH, prev);
+    } catch (e2) {
+      console.error('[llm-state] 恢复旧 llmstate 也失败了（手上现在的配置=新档案，面板档案标记可能错位）:', e2.message);
+    }
+    throw new Error(`启用档案的第二步（记录 activeId）失败，已回滚：${e.message}`);
+  }
   return p;
 }
 

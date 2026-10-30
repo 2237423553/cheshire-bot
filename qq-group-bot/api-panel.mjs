@@ -52,7 +52,11 @@ function fail(e, status = 400) {
   return json({ error: String(e?.message ?? e).slice(0, 300) }, status);
 }
 function needToken(req) {
-  if (req.headers.get('x-panel-token') !== TOKEN) throw Object.assign(new Error('面板令牌不对'), { status: 403 });
+  // 常数时间比较（10-30 评审：普通 !== 理论上可被同机侧信道测长度；本地面板
+  // 威胁模型下属于余量加固）。timingSafeEqual 要求等长，长度不等直接判不匹配。
+  const given = req.headers.get('x-panel-token') ?? '';
+  const ok = given.length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(TOKEN));
+  if (!ok) throw Object.assign(new Error('面板令牌不对'), { status: 403 });
   const origin = req.headers.get('origin');
   // 127.0.0.1 和 localhost 都认（10-24 评审：只认 127.0.0.1 前缀时用 localhost 打开面板会全程 403）；
   // 端口不限死——面板端口会顺延。真正的门闩是上面的 X-Panel-Token。
@@ -210,7 +214,8 @@ async function route(req, port) {
   // ── 生图/生视频 API（mediaapi.json；config.mjs 启动时合并，改完要重启 bot）──
   if (path === '/api/media' && req.method === 'GET') {
     return json({
-      imggen: { url: cfg.imggenUrl, keyMasked: maskKey(cfg.imggenKey), hasKey: Boolean(cfg.imggenKey), model: cfg.imggenModel, size: cfg.imggenSize },
+      imggen: { url: cfg.imggenUrl, keyMasked: maskKey(cfg.imggenKey), hasKey: Boolean(cfg.imggenKey), model: cfg.imggenModel, size: cfg.imggenSize,
+                aspectRatio: cfg.imggenAspectRatio, resolution: cfg.imggenResolution, quality: cfg.imggenQuality },
       vidgen: { url: cfg.vidgenUrl, keyMasked: maskKey(cfg.vidgenKey), hasKey: Boolean(cfg.vidgenKey), model: cfg.vidgenModel, maxSeconds: cfg.vidgenMaxSeconds },
       tts: { url: cfg.ttsUrl, keyMasked: maskKey(cfg.ttsKey), hasKey: Boolean(cfg.ttsKey), model: cfg.ttsModel,
              voice: cfg.ttsVoice, voiceDesign: cfg.ttsVoiceDesign, autoChars: cfg.ttsAutoVoiceChars,

@@ -230,53 +230,67 @@ async function toDataUrl(seg, fallbackMime) {
  * 把一组媒体段转成 OpenAI content 片段。
  * 同时把加载失败收集进 errors —— 失败必须当场说出口，
  * 以前只写日志，指挥官根本不知道出了什么问题（只看到模型瞎猜「一片黑乎乎」）。
+ * 10-30 评审改两阶段：先分桶占位（保持原配额语义），再 **并行下载**
+ * 需要网络的片段（每把各自带 60s 超时闸，互不依赖）——
+ * 多图+视频的消息首字延迟从「相加」变「取最慢」。
  */
 async function mediaToParts(segs) {
-  const parts = [];
-  const errors = [];
+  const plan = [];
   let nImg = 0, nRec = 0, nVid = 0;
   for (const s of segs) {
     if (s.type === 'image' && nImg < MAX_IMAGES) {
       nImg++;
-      const r = await toDataUrl(s, 'image/jpeg');
-      if (r.dataUrl) {
-        parts.push({ type: 'image_url', image_url: { url: r.dataUrl } });
-      } else {
-        parts.push({ type: 'text', text: `[一张图片未能加载：${r.reason}]` });
-        errors.push(`图片加载失败（${r.reason}）`);
-      }
+      plan.push({ kind: 'image', s });
     } else if (s.type === 'record' && nRec < 1) {
       nRec++;
-      // 语音暂不支持：QQ 语音是腾讯 SILK v3 专有编码，MiMo 不认、ffmpeg 也无解。
-      // 不瞎喂，改成如实告知模型，让它老实说听不了，别编造内容。
-      parts.push({ type: 'text', text: '[群友发来一段语音消息，但你听不懂语音内容，请如实说听不了，不要编造]' });
+      plan.push({ kind: 'record', s });
     } else if (s.type === 'video' && nVid < 1) {
       nVid++;
       // 格式从 file 判；无扩展名时放行尝试（QQ 一般就是 mp4）
       const ext = extOf(mediaInfo(s).name);
-      if (ext && !VIDEO_OK.includes(ext)) {
-        parts.push({ type: 'text', text: `[一段视频未能加载：格式 ${ext} 不受支持]` });
-        errors.push(`视频格式 ${ext} 不受支持（只收 ${VIDEO_OK.join('/')}）`);
-        continue;
-      }
-      // URL 方式（MiMo 官方支持，≤300MB）：把 QQ 原始下载链接直接给模型，
-      // 不下载不转码 —— 省流量省时间，也绕开 base64 ≤50MB 的限制。
-      // fps/media_resolution 是 MiMo 的精细度参数（fps 默认 2，范围 0.1~10）。
-      const { src } = mediaInfo(s);
-      if (/^https?:\/\//i.test(src)) {
-        parts.push({ type: 'video_url', video_url: { url: src }, fps: 2, media_resolution: 'default' });
-      } else {
-        // 拿不到网络链接（本地文件）才退回 base64
-        const r = await toDataUrl(s, 'video/mp4');
-        if (r.dataUrl) {
-          parts.push({ type: 'video_url', video_url: { url: r.dataUrl } });
-        } else {
-          parts.push({ type: 'text', text: `[一段视频未能加载：${r.reason}]` });
-          errors.push(`视频加载失败（${r.reason}）`);
-        }
-      }
+      if (ext && !VIDEO_OK.includes(ext)) plan.push({ kind: 'video-badfmt', s, ext });
+      // URL 方式（MiMo 官方支持，≤300MB）：把 QQ 原始下载链接直接给模型，不下载
+      else if (/^https?:\/\//i.test(mediaInfo(s).src)) plan.push({ kind: 'video-url', s });
+      // 拿不到网络链接（本地文件）才退回 base64
+      else plan.push({ kind: 'video-load', s });
     }
   }
+  const results = await Promise.all(plan.map((it) => (
+    it.kind === 'image' ? toDataUrl(it.s, 'image/jpeg')
+      : it.kind === 'video-load' ? toDataUrl(it.s, 'video/mp4')
+      : null
+  )));
+  const parts = [];
+  const errors = [];
+  plan.forEach((it, i) => {
+    if (it.kind === 'image') {
+      const r = results[i];
+      if (r?.dataUrl) {
+        parts.push({ type: 'image_url', image_url: { url: r.dataUrl } });
+      } else {
+        parts.push({ type: 'text', text: `[一张图片未能加载：${r?.reason ?? '未知原因'}]` });
+        errors.push(`图片加载失败（${r?.reason}）`);
+      }
+    } else if (it.kind === 'record') {
+      // 语音暂不支持：QQ 语音是腾讯 SILK v3 专有编码，模型不认。
+      // 不瞎喂，改成如实告知模型，让它老实说听不了，别编造内容。
+      parts.push({ type: 'text', text: '[群友发来一段语音消息，但你听不懂语音内容，请如实说听不了，不要编造]' });
+    } else if (it.kind === 'video-badfmt') {
+      parts.push({ type: 'text', text: `[一段视频未能加载：格式 ${it.ext} 不受支持]` });
+      errors.push(`视频格式 ${it.ext} 不受支持（只收 ${VIDEO_OK.join('/')}）`);
+    } else if (it.kind === 'video-url') {
+      // fps/media_resolution 是 MiMo 的精细度参数（fps 默认 2，范围 0.1~10）
+      parts.push({ type: 'video_url', video_url: { url: mediaInfo(it.s).src }, fps: 2, media_resolution: 'default' });
+    } else {
+      const r = results[i];
+      if (r?.dataUrl) {
+        parts.push({ type: 'video_url', video_url: { url: r.dataUrl } });
+      } else {
+        parts.push({ type: 'text', text: `[一段视频未能加载：${r?.reason}]` });
+        errors.push(`视频加载失败（${r?.reason}）`);
+      }
+    }
+  });
   return { parts, errors };
 }
 
@@ -326,9 +340,9 @@ async function fetchRecentMedia(gid, senderId) {
  * 只展开一层不套娃；拉不到就当没有，不影响主流程。
  */
 async function expandReplySegs(segs) {
-  const out = [];
-  for (const s of segs) {
-    if (s.type !== 'reply' || !s.data?.id) continue;
+  const replies = segs.filter((s) => s.type === 'reply' && s.data?.id);
+  // 10-30 评审：每条引用拉一次消息是独立网络请求，并行拿 + 保序合并
+  const loaded = await Promise.all(replies.map(async (s) => {
     try {
       const msg = await http.raw('get_msg', { message_id: s.data.id });
       let inner = Array.isArray(msg?.message) ? msg.message : [];
@@ -341,13 +355,16 @@ async function expandReplySegs(segs) {
       }
 
       const quotedSender = msg?.sender?.card || msg?.sender?.nickname || '别人';
-      out.push({ type: 'text', text: `[引用 ${quotedSender} 的消息]` });
-      out.push(...inner.filter((x) => ['image', 'video', 'text'].includes(x.type)));
+      return [
+        { type: 'text', text: `[引用 ${quotedSender} 的消息]` },
+        ...inner.filter((x) => ['image', 'video', 'text'].includes(x.type)),
+      ];
     } catch (e) {
       console.warn('[bot] 展开引用消息失败:', e.message);
+      return [];
     }
-  }
-  return out;
+  }));
+  return loaded.flat();
 }
 
 async function buildContent(event) {
@@ -515,10 +532,17 @@ async function sendDrawSticker(gid) {
   const seg = drawStickerSeg();
   if (!seg) return;
   try {
-    await http.raw('send_group_msg', { group_id: Number(gid), message: [seg] }, { timeoutMs: 60 * 1000 });
+    await sendMediaSeg(gid, seg, 60 * 1000);
   } catch (e) {
     console.warn('[bot] 画图贴纸没发出去（不影响主线）:', e.message);
   }
+}
+
+/** 发单段媒体（image/video/record）——群内发媒体的**唯一出口**（10-30 评审：
+ *  旧版 6 处复制粘贴，超时参数/贴纸时机散落，改一处漏五处）。
+ *  ⚠️ timeoutMs 必须显式传（坑 35：图片 SDK 默认 30s 掐不死 highway 慢传）。 */
+async function sendMediaSeg(gid, seg, timeoutMs) {
+  await http.raw('send_group_msg', { group_id: Number(gid), message: [seg] }, { timeoutMs });
 }
 
 async function generateImageTool(args, gid) {
@@ -533,7 +557,7 @@ async function generateImageTool(args, gid) {
     try {
       await http.raw('send_group_msg', {
         group_id: Number(gid),
-        message: [text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)],
+        message: [text(`⚠️ 画画失败了喵：${humanizeError(e)}`)],
       }, { timeoutMs: 60 * 1000 });
       return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
     } catch (e2) {
@@ -543,10 +567,7 @@ async function generateImageTool(args, gid) {
   }
   try {
     // 2~3MB 图走 highway 上传可能超过 SDK 默认 30s，实测超时报「发送失败」其实 QQ 侧还在传
-    await http.raw('send_group_msg', {
-      group_id: Number(gid),
-      message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
-    }, { timeoutMs: 120 * 1000 });
+    await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
   } catch (e) {
     console.warn('[bot] 图片发送失败:', e.message);
     return `图已经画好了（${Math.round(buf.length / 1024)}KB）但发到群里失败：${e.message}`;
@@ -648,6 +669,18 @@ function stripFakeDrawMark(s) {
     .trim();
 }
 
+/** 群内报错的人话滤镜（10-30 评审：各路由把 e.message 裸发群——内部 URL/SDK 原文
+ *  观感差还可能泄露端点；主路径已有人话化、路由没有）。超时家族翻人话；
+ *  其它错误大多是我们自己抛的普通话，原样展示只截断。详细原文一律靠 console.error。 */
+function humanizeError(e) {
+  const raw = String(e?.message ?? e);
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    || e?.kind === 'timeout' || /The operation (?:timed out|was aborted)/i.test(raw)) {
+    return '对端半天没回话（这次请求超时了），缓一缓再试喵';
+  }
+  return raw.slice(0, 100);
+}
+
 /** 拆出末尾的「语气指令：…」行（动态语气，10-23 上线：防每条语音一个腔调）。
  *  必须在压平空白**之前**调——那行自己占一行，压平了就跟正文搅一起拆不开了。 */
 function splitToneLine(s) {
@@ -689,7 +722,21 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
       // 模型有样学样：上下文里全是「画好啦喵～」的成功句式，它就会跳过工具直接编一句。
       // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
       // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
-      if (!drewImage && /画好|画完|图片已(生成|发)|图已(经)?(生成|发出|发到|发送)|\[?已画图|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
+      // 10-30 评审补前置：**只在「本轮确实在聊画图」时才触发**——旁观聊天里说
+      // 「把截图发群里」被模型答「图已发出去了」/ 口头「马上画个重点」都会被旧正则
+      // 误当谎报，白烧一整轮全量上下文。行话判定（[已画图…]）不受前置约束。
+      const lastUserText = (() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            return typeof messages[i].content === 'string' ? messages[i].content : contentToText(messages[i].content);
+          }
+        }
+        return '';
+      })();
+      const drawContexted = /画|图|image|draw|动漫|立绘/i.test(lastUserText) || /已画图/.test(content);
+      //「图已发出去了」＝转发语义不是生成语义——正是评审点名的误伤样本，从触发词里摘掉
+      if (!drewImage && drawContexted
+        && /画好|画完|图片已(生成)|图已(经)?生成|\[?已画图|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
         // 谎话原样回传再指责（10-24 评审）：不回传的话下轮模型看到的是「凭空被骂」，
         // 不知道自己错在哪、容易答非所问白费轮次
         messages.push({
@@ -717,11 +764,23 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
       tool_calls: toolCalls,
       ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
     });
-    for (const tc of toolCalls) {
+    // 同轮多工具并行执行（10-30 评审：模型一轮发两个搜索时逐个 await，Exa 单次
+    // 5~60s 直接翻倍）。按 tool_call_id 保序回填；失败当场转成文字结果喂回，
+    // 不让一个工具的异常炸掉整轮。
+    const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       let args = {};
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { /* 保持空对象 */ }
       if (tc.function?.name === 'generate_image') drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
-      const result = await runTool(tc.function?.name, args, sessionId.startsWith('group-') ? sessionId.slice(6) : null);
+      const gid = sessionId.startsWith('group-') ? sessionId.slice(6) : null;
+      try {
+        const result = await runTool(tc.function?.name, args, gid);
+        return { tc, result };
+      } catch (e) {
+        console.warn(`[bot] 工具 ${tc.function?.name} 执行异常：`, e.message);
+        return { tc, result: `工具 ${tc.function?.name} 执行出错：${e.message}` };
+      }
+    }));
+    for (const { tc, result } of toolResults) {
       messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
     }
   }
@@ -732,7 +791,13 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     content: '[系统提示：工具调用次数已达上限，请不要再调用任何工具，直接给出最终回答]',
   });
   const final = await callLLM(sessionId, messages, true);
-  return stripFakeDrawMark(cleanToolArtifacts(final.content ?? ''));
+  const finalText = stripFakeDrawMark(cleanToolArtifacts(final.content ?? ''));
+  // 10-30 评审：最终轮还带 tool_calls / 只吐空内容时，旧版返回空串——
+  // @ 的人什么都收不到（群里静默）。兜底一句，起码知道占线挂了
+  if (!finalText) {
+    return '柴郡查不动了喵：连环调工具没出结果，换个问法或过一会再来试试～';
+  }
+  return finalText;
 }
 
 // ─────────── 上下文自动压缩 ───────────
@@ -776,6 +841,10 @@ async function compressHistory(gid) {
   } catch (e) {
     console.warn('[bot] 上下文压缩失败:', e.message);
     return false;
+  } finally {
+    // 压缩会话的 token 计数用完即焚（10-30 评审：img/vid/sing 会话都有 finally 清，
+    // 摘要这条漏了，promptTokens['summary-<gid>'] 会随群数永久累积）
+    promptTokens.delete(`summary-${gid}`);
   }
 }
 
@@ -844,14 +913,20 @@ function splitMessage(s, max) {
   if (s.length <= max) return [s];
 
   // ① 先把段落切成不超 max 的「块」（超长段落按句子切）
+  // 切句正则补了英文句号（10-30 评审）：`.` 后面跟空格才算断句（末尾强制零宽断点），
+  // 不然无换行的长英文段/带 URL 的段整个一块，超长也切不动；
+  // 单句超过 max 的硬切兜底（中文没断点符号的一整段也能切出）
   const blocks = [];
   for (const para of s.split(/\n{2,}/)) {
     if (para.length <= max) { blocks.push(para); continue; }
     let cur = '';
-    for (const sent of para.split(/(?<=[。！？!?；;\n])/)) {
-      if (cur && (cur + sent).length > max) { blocks.push(cur); cur = ''; }
-      cur += sent;
-    }
+    const pushChunk = (txt) => {
+      if (!txt) return;
+      while (txt.length > max) { blocks.push(txt.slice(0, max)); txt = txt.slice(max); }
+      if (cur && (cur.length + txt.length) > max) { blocks.push(cur); cur = ''; }
+      cur += txt;
+    };
+    for (const sent of para.split(/(?<=[。！？!?；;\n])(?=\S)|(?<=\.)(?=\s)/)) pushChunk(sent);
     if (cur) blocks.push(cur);
   }
 
@@ -1262,6 +1337,14 @@ async function handleCommand(cmd, gid, ctx) {
 const bvCache = new Map();       // key -> { at, text }
 const bvBusy = new Set();        // 正在总结中的 key
 const BV_CACHE_TTL = 2 * 60 * 60 * 1000;
+const BV_CACHE_MAX = 120;        // 条数上限：超过先淘汰最老（10-30 评审：旧版只增不清，挂机数月线性涨）
+function bvCacheSet(key, value) {
+  if (!bvCache.has(key) && bvCache.size >= BV_CACHE_MAX) {
+    const oldest = bvCache.keys().next().value;
+    bvCache.delete(oldest);
+  }
+  bvCache.set(key, value);
+}
 
 async function handleBilibili(link, userText, event, ctx, gid) {
   // 链接之外的话（去掉QQ分享标题【…】后够长）当作对视频的提问
@@ -1290,7 +1373,7 @@ async function handleBilibili(link, userText, event, ctx, gid) {
       console.log(`[bot] B站 群 ${gid}: ${line.slice(0, 50)}`));
 
     const reply = `📺 ${r.title}（${r.owner}｜${r.durationText}）\n\n${r.summary}`;
-    bvCache.set(key, { at: Date.now(), text: reply });
+    bvCacheSet(key, { at: Date.now(), text: reply });
 
     // 进上下文：之后群里能接着追问这部视频的内容（纯文字，不重传视频）
     pushHistory(gid, 'user', `分享B站视频《${r.title}》${question ? ` 并问：${question}` : ''}`, true);
@@ -1404,7 +1487,7 @@ bot.onGroupMessage(async (event, ctx) => {
       await handleBilibili(bvLink, userText, event, ctx, gid);
     } catch (e) {
       console.error(`[bot] B站总结 群 ${gid} 出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ B站视频没看成喵：${String(e.message).slice(0, 100)}`)); } catch { /* 发不出去就算了 */ }
+      try { await ctx.reply(text(`⚠️ B站视频没看成喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
     }
     return;
   }
@@ -1488,17 +1571,14 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     try {
       await ctx.reply(text('Nyahallo～去猫窝里翻一张出来喵，稍等～'));
       const buf = await randomCheshireImage();
-      await http.raw('send_group_msg', {
-        group_id: Number(gid),
-        message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
-      }, { timeoutMs: 120 * 1000 });
+      await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
       // 进上下文一条轻记录，之后可以接着聊这张猫猫
       pushHistory(gid, 'user', userText, `${displayName(event)}: ${userText} [要求随机柴郡图]`);
       pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发随机柴郡图] Nyahallo～这张猫猫归你了喵`);
       console.log(`[bot] 🐾 群 ${gid} 随机柴郡图已发`);
     } catch (e) {
       console.error('[bot] 随机柴郡图失败:', e.message);
-      try { await ctx.reply(text(`⚠️ 猫窝暂时翻不动了喵：${String(e.message).slice(0, 80)}`)); }
+      try { await ctx.reply(text(`⚠️ 猫窝暂时翻不动了喵：${humanizeError(e)}`)); }
       catch (e2) { console.error('[bot] 猫图失败提示也发不出去：', e2.message); }
     }
     return;
@@ -1550,11 +1630,8 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
 
         // 路由本身有 drewImage 语义：走到这步就必然真生成真发送，不存在嘴遁环节
         const buf = await imggen.generateImage(prompt);
-        // 同上：SDK 默认 30s 掐不死 highway 慢传，给到 120s
-        await http.raw('send_group_msg', {
-          group_id: Number(gid),
-          message: [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }],
-        }, { timeoutMs: 120 * 1000 });
+        // 大图 highway 慢传，给到 120s（坑 35）
+        await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
         const caption = isRedraw
           ? `改好啦喵～按「${drawSubj.slice(0, 30)}」重新画了一版`
           : `画好啦喵～给指挥官画的是：${drawSubj}`;
@@ -1571,7 +1648,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     } catch (e) {
       console.error(`[bot] 群 ${gid} 画图出错：`, e.message);
       // 失败提示必须送达（22:41 事故：只 log 没发群里，指挥官干等）；再发不出去也留痕
-      try { await ctx.reply(text(`⚠️ 画画失败了喵：${String(e.message).slice(0, 100)}`)); }
+      try { await ctx.reply(text(`⚠️ 画画失败了喵：${humanizeError(e)}`)); }
       catch (e2) { console.error('[bot] 画图失败提示也发不出去：', e2.message); }
     } finally {
       promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
@@ -1591,7 +1668,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       console.error(`[bot] 指令 ${cmd} 出错：`, e.message);
       // 一定要给用户反馈，别让群里静悄悄
       try {
-        await ctx.reply(text(`指令执行失败：${e.message}`));
+        await ctx.reply(text(`指令执行失败：${humanizeError(e)}`));
       } catch { /* 连回复都失败就算了 */ }
     }
     return;
@@ -1639,10 +1716,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
 
         const buf = await vidgen.generateVideo(prompt, imgDataUrl);
         // 视频比图大（实测 5.5MB/8s），highway 上传更慢，超时给到 5 分钟
-        await http.raw('send_group_msg', {
-          group_id: Number(gid),
-          message: [{ type: 'video', data: { file: 'base64://' + buf.toString('base64') } }],
-        }, { timeoutMs: 300 * 1000 });
+        await sendMediaSeg(gid, { type: 'video', data: { file: 'base64://' + buf.toString('base64') } }, 300 * 1000);
         const caption = imgDataUrl
           ? `生成好啦喵～按指挥官给的图做的是：${videoSubj}`
           : `生成好啦喵～给指挥官做的是：${videoSubj}`;
@@ -1654,7 +1728,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       }
     } catch (e) {
       console.error(`[bot] 群 ${gid} 生视频出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${String(e.message).slice(0, 100)}`)); }
+      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${humanizeError(e)}`)); }
       catch (e2) { console.error('[bot] 生视频失败提示也发不出去：', e2.message); }
     } finally {
       promptTokens.delete(sid);
@@ -1691,16 +1765,13 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       console.log(`[bot] 🎵 唱歌路由接管 群 ${gid}：${lyrics.length} 字 <- ${songSubj.slice(0, 18) || '(自由发挥)'}`);
       await ctx.reply(text('清清嗓子喵～歌要等十几秒就到～'));
       const buf = await tts.generateSong(lyrics);
-      await http.raw('send_group_msg', {
-        group_id: Number(gid),
-        message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
-      }, { timeoutMs: 120 * 1000 });
+      await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
       await sendReply(ctx, `🎵 ${lyrics}`, { strip: cfg.stripMarkdown });
       pushHistory(gid, 'user', songSubj || '(想听歌)', `${displayName(event)}: 想听${songSubj ? `「${songSubj}」` : '咱唱歌'} [要求唱歌]`);
       pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已唱歌] 🎵 ${lyrics}`);
     } catch (e) {
       console.error(`[bot] 群 ${gid} 唱歌出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ 没唱出去喵：${String(e.message).slice(0, 100)}`)); }
+      try { await ctx.reply(text(`⚠️ 没唱出去喵：${humanizeError(e)}`)); }
       catch (e2) { console.error('[bot] 唱歌失败提示也发不出去：', e2.message); }
     } finally {
       promptTokens.delete(sid);
@@ -1737,10 +1808,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
       // 豆包「引用上文」：把指挥官的语音诉求当语境喂给 TTS，模型自己承接情绪（10-27）
       const buf = await tts.generateSpeech(speak, tone, voiceSubj);
-      await http.raw('send_group_msg', {
-        group_id: Number(gid),
-        message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
-      }, { timeoutMs: 120 * 1000 });
+      await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
       await sendReply(ctx, `🗣️ ${speak}`, { strip: cfg.stripMarkdown });
 
       // 进对话线：user 记诉求、assistant 记语音说了什么，之后可以接着聊
@@ -1748,7 +1816,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发语音] ${speak}`);
     } catch (e) {
       console.error(`[bot] 群 ${gid} 语音出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ 语音没发出去喵：${String(e.message).slice(0, 100)}`)); }
+      try { await ctx.reply(text(`⚠️ 语音没发出去喵：${humanizeError(e)}`)); }
       catch (e2) { console.error('[bot] 语音失败提示也发不出去：', e2.message); }
     }
     return;   // 接管成功或失败都到此为止
@@ -1818,10 +1886,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         if (speak) {
           // 豆包「引用上文」：把触发回复的那句用户原话当语境喂给 TTS（自动语音化 10-27 升级）
           const buf = await tts.generateSpeech(speak, voiceTone, content.rawText);
-          await http.raw('send_group_msg', {
-            group_id: Number(gid),
-            message: [{ type: 'record', data: { file: 'base64://' + buf.toString('base64') } }],
-          }, { timeoutMs: 120 * 1000 });
+          await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
           voiceOk = true;
           console.log(`[bot] 🎙 群 ${gid} 自动语音：念 ${speak.length} 字${voiceTone ? `（语气：${voiceTone}）` : '（默认语气）'}`);
         }

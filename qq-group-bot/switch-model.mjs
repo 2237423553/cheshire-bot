@@ -20,7 +20,7 @@ import { cfg } from './config.mjs';
 import { normalizeChatUrl, modelsUrlOf, fetchModels, probeModel, maskKey, parseHeaders } from './providers.mjs';
 import { saveState, loadState, STATE_PATH, listProfiles, activeProfileId } from './llm-state.mjs';
 import { restartBot, isBotRunning } from './botctl.mjs';
-import { runProbeSuite } from './probe-suite.mjs';
+import { runProbeSuite, formatSuite } from './probe-suite.mjs';
 
 const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -123,21 +123,13 @@ if (args.includes('--probe')) {
   console.log(`\n  四件套探测 ${cfg.llmUrl} / ${c.hi(model)}，结果只显示不落盘\n`);
   try {
     const out = await runProbeSuite(cfg.llmUrl, cfg.llmKey, model, cfg.llmHeaders ?? {});
-    const it = out.items;
-    const sym = (ok, warn) => (ok === true && !warn ? c.ok('√') : ok === true && warn ? c.hi('⚠') : c.bad('×'));
-    const tiers = Object.entries(it.thinking.tiers ?? {});
-    console.log(`  基础生成    ${sym(it.basic?.ok)}  ${it.basic?.detail ?? ''} ${it.basic?.latencyMs ? `(${Math.round(it.basic.latencyMs)}ms)` : ''}`);
-    for (const [t, v] of tiers) {
-      console.log(`  thinking.${String(t).padEnd(8)} ${v.accepted ? c.ok('√ 接受') : c.bad('× ' + v.kind)}${v.reasoningPresent ? c.dim('（有思考）') : ''}${v.latencyMs ? c.dim(` ${Math.round(v.latencyMs)}ms`) : ''}`);
+    // 渲染走 formatSuite（probe-suite 导出，10-30 评审：CLI 渲染逻辑从此只有一份）
+    for (const line of formatSuite(out)) {
+      if (line.includes('✗')) console.log(c.bad('  ' + line));
+      else if (line.includes('⚠')) console.log(c.hi('  ' + line));
+      else if (line.startsWith('总评')) console.log('  ' + c.bold(line));
+      else console.log('  ' + line);
     }
-    console.log(`  推荐思考档  ${JSON.stringify(it.thinking?.recommended ?? 'default')}  ${c.dim(it.thinking?.detail ?? '')}`);
-    console.log(`  工具调用    ${sym(it.tools?.ok, it.tools?.warning)}  ${it.tools?.detail ?? ''}`);
-    console.log(`  图片视觉    ${sym(it.vision?.ok, it.vision?.kindExtra === 'ok-loose')}  ${it.vision?.detail ?? ''}`);
-    console.log('');
-    if (out.warnings.length) console.log(`  ${c.hi('⚠ 警告')}\n    ${out.warnings.join('\n    ')}`);
-    if (out.errors.length) console.log(`  ${c.bad('✗ 错误')}\n    ${out.errors.join('\n    ')}`);
-    console.log(`  ${c.bold(out.allOk ? '总评：全绿，可以放心切' : '总评：有失败项 —— 请对照确认再决定')}`);
-    console.log(c.dim(`  耗时 ${Math.round(out.durationMs / 1000)}s`));
   } catch (e) {
     console.log(c.bad(`  探测失败：${e.message}`));
     process.exit(1);
@@ -257,15 +249,12 @@ try {
 if ((await ask('  跑四件套深度探测？（基础/思考档/工具/视觉，y/N)', 'N')).toLowerCase() === 'y') {
   try {
     const out = await runProbeSuite(chatUrl, useKey, model, extra);
-    const it = out.items;
-    if (it.basic?.ok) console.log(c.ok(`  基础生成 √ ${out.items.basic.detail}`));
-    else console.log(c.bad(`  基础生成 × ${it.basic?.detail}`));
-    const tiers = Object.entries(it.thinking.tiers ?? {});
-    console.log(c.dim(`  思考档接受：${tiers.map(([t, v]) => `${t}=${v.accepted ? '√' : v.kind}`).join(' ')} → 推荐 ${JSON.stringify(it.thinking.recommended ?? 'default')}`));
-    console.log(`  工具调用 ${it.tools.ok ? (it.tools.warning ? c.hi('⚠ ' + it.tools.detail) : c.ok('√ ' + it.tools.detail)) : c.bad('× ' + it.tools.detail)}`);
-    console.log(`  图片视觉 ${it.vision.ok ? (it.vision.kindExtra === 'ok-loose' ? c.hi('△ ' + it.vision.detail) : c.ok('√ ' + it.vision.detail)) : c.bad('× ' + it.vision.detail)}`);
-    if (out.errors.length) console.log(c.bad(`  错误：${out.errors.join('；')}`));
-    if (out.warnings.length) console.log(c.hi(`  警告：${out.warnings.join('；')}`));
+    for (const line of formatSuite(out)) {
+      if (line.includes('✗')) console.log(c.bad('  ' + line));
+      else if (line.includes('⚠')) console.log(c.hi('  ' + line));
+      else if (line.startsWith('总评')) console.log('  ' + c.bold(line));
+      else console.log('  ' + c.ok(line));
+    }
   } catch (e) {
     console.log(c.bad(`  四件套没跑成（不影响切换）：${e.message}`));
   }

@@ -101,6 +101,28 @@ export function maskKey(k) {
 }
 
 /**
+ * 上游错误统一分类（10-30 评审：审核/欠费/超时的正则曾在 5 处各写各的，已经漂移）。
+ * 返回 'timeout' | 'moderation' | 'quota' | 'key' | 'rate' | 'other' —— **文案归调用方**
+ * （各服务的招呼话术不同），这里只管分类。
+ * err 可以是 message 字符串、{message}、{code,...}——**先取 message ?? code ?? JSON.stringify
+ * 串起来再判**（OpenAI 系 error.code 如 content_management_policy / insufficient_quota 也命中）。
+ */
+export function classifyUpstreamError(status, e) {
+  const name = e && typeof e === 'object' ? String(e.name ?? '') : '';
+  const errBits = typeof e === 'object' && e !== null
+    ? [e.message ?? '', e.code ?? '']
+    : [String(e ?? '')];
+  const extra = e === null || e === undefined ? '' : JSON.stringify(e);
+  const err = `${errBits.join(' ')} ${extra}`;
+  if (name === 'TimeoutError' || name === 'AbortError' || /The operation (?:timed out|was aborted)/i.test(err)) return 'timeout';
+  if (/安全策略|合规|审核|moderation|sensitive|content[_ ]?management|policy[_ ]?blocked|审核拦截/i.test(err)) return 'moderation';
+  if (/quota|额度(?:已)?(?:用完|耗尽|打满)|余额不足|欠费|没钱|insufficient/i.test(err)) return 'quota';
+  if (status === 401 || /api[._ ]?key|invalid[._ ]?key|unauthorized/i.test(err)) return 'key';
+  if (status === 429 || /rate[._ ]?limit|too many requests/i.test(err)) return 'rate';
+  return 'other';
+}
+
+/**
  * 解析自定义请求头。支持三种写法，混着写也行：
  *   X-Title: My Bot       （冒号，最常用）
  *   X-Title=My Bot        （等号）

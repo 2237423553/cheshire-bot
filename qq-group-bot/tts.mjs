@@ -12,6 +12,7 @@
 //    QQ 要的 NT SILK——所以这里只管合成，不碰音频编码
 // ═══════════════════════════════════════════════════════════════════════
 import { cfg } from './config.mjs';
+import { classifyUpstreamError } from './providers.mjs';
 
 const TIMEOUT = 120 * 1000;   // 实测合成几秒就回；超时给足防误报
 
@@ -84,10 +85,11 @@ async function volcRequest(text, instructions) {
     if (code === 20000000) continue;   // 流结束信号（实测 body：code 非 0 但 message=OK、data=null——文档说「非 0 即失败」是骗人的，以实测为准）
     if (code !== 0) {
       const msg = String(j.message ?? `错误码 ${j.code}`);
-      if (/安全|审核|moderation|sensitive/i.test(msg)) {
+      const kind = classifyUpstreamError(0, j.message ?? j.code);
+      if (kind === 'moderation') {
         throw new Error('⛔ 这段话被 TTS 服务的安全审核拦了——念不了，换个说法试试吧');
       }
-      if (/quota|额度|余额|欠费|没钱/i.test(msg)) {
+      if (kind === 'quota') {
         throw new Error('⛔ TTS API 没钱了——等指挥官去控制台处理，别再试了');
       }
       throw new Error(`语音合成失败：${msg.slice(0, 120)}`);
@@ -129,15 +131,15 @@ async function ttsRequest(body, ep = {}) {
 
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) {
-      const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-      if (/安全策略|合规|审核|moderation/i.test(msg)) {
+      const kind = classifyUpstreamError(r.status, j.error ?? undefined);
+      if (kind === 'moderation') {
         throw new Error('⛔ 这段话被 TTS 服务的安全审核拦了——念不了，换个说法试试吧');
       }
-      if (r.status === 401) throw new Error('TTS API Key 无效（401）');
-      if (/QUOTA|额度|余额不足|欠费|没钱/i.test(msg)) {
+      if (kind === 'key') throw new Error('TTS API Key 无效（401）');
+      if (kind === 'quota') {
         throw new Error('⛔ TTS API 没钱了——等指挥官去控制台处理，别再试了');
       }
-      if (r.status === 429) {
+      if (kind === 'rate') {
         if (attempt < 3) {
           const wait = Math.min(Number(r.headers.get('retry-after')) || 15, 60);
           console.log(`[bot] TTS 被限流（429），等 ${wait}s 重试（第 ${attempt}/2 次重试）`);
@@ -146,6 +148,7 @@ async function ttsRequest(body, ep = {}) {
         }
         throw new Error('TTS 被限流了（重试 2 次都不行）——过几分钟再试一次');
       }
+      const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
       throw new Error(`语音合成失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
     }
 
@@ -241,11 +244,12 @@ async function singCreate(textPrompt) {
   }
   const j = await r.json().catch(() => ({}));
   if (j.audio) return Buffer.from(j.audio, 'base64');
+  const kind = classifyUpstreamError(r.status, j.message ?? j.msg ?? undefined);
   const msg = String(j.message ?? j.msg ?? `HTTP ${r.status}`);
-  if (/安全|审核|sensitive|moderation/i.test(msg)) {
+  if (kind === 'moderation') {
     throw new Error('⛔ 这段词被安全审核拦了——唱不了，换个歌词试试吧');
   }
-  if (/quota|额度|余额|欠费|没钱/i.test(msg)) {
+  if (kind === 'quota') {
     throw new Error('⛔ 唱歌接口没钱了——等指挥官去控制台处理');
   }
   throw new Error(`唱歌合成失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);

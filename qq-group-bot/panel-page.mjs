@@ -90,7 +90,9 @@ export const PAGE_HTML = `<!doctype html>
 <tr><td>端点</td><td><input id="m_url"></td></tr>
 <tr><td>Key</td><td><div class="row"><input id="m_key" type="password" placeholder="留空 = 沿用当前"><button class="eye" onclick="mtoggle()">👁</button></div></td></tr>
 <tr><td>模型</td><td><div class="row"><div style="position:relative;flex:1"><input id="m_model" autocomplete="off" placeholder="先拉列表，或直接输模型 ID"><div id="m_drop" class="drop" style="display:none"></div></div><button onclick="pullMediaModels('imggen')">拉列表</button></div></td></tr>
-<tr><td>尺寸</td><td><input id="m_size" placeholder="1024x1024"></td></tr></table>
+<tr><td>尺寸</td><td><input id="m_size" placeholder="1024x1024（gpt-image 系用）"></td></tr>
+<tr><td>Grok 参数</td><td><input id="m_ar" placeholder="比例 auto / 16:9 / 1:1 / 21:9（grok-imagine 系用）" style="margin-bottom:4px">
+  <div class="row" style="margin:0"><input id="m_res" placeholder="分辨率 1k / 2k" style="flex:1"><input id="m_qual" placeholder="档位 low/medium/high" style="flex:1"></div></td></tr></table>
 <div class="row" style="margin-top:8px"><button class="pri" onclick="saveMedia('imggen')">保存生图配置</button><button onclick="testImggen()">花一张图的钱实测</button></div>
 <div class="hint">实测 = 真生成一张最小图（结果不进群、直接丢弃）；保存后重启机器人生效</div></div>
 
@@ -429,6 +431,7 @@ async function loadMedia() {
   try {
     const j = await api('/api/media');
     $('m_url').value = j.imggen.url || ''; $('m_model').value = j.imggen.model || ''; $('m_size').value = j.imggen.size || '';
+    $('m_ar').value = j.imggen.aspectRatio || ''; $('m_res').value = j.imggen.resolution || ''; $('m_qual').value = j.imggen.quality || '';
     $('v_url').value = j.vidgen.url || ''; $('v_model').value = j.vidgen.model || ''; $('v_max').value = j.vidgen.maxSeconds || 15;
     $('t_url').value = j.tts.url || ''; $('t_model').value = j.tts.model || ''; $('t_design').value = j.tts.voiceDesign || '';
     $('t_chars').value = j.tts.autoChars || ''; $('t_voice').value = j.tts.voice || '';
@@ -444,7 +447,9 @@ function numField(id, key, out) {
 async function saveMedia(side) {
   const t = {};
   if (side === 'imggen') {
-    Object.assign(t, { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(), imggenSize: $('m_size').value.trim() });
+    Object.assign(t, { imggenUrl: $('m_url').value.trim(), imggenKey: $('m_key').value, imggenModel: $('m_model').value.trim(),
+      imggenSize: $('m_size').value.trim(), imggenAspectRatio: $('m_ar').value.trim(),
+      imggenResolution: $('m_res').value.trim(), imggenQuality: $('m_qual').value.trim() });
   } else if (side === 'vidgen') {
     Object.assign(t, { vidgenUrl: $('v_url').value.trim(), vidgenKey: $('v_key').value, vidgenModel: $('v_model').value.trim() });
     numField('v_max', 'vidgenMaxSeconds', t);

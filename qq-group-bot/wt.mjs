@@ -24,24 +24,31 @@ export async function fetchStats(nick) {
 
   const path = `/en/stat/${encodeURIComponent(name)}/export/json`;
   const hosts = ['https://thunderskill.com', 'https://www.thunderskill.com'];
-  // 这个站从国内访问时好时坏（实测既有超时也有 2~8s 慢连），所以要重试 + 换备用域名
-  let r = null;
+  // 这个站从国内访问时好时坏（实测既有超时也有 2~8s 慢连）。
+  // 10-30 评审：改为**两域名并发竞速**（先回的用）+整体一轮重试——旧版 3 次轮换取模
+  // 相当于把慢域名重点照顾了 2 次，最坏串行 90s、竞速口径 15s 内见分晓。
+  // 单发超时 15s：比旧值短——反正在竞速，慢的那条本来就轮不上先用
   let lastErr = '';
-  outer:
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const host = hosts[attempt % hosts.length];
+  let r = null;
+  for (let round = 0; round < 2 && !r; round++) {
     try {
-      r = await fetch(host + path, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        signal: AbortSignal.timeout(30000),
-      });
-      break outer;
+      r = await Promise.any(hosts.map(async (host) => {
+        try {
+          return await fetch(host + path, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+            signal: AbortSignal.timeout(15000),
+          });
+        } catch (e) {
+          throw e instanceof Error ? e : new Error(String(e));
+        }
+      }));
     } catch (e) {
-      lastErr = e.name === 'TimeoutError' ? '超时' : e.message;
-      r = null;
+      lastErr = e instanceof AggregateError
+        ? e.errors.map((x) => (x.name === 'TimeoutError' ? '超时' : String(x.message ?? x))).join(' / ')
+        : String(e.message ?? e);
     }
   }
-  if (!r) throw new Error(`连不上 Thunderskill（${lastErr}，重试 3 次都不行）——过会儿再试`);
+  if (!r) throw new Error(`连不上 Thunderskill（${lastErr}，双域名竞速两轮都不行）——过会儿再试`);
 
   if (r.status === 404 || r.status === 403) {
     throw new Error(`Thunderskill 没有收录「${name}」——这个站只统计被人查过的玩家，先去 thunderskill.com 搜一次这个名字，明天再来查`);

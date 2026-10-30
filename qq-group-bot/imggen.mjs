@@ -8,6 +8,7 @@
 //  - 生成要等十几秒到一分钟，超时给足
 // ═══════════════════════════════════════════════════════════════════════
 import { cfg } from './config.mjs';
+import { classifyUpstreamError } from './providers.mjs';
 
 const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可贵等也不要误报
 
@@ -56,19 +57,21 @@ async function generateImageInner(prompt, attempt) {
 
   const j = await r.json().catch(() => ({}));
   if (!r.ok || j.error) {
+    // 统一走分类器（10-30 评审：审核/欠费正则 5 处漂移，现在只此一张表；连 error.code 也认）
+    const kind = classifyUpstreamError(r.status, j.error ?? undefined);
     const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-    // 中转的审核拦截长这样——当场拒绝、不重试（重试也没用），翻译成人话如实转告
-    if (/安全策略|合规|审核/.test(msg)) {
+    if (kind === 'moderation') {
+      // 审核=当场拒绝、不重试（重试也没用），翻译成人话如实转告
       throw new Error('⛔ 这张图被生图服务的安全审核拒绝了（它审核很严，正常内容也可能误拒）——画不了，换个描述试试吧');
     }
-    if (r.status === 401) throw new Error('生图 API Key 无效（401）');
-    // 中转把「没钱」也用 429 包着发（body 是 API_KEY_QUOTA_EXHAUSTED）——认出来当场明报，不重试
-    if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+    if (kind === 'key') throw new Error('生图 API Key 无效（401）');
+    // 中转把「没钱」也用 429 包着发——认出来当场明报，不重试
+    if (kind === 'quota') {
       throw new Error('⛔ 生图 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
     }
     // 429 = 中转限流（今天连画几张很容易撞上）。有 Retry-After 就等一把重试一次，
     // 还不行就明说「限流了等几分钟」，别让群里以为机器人坏了
-    if (r.status === 429) {
+    if (kind === 'rate') {
       const wait = Math.min(Number(r.headers.get('retry-after')) || 30, 90);
       console.log(`[bot] 生图被限流（429），等 ${wait}s 重试（第 ${attempt + 1}/3 次重试）`);
       await new Promise((res) => setTimeout(res, wait * 1000));

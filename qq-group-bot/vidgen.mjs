@@ -9,6 +9,7 @@
 //  - 生成是分钟级（实测几十秒到几分钟），轮询上限给足
 // ═══════════════════════════════════════════════════════════════════════
 import { cfg } from './config.mjs';
+import { classifyUpstreamError } from './providers.mjs';
 
 const SUBMIT_PATH = '/v1/videos/generations';
 const POLL_INTERVAL = 5000;
@@ -52,13 +53,14 @@ export async function generateVideo(prompt, imageDataUrl = '') {
       const j = await r.json().catch(() => ({}));
       if (!r.ok || j.error) {
         const msg = String(j.error?.message ?? j.error ?? `HTTP ${r.status}`);
-        if (/安全策略|合规|moderation|审核/i.test(msg)) {
+        const kind = classifyUpstreamError(r.status, j.error ?? undefined);
+        if (kind === 'moderation') {
           // 审核=当场拒绝，不重试（重试也没用）
           throw new Error('⛔ 这个描述被生视频服务的安全审核拒绝了——生成不了，换个描述试试吧');
         }
-        if (r.status === 401) throw new Error('生视频 API Key 无效（401）');
-        // 中转把「没钱」也用 429 包着发（body 是 API_KEY_QUOTA_EXHAUSTED）——认出来当场明报，不重试
-        if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+        if (kind === 'key') throw new Error('生视频 API Key 无效（401）');
+        // 中转把「没钱」也用 429 包着发——认出来当场明报，不重试
+        if (kind === 'quota') {
           throw new Error('⛔ 生视频 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
         }
         if (r.status === 429) throw new Error('生视频被限流（429），稍后再试');
@@ -104,10 +106,11 @@ export async function generateVideo(prompt, imageDataUrl = '') {
     }
     if (!ok || j?.error) {
       const msg = String(j?.error?.message ?? j?.error ?? `HTTP ${status}`);
-      if (/安全策略|合规|moderation|审核/i.test(msg)) {
+      const kind = classifyUpstreamError(status, j?.error ?? undefined);
+      if (kind === 'moderation') {
         throw new Error('⛔ 这个描述被生视频服务的安全审核拒绝了——生成不了，换个描述试试吧');
       }
-      if (/QUOTA|额度(已)?(用完|耗尽|打满)|余额不足|欠费|没钱/i.test(msg)) {
+      if (kind === 'quota') {
         throw new Error('⛔ 生视频 API 没钱了（额度用完）——等指挥官去控制台充值或调限额，别再试了');
       }
       if (j?.error) throw new Error(`生视频任务失败：${msg.slice(0, 120)}`);
