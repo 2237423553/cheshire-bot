@@ -1540,43 +1540,17 @@ bot.onGroupMessage(async (event, ctx) => {
     return;
   }
 
-  // ── 群级串行闸（2026-10-30 评审）：正事排队跑，不让第二条流水线并发 ──
-  // 之前每组 @ 是独立的 fire-and-forget 异步任务，LLM 回复要 5~60s、生视频几分钟，
-  // 冷却闸（1s）根本拦不住第二个 @ —— 两条流水线并发会双写 history 打乱上下文顺序。
-  // B站路由有自己的 bvBusy 防重入、复读/信标/只读指令都是纯脚本秒出，都不受此闸影响。
-  // 忙时不静默丢弃：先报「在忙+前面排着几件」，这条照样进队列。
-  if (busyGroups.has(gid)) {
-    const n = groupQueueLen(gid);
-    try {
-      await ctx.reply(text(n > 1 ? `柴郡在忙前一条喵，前面还有 ${n - 1} 件正事排着，这条在队尾，稍等～`
-        : '柴郡在忙前一条喵，这条排在后面了，稍等～'));
-    } catch { /* 发不出去就算了 */ }
-  }
-  enqueueHeavy(gid, () => handleAtMe(event, ctx, gid, userText, atMe, cmd))
+  // ── 正事并发跑（2026-10-30 指挥官拍板：不要排队，模型能并发）──
+  // 曾试过群级串行任务链（防并发流水线双写 history 乱序），实战体感是
+  // 「长任务压住后面所有 @」，指挥官明确不要排队。已知取舍（记录在案）：
+  // 两条流水线并发时 history 插入顺序可能交错（A 的回复插在 B 的诉求后面）、
+  // 压缩可能与另一轮对话并发踩散条目——踩到了再补针对性闸。
+  // 各路由自己的错误早已各自上报，这里只兜住逃逸异常。
+  handleAtMe(event, ctx, gid, userText, atMe, cmd)
     .catch((e) => console.error(`[bot] 群 ${gid} 正事链异常：`, e.message));
 });
 
-// 每群一个任务链：只有「正事」（画图/视频/唱歌/语音/主对话/压缩清空）才排队；
-// 前一任失败不毒化后任（catch 吞掉只留日志，真实错误已在路由里自行上报过）。
-const groupJobs = new Map();   // gid -> { tail: 链尾 Promise(永不 reject), n: 队列里还有几件 }
-const busyGroups = new Set();  // gid 有正事在跑（含排队）就记进来，供「在忙」提示判断
-function enqueueHeavy(gid, job) {
-  const slot = groupJobs.get(gid) ?? { tail: Promise.resolve(), n: 0 };
-  groupJobs.set(gid, slot);
-  slot.n = (slot.n ?? 0) + 1;
-  busyGroups.add(gid);   // 排队也算忙（不然排队的人不知道自己为什么还没被理）
-  const run = Promise.resolve(slot.tail).then(job);
-  // 链尾判空闲：只有自己是最新尾时才摘 busy 标记 —— 后面还有人排队时不摘
-  const tail = run.catch(() => {}).finally(() => {
-    if (slot.tail === tail) { busyGroups.delete(gid); slot.n = 0; }
-  });
-  slot.tail = tail;
-  return run;
-}
-/** 该群队列里还压着几件正事（含在跑的那件），供「在忙」提示报数 */
-function groupQueueLen(gid) { return groupJobs.get(gid)?.n ?? 0; }
-
-// @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来以便排队）；
+// @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来便于并发调用）；
 // 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。
 async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
 
@@ -1927,8 +1901,8 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     console.log(`[bot] 群 ${gid}${describeMedia(content.parts)} <- ${content.rawText.slice(0, 18) || '[媒体]'}  ->  ${reply.slice(0, 22)} | tok=${tok}${chunks.length > 1 ? ` 已分${chunks.length}条` : ''}`);
 
     // 回复发完了才压缩（10-30 评审）：撞上阈值的那轮用户已经拿到回复，
-    // 后台这段压缩谁也不用等；还在 enqueueHeavy 的 job 里同步执行，
-    // 群级串行闸保证它跑完之前下一条 @ 只是排队 —— 不会跟下一轮对话并发打架
+    // 这段压缩谁也不用等。压缩与同群下一轮对话可能并发（指挥官拍板不排队）——
+    // compressHistory 的 history.set 整表替换有踩散并发条目的已知风险，踩到再补闸
     await maybeCompress(gid);
   } catch (e) {
     // 超时类错误先翻译成人话（2026-10-29：裸英文「The operation timed out.」曾直接漏到群里）
@@ -1942,7 +1916,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     } catch { /* 连回复都失败就算了 */ }
   }
 }
-// handleAtMe 到此为止 —— 它被 onGroupMessage 里的 enqueueHeavy 排队执行（见上方「群级串行闸」）
+// handleAtMe 到此为止 —— 它由 onGroupMessage 直接并发调用（2026-10-30 指挥官拍板不排队）
 
 await bot.connect();
 console.log('[bot] 事件流已连接，等待 @ …');
