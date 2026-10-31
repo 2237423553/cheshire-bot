@@ -633,6 +633,75 @@ async function callLLM(sessionId, messages, useTools) {
   return j.choices?.[0]?.message ?? {};
 }
 
+// ── 内部块泄漏抢救（10-31 群内实锤）──
+// 模型偶尔把内部工具块 [['{'type': 'tool_use', 'id': 'toolu_…', 'name':
+// 'generate_image', 'input': {…}}]] 以 Python repr 文本**整段吐成正文**：
+// 工具没执行、群里一坨语录。三层对策（见 askLLM/cleanToolArtifacts）：
+// 能解析就当真工具执行；解析不出就地重打；兜底把这类片段整段剥掉。
+// 'eom' 是独有内部指纹一起收——纯 text 块（text:None, eom:False）也会漏。
+const TOOL_TYPE_RE = /['"]type['"]\s*:\s*['"](?:tool_use|tool_call|function)['"]|['"]eom['"]\s*:/;
+
+/** 括号配对扫描：正文里「完整闭合且含内部块指纹」的片段抠出来。
+ *  群聊正常消息带这种含指纹的闭合块极罕见，误伤面可控。 */
+function findToolBlocks(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let depth = 0, start = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '[' || ch === '{') { if (depth === 0) start = i; depth++; }
+    else if (ch === ']' || ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          const seg = s.slice(start, i + 1);
+          if (TOOL_TYPE_RE.test(seg)) out.push(seg);
+          start = -1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Python repr → JSON 尽力转换（None/True/False、单引号串、裸键）。
+ *  只用于泄漏块抢救；串里有撇号之类解析失败就放弃，交给上层重打。 */
+function pyToJson(s) {
+  return s
+    .replace(/\bNone\b/g, 'null')
+    .replace(/\bTrue\b/g, 'true')
+    .replace(/\bFalse\b/g, 'false')
+    .replace(/'((?:[^'\\\n]|\\.)*)'/g, '"$1"')
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+}
+
+/** 泄漏片段 → 结构化 tool_calls（Anthropic 块格式为主）。
+ *  成功返回 [{id, type:'function', function:{name, arguments}}]，失败 null。 */
+function toolCallsFromSegments(segs) {
+  const calls = [];
+  for (const seg of segs) {
+    for (const candidate of [seg, pyToJson(seg)]) {
+      let obj = null;
+      try { obj = JSON.parse(candidate); } catch { continue; }
+      let blocks = obj;
+      if (Array.isArray(blocks) && blocks.length === 1 && Array.isArray(blocks[0])) blocks = blocks[0];
+      if (!Array.isArray(blocks)) continue;
+      for (const b of blocks) {
+        const name = b?.function?.name ?? b?.name;
+        if (!b || (b.type !== 'tool_use' && b.type !== 'function') || typeof name !== 'string') continue;
+        const args = b.input ?? b.arguments ?? b.function?.arguments ?? {};
+        calls.push({
+          id: String(b.id ?? `toolu_leak_${calls.length}`),
+          type: 'function',
+          function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+        });
+      }
+      break;   // 这段解析成了，不必再试 pyToJson 变体
+    }
+  }
+  return calls.length ? calls : null;
+}
+
 /**
  * 清理「工具调用被当文本吐出来」的残留 —— 但只清真残留，不碰正常代码。
  *
@@ -645,18 +714,21 @@ function cleanToolArtifacts(s) {
   // ① 围栏块：内容像工具调用 JSON（带 "name"+"arguments"/"function"）或者是
   //    伪标签语法才删；真代码（脚本/配置片段）原样保留
   out = out.replace(/```[a-z]*\n?([\s\S]*?)```/gi, (m, body) => {
-    const looksLikeToolCall = /"(?:name|function|arguments)"|<tool_call>|<\/tool/i.test(body);
+    const looksLikeToolCall = /"(?:name|function|arguments|tool_use)"|'(?:name|function|arguments|input|tool_use|eom)'|toolu_[A-Za-z0-9_]+|<tool_call>|<\/tool/i.test(body);
     return looksLikeToolCall ? '' : m;
   });
   // ② 行内代码只删除内容确实是工具调用的（比如 `{"name":"web_search",...}`），
   //    普通行像 `config.mjs` 一律放行
   out = out.replace(/`([^`\n]+)`/g, (m, body) => (
-    /^\s*[{<]|"name"|tool/i.test(body.trim()) ? '' : m
+    /^\s*[{<]|"name"|['"](?:tool_use|eom)['"]|toolu_[A-Za-z0-9_]+|tool/i.test(body.trim()) ? '' : m
   ));
   // ③ 伪标签对（<tool_call>…</tool_call> 或任意 <tag>{json}</tag> 包工具调用的）照删：
   //    这类语法群里正常聊天不会出现，剥了也不伤普通内容
   out = out.replace(/<tool_call>[\s\S]*?<\/tool(?:_call)?>/gi, '');
   out = out.replace(/<([a-z_]+)>\s*\{[\s\S]{0,300}?"(?:name|arguments)"[\s\S]{0,300}?\}\s*<\/\1>/gi, '');
+  // ④ 内部块整段泄漏（10-31 群内实锤：单引号 Python repr、不带围栏，①②③拦不住）
+  //    括号配对扫出含内部块指纹的完整片段整段剜掉；不平衡残段由 askLLM 重打路径兜
+  for (const seg of findToolBlocks(out)) out = out.split(seg).join('');
   return out.trim();
 }
 
@@ -714,11 +786,27 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
   // 工具循环：模型说要调工具 -> 执行 -> 喂回去 -> 再问
   // 注意：每一轮都必须带 tools。中途撤掉 tools 会让模型用文本伪造工具调用语法。
   let drewImage = false;   // 本轮有没有真的调过 generate_image（防「嘴上画好了图却不存在」）
+  let dumpRetries = 0;     // 内部块泄漏抢救失败的重打计数
   for (let round = 0; round < cfg.maxToolRounds; round++) {
     const msg = await callLLM(sessionId, messages, true);
-    const toolCalls = msg.tool_calls;
-    if (!toolCalls?.length) {
-      const content = cleanToolArtifacts(msg.content ?? '');
+    let toolCalls = msg.tool_calls?.length ? msg.tool_calls : null;
+    const rawContent = typeof msg.content === 'string' ? msg.content : contentToText(msg.content ?? '');
+    if (!toolCalls && TOOL_TYPE_RE.test(rawContent)) {
+      // 10-31 群内实锤：模型把内部工具块 [['{'type': 'tool_use', …}]] 以 Python repr
+      // 当正文整段吐出来——工具没执行，群里一坨语录。先抢救成真工具调用执行；
+      // 抢救不出就重打一轮（坏回复不入上下文、不喂回模型防学样），最多 2 次。
+      toolCalls = toolCallsFromSegments(findToolBlocks(rawContent));
+      if (toolCalls) {
+        console.warn(`[bot] 从正文抢救出 ${toolCalls.length} 个工具调用（模型漏了内部块）`);
+      } else if (++dumpRetries <= 2) {
+        console.warn('[bot] 模型把内部块吐成正文且抢救失败，重打一轮');
+        continue;
+      } else {
+        return '柴郡刚卡了一下壳喵，再叫我一次试试～';
+      }
+    }
+    if (!toolCalls) {
+      const content = cleanToolArtifacts(rawContent);
       // 模型有样学样：上下文里全是「画好啦喵～」的成功句式，它就会跳过工具直接编一句。
       // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
       // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
@@ -760,7 +848,8 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     // reasoning_content，缺失会 400（见 MiMo 文档「深度思考-多轮对话回传要求」）
     messages.push({
       role: 'assistant',
-      content: msg.content ?? '',
+      // 抢救路径（工具调用是从正文里捞的）残渣不喂回——喂回去模型会学样接着吐
+      content: msg.tool_calls?.length ? (msg.content ?? '') : '',
       tool_calls: toolCalls,
       ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
     });
@@ -1116,7 +1205,12 @@ function parseDrawIntent(raw) {
   const counterDraw = /(?:画|生成)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)/.test(t);
   // 「来张 X 的图」「生成 X 图片」：动词弱，必须有图字才认
   const nounDraw = /(?:画|生成|来|出)\s*[^。？！]{0,50}(?:图|图片|照片)/.test(t);
-  if (!headDraw && !counterDraw && !nounDraw) return null;
+  // 「生成 X」「画 X」句首裸动词也接（10-31 群内实锤：「生成尼古喵喵中的主角佐藤雅尼子」
+  // 没有量词也没有图字，上面三条全漏 → 掉进带工具的正常对话，模型一抽风把内部工具块
+  // 整段当正文吐进群）。误触保护三道兜底：文字产物黑名单 + 长度上限 + 翻译层否决权，
+  // 「生成个跑腿脚本」「生成作文」根本到不了这。
+  const headGenerate = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}(?:画|生成)\s*\S[\s\S]{0,60}$/.test(t);
+  if (!headDraw && !counterDraw && !nounDraw && !headGenerate) return null;
   return t;
 }
 
