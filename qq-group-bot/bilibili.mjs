@@ -185,6 +185,15 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
   // 对策：识别这种拒答，重新取直链（新签名新节点）再喂，最多 3 次；仍不行就明着报错。
   const REFUSAL_RE = /无法(直接)?(访问|观看|查看|处理)|不能(直接)?(观看|访问|处理)(外部)?(视频|链接)|无法观看/i;
 
+  // ⚠️ 第二类拒答（2026-10-31 群内实锤）：内容风控罐头。HTTP 200、结构正常，
+  // content 却是一句英文「The request was rejected because it was considered high risk」
+  //（战争/武器类题材容易撞上）。老 REFUSAL_RE 只认中文「看不到视频」，这种漏网后
+  // 被当正文发群+缓存 2 小时。审核 ensemble 有抖动（同视频隔几分钟就过审），所以
+  // 值得再试 1 把；但同输入连撞纯属烧钱，封顶 2 次。命中绝不缓存/存档（走 throw）。
+  // 只收高置信英文罐头，别放「风控/敏感」这类词——股票/银行总结里是正经内容词，会误伤。
+  const MODERATION_RE = /The request was (?:rejected|blocked)|considered high risk|content policy|(?:content )?may violate|violates? (?:our )?content/i;
+
+  let modTries = 0;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const { url: directUrl, quality, sizeMB } = await fetchDirectUrl(bvid, pg.cid, (m) => onStep(m));
     onStep(`直链到手：${quality}P / ${sizeMB}MB（第 ${attempt} 次，签名链接现取现喂）`);
@@ -207,6 +216,15 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
     const content = j.choices?.[0]?.message?.content;
     if (!content) throw new Error(`LLM 没返回正文：${JSON.stringify(j).slice(0, 300)}`);
 
+    if (MODERATION_RE.test(content)) {
+      modTries++;
+      if (modTries >= 2) {
+        throw new Error('视频内容被上游审核拦了喵（战争/武器类题材容易撞风控），这条咱总结不了，换条视频或过一会儿再试');
+      }
+      onStep('模型把内容拦了（上游审核拒答），缓一缓再试一把…');
+      continue;
+    }
+
     if (!REFUSAL_RE.test(content)) {
       const info = {
         bvid, page,
@@ -219,5 +237,5 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
     }
     if (attempt < 3) onStep('模型说看不到视频（服务端拉直链失败？），重取直链再试…');
   }
-  throw new Error('模型连看 3 次都说看不到视频（服务端拉直链一直失败），稍后再发一次试试喵');
+  throw new Error('模型连看 3 次都没给出总结（一直说看不到视频或拦内容），稍后再发一次试试喵');
 }
