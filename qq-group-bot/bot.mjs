@@ -1226,6 +1226,11 @@ function parseSongIntent(raw) {
   return m2 ? m2[1].trim() : null;
 }
 
+// 显式语音路由的长稿切段长度（视 TTS 合成/QQ 语音单条上限，约 1 分钟语音一段）。
+// 注意：这不是字数限制——指挥官明令「显式念=无视字数」（2026-11-01），任何长度都念，
+// 只是长稿自动分多条语音连发。
+const VOICE_CHUNK_CHARS = 220;
+
 /**
  * 语音回复意图（语音路由的闸门）。返回**完整原文**当话题（不剥触发词）——
  * 「用日语说一段小故事」这种语言/文风要求全在触发词里，剥了模型就不知道要念日语了。
@@ -1520,7 +1525,7 @@ console.log(`[bot] 指令：#上下文（查记忆） · #压缩（手动压缩�
 console.log('[bot]      #战绩 <玩家名>（战争雷霆 K/D / 胜率，走 Thunderskill）');
 console.log(`[bot]      #吃什么（从 ${foodCount()} 道菜里真随机抽早/中/晚三餐，模型只写推荐语）`);
 console.log(`[bot] 复读：群里出现「+1 复读」时跟着复读一次（同一内容只跟一次，防死循环）`);
-console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（@ 说「语音：xxx」「念一下/念出来 xx」触发 TTS 合成）`);
+console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（「语音：xxx」「念一下/念出来 xx」触发 TTS 合成，字数不限、长稿自动分条）`);
 console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
 {
   // 开机打一眼当前开关状态（面板改了开关不用重启，这行只在启动时打一次快照）
@@ -1885,10 +1890,12 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
   }
   if (voiceSubj) {
     try {
-      // 让主 LLM 在现有群聊上下文里组织一句能念的回话（带本轮媒体，图片照常看得见）
+      // 让主 LLM 在现有群聊上下文里组织一份能念的口语稿（带本轮媒体，图片照常看得见）
       // 动态语气（10-23）：要求它在末尾另起一行报「语气指令：…」，防每条语音一个腔调
+      // 字数不限（2026-11-01 指挥官明令：显式念=无视字数）——长稿在发送层切段连发
       const raw = await askLLM(`group-${gid}`, content.parts,
-        '指挥官要求用语音回复：你的这段回话会被合成语音念到群里。请控制在 100 字以内、'
+        '指挥官要求用语音回复：你的这段回话会被合成语音念到群里。字数不限——'
+        + '要念的内容是多长就组织多长，完整念完，但别为长而长。'
         + '纯口语——不许用 markdown、表情符号、编号或换行，那些 TTS 念出来很难听。'
         + '然后在回话末尾另起一行，用「语气指令：」开头写一句 20~40 字的念法描述'
         + '（情绪/音调/语速，要贴合内容和当下的心情，每条都不许雷同，'
@@ -1899,11 +1906,15 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       const tone = tl.tone;
       let speak = sanitizeForSpeech(tl.text);
       if (!speak) throw new Error('没拿到能念的话');
-      if (speak.length > 160) speak = speak.slice(0, 155) + '，后面没法念了喵。';
-      console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
+      //长稿切段逐条发：QQ 语音/TTS 单条合成有长响上限，切段是发送层的必要动作（不是限字数）
+      const speakChunks = splitMessage(speak, VOICE_CHUNK_CHARS);
+      console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字/${speakChunks.length} 条语音${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
       // 豆包「引用上文」：把指挥官的语音诉求当语境喂给 TTS，模型自己承接情绪（10-27）
-      const buf = await tts.generateSpeech(speak, tone, voiceSubj);
-      await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+      for (let i = 0; i < speakChunks.length; i++) {
+        const buf = await tts.generateSpeech(speakChunks[i], tone, voiceSubj);
+        await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+        if (i < speakChunks.length - 1) await new Promise((r) => setTimeout(r, 500));
+      }
       await sendReply(ctx, `🗣️ ${speak}`, { strip: cfg.stripMarkdown });
 
       // 进对话线：user 记诉求、assistant 记语音说了什么，之后可以接着聊
