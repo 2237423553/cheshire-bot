@@ -1,0 +1,20 @@
+{
+  "name": "zcode-community-plugins",
+  "owner": { "name": "session-usage contributors" },
+  "plugins": [
+    {
+      "name": "session-usage",
+      "source": "./session-usage",
+      "version": "0.2.0",
+      "description": "Auto-append Cherry-Studio-style usage footer to every reply; on-demand session stats via /usage",
+      "displayName": "Session Usage",
+      "displayName_i18n": { "zh-CN": "会话用量" },
+      "description_i18n": {
+        "zh-CN": "每条回复末尾自动附加统计页脚（Tokens · Token/秒，Cherry Studio 风格）；/usage 查看完整面板：输入/输出 Token、缓存、TPS、端到端耗时与本地费用估算。"
+      },
+      "category": "utilities",
+      "keywords": ["usage", "tokens", "footer", "stats", "cherry-studio"],
+      "author": { "name": "session-usage contributors" }
+    }
+  ]
+}

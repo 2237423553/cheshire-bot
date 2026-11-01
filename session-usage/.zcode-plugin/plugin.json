@@ -1,0 +1,9 @@
+{
+  "name": "session-usage",
+  "version": "0.2.0",
+  "description": "Auto-append Cherry-Studio-style usage footer to every reply; on-demand session stats via /usage",
+  "author": { "name": "session-usage contributors" },
+  "skills": "./skills",
+  "commands": "./commands",
+  "hooks": "./hooks/hooks.json"
+}

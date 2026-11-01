@@ -1,0 +1,5 @@
+{
+  "_说明": "本地费用估算用。键 = 模型 ID（与 rollout 日志里的 model.modelId 一致，区分大小写）。单价单位：US$/1M tokens。可选键：cache_read、cache_write，缺省按 input 单价计。某模型未配置或 input/output 不完整时，费用行显示 —。",
+  "示例-照抄格式后删除": { "input": 0.6, "output": 2.2, "cache_read": 0.11 },
+  "GLM-5.3-Flash": { "input": null, "output": null }
+}

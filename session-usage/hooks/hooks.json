@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python",
+            "args": [
+              "-I",
+              "${ZCODE_PLUGIN_ROOT}/skills/session-usage/scripts/usage.py",
+              "--footer"
+            ],
+            "timeoutMs": 20000,
+            "statusMessage": "统计会话用量"
+          }
+        ]
+      }
+    ]
+  }
+}
