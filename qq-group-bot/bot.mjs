@@ -962,8 +962,21 @@ function segments(event) {
   return Array.isArray(event.message) ? event.message : [];
 }
 
-function isAtMe(event, myUin) {
-  return segments(event).some((s) => s.type === 'at' && String(s.data?.qq) === String(myUin));
+function isAtMe(event, myUin, myNickname = '') {
+  if (segments(event).some((s) => s.type === 'at' && String(s.data?.qq) === String(myUin))) return true;
+  // 纯文本 @（2026-11-01 群内实锤：魅魔群成员手打「@柴油郡 随机柴郡图」三连发静默吞——
+  // 手打的只是字符不是 AT 段，原闸直接漏）。限句首匹配「@昵称」或「@柴郡」人设名，
+  // 后面接词也算（「@柴油郡谢谢请我吃饭」同样是点名）；只兜群名片=昵称的场景，
+  // 群名片带装饰前缀的（如 -ECN-柴油郡）打真 AT 不受影响、手打别名「@柴郡」照样命中。
+  const t = String(contentToText(event?.message ?? event));
+  if (!myNickname) return /^\s*@\s*柴郡/.test(t);
+  const re = new RegExp(`^\\s*@(?:${escapeRegExp(String(myNickname).trim())}|柴郡)`);
+  return re.test(t);
+}
+
+/** 正则元字符转义（昵称里可能有特殊字符） */
+function escapeRegExp(s) {
+  return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function contentToText(content) {
@@ -1540,7 +1553,7 @@ bot.onGroupMessage(async (event, ctx) => {
   const gid = event.group_id;
   const userText = extractUserText(event);
   const beacon = !!cfg.beaconTrigger && userText.includes(cfg.beaconTrigger);
-  const atMe = isAtMe(event, me.user_id);
+  const atMe = isAtMe(event, me.user_id, me.nickname);
   const cmd = userText ? parseCommand(userText) : null;
   const bvLink = userText ? extractBvLink(userText) : null;   // B站链接算「正事」，不进复读链
 
