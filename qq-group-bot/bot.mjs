@@ -10,7 +10,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
-import { assertSafeUrl } from './providers.mjs';
+import { assertSafeUrl, CANNED_REFUSAL_RE } from './providers.mjs';
 import { SWITCHES } from './switches-meta.mjs';
 import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
@@ -791,6 +791,16 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     const msg = await callLLM(sessionId, messages, true);
     let toolCalls = msg.tool_calls?.length ? msg.tool_calls : null;
     const rawContent = typeof msg.content === 'string' ? msg.content : contentToText(msg.content ?? '');
+    if (!toolCalls && CANNED_REFUSAL_RE.test(rawContent)) {
+      // 11-02 群内实锤（「翻译粤语」返回英文审核罐头当正文）——B站那条修复只盖了
+      // 视频总结引擎，主聊天路径也要接。打法同工具块抢救：坏回复不入上下文、
+      // 不喂回模型防学样，重打 ≤2（审核有抖动），连中 N 把就回人话兜底。
+      if (++dumpRetries <= 2) {
+        console.warn('[bot] 模型返回上游审核罐头（英文拒收提示），重打一轮');
+        continue;
+      }
+      return '这轮被上游审核拦下来了喵（模型那边回了句拒收提示），换个问法再试试～';
+    }
     if (!toolCalls && TOOL_TYPE_RE.test(rawContent)) {
       // 10-31 群内实锤：模型把内部工具块 [['{'type': 'tool_use', …}]] 以 Python repr
       // 当正文整段吐出来——工具没执行，群里一坨语录。先抢救成真工具调用执行；

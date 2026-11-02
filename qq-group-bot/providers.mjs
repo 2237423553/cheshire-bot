@@ -123,6 +123,17 @@ export function classifyUpstreamError(status, e) {
 }
 
 /**
+ * 成功回复里的审核罐头检测（2026-10-31 B站实锤 + 11-02 主聊天实锤）：
+ * 上游内容风控不走报错出口 —— HTTP 200、JSON 结构正常，content 却是一句英文罐头
+ * 「The request was rejected because it was considered high risk」。报错分类器
+ * classifyUpstreamError 管不到这条通道（它管的是 error 字段/异常），所以罐头
+ * 只能在这里认。**只收高置信英文罐头**：中文「风控/敏感」是正经内容词（银行/股票
+ * 总结里满地都是），放进正则必误伤。命中后：重试 1~2 把（审核 ensemble 有抖动），
+ * 连续命中就回人话，绝不把罐头发进群。
+ */
+export const CANNED_REFUSAL_RE = /(?:the )?request was (?:rejected|blocked)|considered high risk|content policy|(?:content )?may violate|violates? (?:our )?content/i;
+
+/**
  * 解析自定义请求头。支持三种写法，混着写也行：
  *   X-Title: My Bot       （冒号，最常用）
  *   X-Title=My Bot        （等号）

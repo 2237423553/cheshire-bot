@@ -18,6 +18,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { cfg } from './config.mjs';
+import { CANNED_REFUSAL_RE } from './providers.mjs';
 
 const UA_API = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
 // MiMo URL 直传官方上限 300MB，留点余量防签名参数差异
@@ -185,13 +186,11 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
   // 对策：识别这种拒答，重新取直链（新签名新节点）再喂，最多 3 次；仍不行就明着报错。
   const REFUSAL_RE = /无法(直接)?(访问|观看|查看|处理)|不能(直接)?(观看|访问|处理)(外部)?(视频|链接)|无法观看/i;
 
-  // ⚠️ 第二类拒答（2026-10-31 群内实锤）：内容风控罐头。HTTP 200、结构正常，
-  // content 却是一句英文「The request was rejected because it was considered high risk」
-  //（战争/武器类题材容易撞上）。老 REFUSAL_RE 只认中文「看不到视频」，这种漏网后
-  // 被当正文发群+缓存 2 小时。审核 ensemble 有抖动（同视频隔几分钟就过审），所以
-  // 值得再试 1 把；但同输入连撞纯属烧钱，封顶 2 次。命中绝不缓存/存档（走 throw）。
-  // 只收高置信英文罐头，别放「风控/敏感」这类词——股票/银行总结里是正经内容词，会误伤。
-  const MODERATION_RE = /The request was (?:rejected|blocked)|considered high risk|content policy|(?:content )?may violate|violates? (?:our )?content/i;
+  // ⚠️ 第二类拒答（2026-10-31 群内实锤）：内容风控罐头（HTTP 200 里藏英文拒收提示）。
+  // 11-02 起罐头正则上收 providers.mjs 共享层（CANNED_REFUSAL_RE，主聊天同源）——
+  // 打法：审核 ensemble 有抖动（同视频隔几分钟就过审），重试 1 把；连撞 2 次即弃，
+  // 绝不缓存/存档/发群。正则细节与误伤口径见 providers.mjs 注释。
+  const MODERATION_RE = CANNED_REFUSAL_RE;
 
   let modTries = 0;
   for (let attempt = 1; attempt <= 3; attempt++) {
