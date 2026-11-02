@@ -179,7 +179,8 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
     `这是一个B站视频：《${view.title}》（UP主：${view.owner}，时长 ${fmtDur(pg.duration)}）。\n` +
     `请完整观看视频后，${question ? `回答这个问题：${question}` : '给我一份总结，格式如下：\n' +
       '## 一句话概括\n## 内容要点（分点，教程类按步骤列出）\n## 值得注意的细节\n## 结论/建议'}\n` +
-    `用中文回答。`;
+    `必须用简体中文回答：视频里说的哪怕是英语，时间轴上的哪一秒讲了什么，也一律用中文转述` +
+    `（专用武器型号名保留英文可以，整段正文绝不许是英文）。`;
 
   // ⚠️ 偶发坑（2026-10-20 群内首秀踩到）：服务端偶尔拉不动直链，此时 API 照样 200、
   // 照样计费两万 tok，模型却「装看不见」回一段「无法访问外部视频」——不报错就是黑洞。
@@ -193,6 +194,7 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
   const MODERATION_RE = CANNED_REFUSAL_RE;
 
   let modTries = 0;
+  let zhRetried = false;   // 语言MISS（英文出稿）重打计次：只放一次额外轮
   for (let attempt = 1; attempt <= 3; attempt++) {
     const { url: directUrl, quality, sizeMB } = await fetchDirectUrl(bvid, pg.cid, (m) => onStep(m));
     onStep(`直链到手：${quality}P / ${sizeMB}MB（第 ${attempt} 次，签名链接现取现喂）`);
@@ -222,6 +224,24 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
       }
       onStep('模型把内容拦了（上游审核拒答），缓一缓再试一把…');
       continue;
+    }
+
+    // ⚠️ 第三类毛病（2026-11-02 群内实锤）：中文钳失守——外国武器题材的英文视频，
+    // 提示词写了「用中文回答」，模型还是通篇英文出稿（满屏英语时间轴）。
+    // 对策：提示词把中文钳拧紧（见上），引擎再兜一把「中文占比」闸——英文字母
+    // 明显多于汉字 = 语言MISS，敲打一把重打；连歪两次就认命先发原文（不加无限钱的额外轮）。
+    const ratio = (() => {
+      const cjk = (content.match(/[一-鿿]/g) ?? []).length;
+      const ascii = (content.match(/[A-Za-z]/g) ?? []).length;
+      return ascii < 60 || cjk * 1.2 >= ascii;   // 短稿（<60 个字母）不算翻车；汉字达到英文字母量级即算中文
+    })();
+    if (!ratio) {
+      if (!zhRetried) {
+        zhRetried = true;
+        onStep('总结写成英文了，敲打一把让乖乖说中文再试…');
+        continue;
+      }
+      onStep('英文没压住，先把原文贴出来（见谅喵）');
     }
 
     if (!REFUSAL_RE.test(content)) {
