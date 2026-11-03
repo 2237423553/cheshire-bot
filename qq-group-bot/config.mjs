@@ -42,7 +42,11 @@ export const cfg = {
   obWsToken: '在这里填你的OneBotWS令牌',
 
   // —— 群聊机器人行为 ——
-  cooldownMs: 1000,        // 冷却 1 秒
+  // 私聊白名单（2026-11-03 指挥官指示）：**仅有这个 QQ 号的私聊会得到反应**，
+  // 其他人私聊一律不回也不提示。想开放或换人改这里一个字符串即可。
+  privateChatOwner: '2237423553',
+
+  cooldownMs: 1000,        // 冷却 1 秒（群内）；私聊不做冷却（单人白名单，手感优先）
   maxTurns: 200,               // 每个群最多保留多少轮（超出靠压缩摘要收尾）
   maxReplyChars: 0,            // 回复总长上限，0 = 不限制（靠 chunkChars 分段连发）
   chunkChars: 700,             // 单条 QQ 消息的常规长度

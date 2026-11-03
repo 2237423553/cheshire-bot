@@ -538,10 +538,15 @@ async function sendDrawSticker(gid) {
   }
 }
 
-/** 发单段媒体（image/video/record）——群内发媒体的**唯一出口**（10-30 评审：
- *  旧版 6 处复制粘贴，超时参数/贴纸时机散落，改一处漏五处）。
+/** 发单段媒体（image/video/record/text）——群里和私聊发媒体的**唯一出口**（10-30 评审：
+ *  旧版 6 处复制粘贴，超时参数/贴纸时机散落，改一处漏五处；2026-11-03 私聊支持：
+ *  gid 以 'pv' 开头 = 私聊会话（pv<QQ号>），走 send_private_msg）。
  *  ⚠️ timeoutMs 必须显式传（坑 35：图片 SDK 默认 30s 掐不死 highway 慢传）。 */
 async function sendMediaSeg(gid, seg, timeoutMs) {
+  if (String(gid).startsWith('pv')) {
+    await http.raw('send_private_msg', { user_id: Number(String(gid).slice(2)), message: [seg] }, { timeoutMs });
+    return;
+  }
   await http.raw('send_group_msg', { group_id: Number(gid), message: [seg] }, { timeoutMs });
 }
 
@@ -553,12 +558,9 @@ async function generateImageTool(args, gid) {
     buf = await imggen.generateImage(args.prompt);
   } catch (e) {
     console.warn('[bot] 生图失败:', e.message);
-    // 失败原因别指望模型转告（它有时就吞了）——脚本直接发群里，返回值只要它别重复
+    // 失败原因别指望模型转告（它有时就吞了）——脚本直接发出去，返回值只要它别重复
     try {
-      await http.raw('send_group_msg', {
-        group_id: Number(gid),
-        message: [text(`⚠️ 画画失败了喵：${humanizeError(e)}`)],
-      }, { timeoutMs: 60 * 1000 });
+      await sendMediaSeg(gid, text(`⚠️ 画画失败了喵：${humanizeError(e)}`), 60 * 1000);
       return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
     } catch (e2) {
       console.error('[bot] 失败提示也发不出去:', e2.message);
@@ -574,8 +576,11 @@ async function generateImageTool(args, gid) {
   }
   // 工具路径画的图也要记进 lastDraw，否则 10 分钟内的「改一下」会捞到上上次的旧 prompt
   // （10-23 事故：雪乃烟花图走工具路径没记账，改稿路由拿两轮前的火箭 prompt 重画了火箭）
-  // 键一律 Number()：意图路由存的是 event.group_id（数字），构造必须一致（坑 28）
-  if (gid != null) lastDrawByGroup.set(Number(gid), { prompt: args.prompt, subj: '(模型工具画)', at: Date.now() });
+  // 群键一律 Number()：意图路由存的是 event.group_id（数字），构造必须一致（坑 28）；
+  // 私聊会话键是 'pv<QQ号>' 字符串——独立命名空间，与群数字键互不混淆
+  if (gid != null) {
+    lastDrawByGroup.set(String(gid).startsWith('pv') ? gid : Number(gid), { prompt: args.prompt, subj: '(模型工具画)', at: Date.now() });
+  }
   await sendDrawSticker(gid);   // 画完跟一张「营业中」贴纸（指挥官 10-24 指示）
   return `图片已生成并发到群里（${Math.round(buf.length / 1024)}KB）。用一两句话告诉指挥官画的是什么即可。`;
 }
@@ -1604,21 +1609,6 @@ bot.onGroupMessage(async (event, ctx) => {
   // 复读比的是「紧挨着的上一条」，中间插了别的东西就不算 +1 了。
   repeatState.delete(gid);
 
-  // ── B站链接：群里出现就自动总结（不用 @，链接即触发）──
-  // 同一条视频 2 小时内只「看」一遍（缓存秒回），正在看的时候再发不重复点火。
-  if (bvLink && featureOn('bilibili', true)) {
-    const nowBv = Date.now();
-    if (nowBv - (lastReplyAt.get(gid) ?? 0) < cfg.cooldownMs) return;
-    lastReplyAt.set(gid, nowBv);
-    try {
-      await handleBilibili(bvLink, userText, event, ctx, gid);
-    } catch (e) {
-      console.error(`[bot] B站总结 群 ${gid} 出错：`, e.message);
-      try { await ctx.reply(text(`⚠️ B站视频没看成喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
-    }
-    return;
-  }
-
   if (!atMe && !(beacon && featureOn('beacon', true))) return;   // 既没 @ 我、也没喊寻呼（或信标已关），就当没看见
 
   // 冷却：防刷屏（寻呼和正常回复共用一个闸门，免得刷爆）
@@ -1636,6 +1626,32 @@ bot.onGroupMessage(async (event, ctx) => {
     if (!atMe) return;   // 只是喊一嗓子的话，到此为止，别再走 LLM
   }
 
+  // ── B站链接 / #战绩 / 指令 / 正事：群与私聊完全同构，收口到 routeMatters ──
+  await routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink);
+});
+
+/**
+ * 正事统一入口（2026-11-03 从 onGroupMessage 尾部提炼：私聊支持要求两条入口
+ * **共用同一套路由**，防止第二份复制漂移）。调用前调用方各自把关
+ * 自跳过 / 白名单 / 冷却 / 信标这些「入口闸」。内部顺序：
+ *   B站链接即触发（免@、缓存 2h） → #战绩（纯查询） → 只读指令立即答 → 正事并发。
+ */
+async function routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink) {
+  // ── B站链接：出现就自动总结（不用 @，链接即触发）──
+  // 同一条视频 2 小时内只「看」一遍（缓存秒回），正在看的时候再发不重复点火。
+  if (bvLink && featureOn('bilibili', true)) {
+    const nowBv = Date.now();
+    if (nowBv - (lastReplyAt.get(gid) ?? 0) < cfg.cooldownMs) return;
+    lastReplyAt.set(gid, nowBv);
+    try {
+      await handleBilibili(bvLink, userText, event, ctx, gid);
+    } catch (e) {
+      console.error(`[bot] B站总结 会话 ${gid} 出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ B站视频没看成喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+    }
+    return;
+  }
+
   // ── #战绩 <玩家名>：战争雷霆战绩查询（纯查询，不走 LLM、不耗 token）──
   const wtNick = parseWtCommand(userText);
   if (wtNick !== null) {
@@ -1645,7 +1661,7 @@ bot.onGroupMessage(async (event, ctx) => {
       } else {
         const d = await wt.fetchStats(wtNick);
         await sendReply(ctx, wt.formatStats(d), { strip: false });
-        console.log(`[bot] 群 ${gid} #战绩 ${wtNick} -> ${d.nick}`);
+        console.log(`[bot] 会话 ${gid} #战绩 ${wtNick} -> ${d.nick}`);
       }
     } catch (e) {
       console.error('[bot] #战绩 出错：', e.message);
@@ -1656,7 +1672,7 @@ bot.onGroupMessage(async (event, ctx) => {
 
   // ── 只读指令**立即答、不排队**（10-30 实战反馈：B站长任务在跑时连 #上下文
   // 都要排在后面吃「在忙」，太憋屈）。#吃什么 用独立会话、#模型/#上下文 纯读——
-  // 都不写 history，串行闸管不着它们；写 history 的 #压缩/#清空 仍排队（与对话串行才安全）。
+  // 都不写 history；写 history 的 #压缩/#清空 走正事链与对话同源才安全。
   if (cmd && ![ 'compress', 'clear' ].includes(cmd)) {
     try {
       await handleCommand(cmd, gid, ctx);
@@ -1674,7 +1690,22 @@ bot.onGroupMessage(async (event, ctx) => {
   // 压缩可能与另一轮对话并发踩散条目——踩到了再补针对性闸。
   // 各路由自己的错误早已各自上报，这里只兜住逃逸异常。
   handleAtMe(event, ctx, gid, userText, atMe, cmd)
-    .catch((e) => console.error(`[bot] 群 ${gid} 正事链异常：`, e.message));
+    .catch((e) => console.error(`[bot] 会话 ${gid} 正事链异常：`, e.message));
+}
+
+// ── 私聊：**仅对白名单 QQ 号反应**（2026-11-03 指挥官指示）──
+// 会话建模成 gid='pv<QQ号>'：历史/压缩/指令键统一走 group-<gid>，全链复用；
+// 发媒体由 sendMediaSeg 的私聊分支送出。没有 @/信标/复读概念，atMe 恒真、不做冷却。
+bot.onPrivateMessage((event, ctx) => {
+  const uid = String(event.user_id);
+  if (uid === String(me.user_id)) return;                    // 自环不回（message_sent 也不理）
+  if (uid !== String(cfg.privateChatOwner)) return;          // 白名单外：一概不回、不发提示
+  const gid = `pv${uid}`;
+  const userText = extractUserText(event);
+  const cmd = userText ? parseCommand(userText) : null;
+  const bvLink = userText ? extractBvLink(userText) : null;
+  routeMatters(event, ctx, gid, userText, true, cmd, bvLink)
+    .catch((e) => console.error(`[bot] 私聊 ${uid} 正事链异常：`, e.message));
 });
 
 // @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来便于并发调用）；
