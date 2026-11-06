@@ -20,8 +20,10 @@ export async function generateImage(prompt) {
   return generateImageInner(p, 0);
 }
 
-async function generateImageInner(prompt, attempt) {
-  if (attempt >= 4) throw new Error('生图被限流了（429 重试 3 次都不行），中转在限流高峰——过几分钟再试一次');
+async function generateImageInner(prompt, attempt, netRetry = false) {
+  if (attempt >= 4) throw new Error(netRetry
+    ? '连不上生图接口（中转网络抖动，重试 3 次都不行）——过几分钟再试一次喵'
+    : '生图被限流了（429 重试 3 次都不行），中转在限流高峰——过几分钟再试一次');
   let r;
   try {
     r = await fetch(cfg.imggenUrl, {
@@ -52,7 +54,13 @@ async function generateImageInner(prompt, attempt) {
     });
   } catch (e) {
     // TimeoutError/AbortError 异名同源（不同运行时叫法不同），都按超时翻成人话
-    throw new Error(e.name === 'TimeoutError' || e.name === 'AbortError' ? '生图超时（超过 3 分钟）' : `连不上生图接口：${e.message}`);
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') throw new Error('生图超时（超过 3 分钟）');
+    // 瞬时网络抖动（2026-11-06 群内实锤：中转偶发「socket connection was closed
+    // unexpectedly」，现场 6 连发复测全通=掐线瞬时）——缓 3s 重试一把再认命，
+    // 且绝不把 Bun 英文底层报错原样漏进群
+    console.warn(`[bot] 生图接口网络抖动（${e.message}），3s 后重试（第 ${Math.min(attempt + 1, 3)}/3 次）`);
+    await new Promise((res) => setTimeout(res, 3000));
+    return generateImageInner(prompt, attempt + 1, true);
   }
 
   const j = await r.json().catch(() => ({}));

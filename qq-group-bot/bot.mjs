@@ -601,41 +601,47 @@ async function callLLM(sessionId, messages, useTools) {
   if (cfg.thinking && cfg.thinking !== 'default') body.thinking = cfg.thinking;   // 'default' = 不传，用模型默认
   if (useTools) body.tools = toolsNow();   // 按开关现过滤（search/imggen 关了工具就从清单里消失）
 
-  const r = await fetch(cfg.llmUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${cfg.llmKey}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'qq-group-bot/1.0',
-      // OpenCode Go 要求每个会话带稳定的会话 ID（路由 + 提示词缓存）；
-      // 其他服务商不理会这个头，实测（10-30 Token Plan）带上也无碍
-      'x-opencode-session': sessionId,
-      // 自定义头放最后 —— 允许覆盖上面任何一条（有些中转商要自己的鉴权头）
-      ...(cfg.llmHeaders ?? {}),
-    },
-    body: JSON.stringify(body),
-    // ⚠️ 必须带超时（2026-10-29 实锤：这里是主线唯一的无闸 fetch——对端挂起会让
-    // 这条 @ 永远悬着）。5 分钟是思考模型+长上下文的安全上限，正常回复 5~60s 内回。
-    signal: AbortSignal.timeout(5 * 60 * 1000),
-  });
-  // 先查 r.ok 再解析（10-30 评审）：网关 502 返 HTML 时裸 r.json() 会抛
-  // 「Unexpected token」乱码出群；非 200 且无 error 字段则静默空回复
-  const j = await r.json().catch(() => null);
-  if (!r.ok) {
-    const detail = String(j?.error?.message ?? (typeof j?.message === 'string' ? j.message : '') ?? '').trim()
-      || JSON.stringify(j ?? {}).slice(0, 100);
-    throw new Error(`LLM 接口 HTTP ${r.status}：${detail}`);
+  // 空包重试（2026-11-06 群内实锤：HTTP 200 + {} 空体直接落群——网关偶发空包）。
+  // 只有「200 绿灯但没 choices」走重试；HTTP 硬错 / error 字段照旧当场抛，不耗时间。
+  let lastBad = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 3000));   // 网关缓一缓
+    const r = await fetch(cfg.llmUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.llmKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'qq-group-bot/1.0',
+        // OpenCode Go 要求每个会话带稳定的会话 ID（路由 + 提示词缓存）；
+        // 其他服务商不理会这个头，实测（10-30 Token Plan）带上也无碍
+        'x-opencode-session': sessionId,
+        // 自定义头放最后 —— 允许覆盖上面任何一条（有些中转商要自己的鉴权头）
+        ...(cfg.llmHeaders ?? {}),
+      },
+      body: JSON.stringify(body),
+      // ⚠️ 必须带超时（2026-10-29 实锤：这里是主线唯一的无闸 fetch——对端挂起会让
+      // 这条 @ 永远悬着）。5 分钟是思考模型+长上下文的安全上限，正常回复 5~60s 内回。
+      signal: AbortSignal.timeout(5 * 60 * 1000),
+    });
+    // 先查 r.ok 再解析（10-30 评审）：网关 502 返 HTML 时裸 r.json() 会抛
+    // 「Unexpected token」乱码出群；非 200 且无 error 字段则静默空回复
+    const j = await r.json().catch(() => null);
+    if (!r.ok) {
+      const detail = String(j?.error?.message ?? (typeof j?.message === 'string' ? j.message : '') ?? '').trim()
+        || JSON.stringify(j ?? {}).slice(0, 100);
+      throw new Error(`LLM 接口 HTTP ${r.status}：${detail}`);
+    }
+    if (j?.error) throw new Error(`LLM ${r.status}: ${String(j.error?.message ?? JSON.stringify(j.error)).slice(0, 120)}`);
+    if (j?.choices?.[0]?.message) {
+      // 记下真实 prompt_tokens，用来判断何时该压缩（比按字数估算准）
+      const pt = j.usage?.prompt_tokens;
+      if (pt) promptTokens.set(sessionId, pt);
+      return j.choices[0].message;
+    }
+    lastBad = `${JSON.stringify(j ?? {}).slice(0, 80)}`;
+    console.warn(`[bot] LLM 返了 HTTP ${r.status} 没带 choices（${lastBad}），3s 后重试一把`);
   }
-  if (j?.error) throw new Error(`LLM ${r.status}: ${String(j.error?.message ?? JSON.stringify(j.error)).slice(0, 120)}`);
-  if (!j?.choices?.[0]?.message) {
-    throw new Error(`LLM 返回结构不对（HTTP ${r.status}）：${JSON.stringify(j ?? {}).slice(0, 80)}`);
-  }
-
-  // 记下真实 prompt_tokens，用来判断何时该压缩（比按字数估算准）
-  const pt = j.usage?.prompt_tokens;
-  if (pt) promptTokens.set(sessionId, pt);
-
-  return j.choices?.[0]?.message ?? {};
+  throw new Error(`LLM 网关连着两把都回空包（少见，像是抖动）：${lastBad} —— 过一会儿再试喵`);
 }
 
 // ── 内部块泄漏抢救（10-31 群内实锤）──
