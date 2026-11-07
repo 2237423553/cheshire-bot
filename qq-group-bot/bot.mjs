@@ -1592,7 +1592,10 @@ bot.onGroupMessage(async (event, ctx) => {
   const beacon = !!cfg.beaconTrigger && userText.includes(cfg.beaconTrigger);
   const atMe = isAtMe(event, me.user_id, me.nickname);
   const cmd = userText ? parseCommand(userText) : null;
-  const bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);   // B站链接算「正事」，不进复读链（分享卡 json 段也算）
+  let bvLink = null;
+  try {
+    bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);   // B站链接算「正事」，不进复读链（分享卡 json 段也算）
+  } catch (e) { console.error('[bot] bvLink 链接识别炸了：', e.message); }
 
   if (String(event.user_id) === String(me.user_id)) return;   // 别回自己的消息（防死循环）
 
@@ -1664,10 +1667,10 @@ bot.onGroupMessage(async (event, ctx) => {
 async function routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink) {
   // ── B站链接：出现就自动总结（不用 @，链接即触发）──
   // 同一条视频 2 小时内只「看」一遍（缓存秒回），正在看的时候再发不重复点火。
+  // ⚠️ 这里不许再做旧值冷却检查（2026-11-07 探针实锤：入口闸先盖章、这里再 old 查，
+  // saw saw「刚盖的章」= 每条链接必然静默 return——11-03 收口引入的回归，免@/带@全灭）。
+  // 防刷由入口闸（1s 共享冷却）和 bvBusy（同视频防重入）负责，此处直接处理。
   if (bvLink && featureOn('bilibili', true)) {
-    const nowBv = Date.now();
-    if (nowBv - (lastReplyAt.get(gid) ?? 0) < cfg.cooldownMs) return;
-    lastReplyAt.set(gid, nowBv);
     try {
       await handleBilibili(bvLink, userText, event, ctx, gid);
     } catch (e) {
