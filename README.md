@@ -1,33 +1,35 @@
 # 柴郡 QQ 群机器人 / Cheshire QQ Group Bot
 
-> QQ 群聊机器人：@ 对话（文字/图片/视频）、**B站链接自动总结**、联网搜索、上下文记忆。
-> **仓库不含任何密钥**，也不含 SnowLuma 本体（需单独安装）。
+> 一只住在 QQ 群里的柴郡猫。@她就能聊天，扔个 B 站链接她就自己看完然后讲给你听，
+> 还会画画、配音、唱歌。所有 AI 服务都从本机配置面板随手更换。
+> 仓库不含任何密钥，也不含 SnowLuma 本体（需单独安装）。
 
 ---
 
 # 🇬🇧 English
 
-A QQ group chat bot playing Cheshire (Azur Lane). **@-mention** her for text / image / video chat, drop a **bilibili link** and she "watches" the video itself, ask her to **draw**, **make videos**, **speak** or even **sing**. Runs fully on your own machine; every AI capability talks to a provider you plug in yourself, and this README tells you exactly **which key, in which file, and what takes effect after a restart**.
+A Cheshire cat living in your QQ group. @-mention her to chat — she remembers the group's ongoing conversation. Paste a Bilibili link and she watches the video herself, then tells you what it's about (@ not required). She can draw, speak with a real synthesized voice, and sing. Everything runs on your own machine, and every AI service she talks to is a plug you swap on a local settings page.
 
-## What it does
+## What she can do
 
-- 🗨️ **@ chat (text / image / video)**: videos go **URL-direct** — QQ's original download link is passed straight to the multimodal model (zero download, zero transcode, up to 300 MB, sidesteps the 50 MB base64 limit)
-- 📺 **Bilibili link auto-summary**: drop a `b23.tv` / BV link **without @** and she fetches the playurl combined audio+video mp4 stream (no Referer check, login-free 720P cap) and feeds it to the model to "watch" — summary is archived into context for follow-up questions; refuses politely + retries on failures. CLI entry `bilibili-summarize.mjs` shares the same engine
-- 🔎 **Web search**: Exa MCP Server (`web_search` / `fetch_webpage`), no API key needed
-- 🎙 **Voice replies**: ordinary replies shorter than `ttsAutoVoiceChars` (default 50) go out **as voice first**, with a text copy right after; the **TTS endpoint is pluggable** — point `ttsUrl` at any OpenAI-compatible chat/completions (voice designed in natural language) or at ByteDance's official seed-tts protocol (the client auto-detects which from the URL and switches request shape/parsing). The voice itself is a natural-language description you can rewrite anytime; every reply carries a per-message tone directive and the triggering message is fed back as context, so the mood matches the conversation. Explicit triggers too: `语音：…` / `说一段…` / `用日语说…`. If TTS breaks, replies fall back to plain text
-- 🎵 **Singing**: @ her with `唱歌 / 唱首 / 来一首 xxx` — an LLM writes lyrics, then a **dedicated sing channel** synthesizes: `ttsSingUrl / ttsSingKey / ttsSingModel / ttsSingVoice` are configured independently from speech, so talking and singing can use different providers; both a prompt-driven audio-generation model and a `(唱歌)`-tag preset-voice model work (request shape auto-detected per endpoint)
-- 🐾 **Random Cheshire meme**: @ her with `随机柴郡图 / 来张柴郡猫猫 / 抽一张柴郡表情包` and she fetches a random image from a GitHub-hosted meme repo and posts it — fully scripted (real dice roll in code, the model never involved); the meme pool, its GitHub-API transport and the no-repeat guard are documented in the code
-- 🖼 **Text-to-image**: `画一张××` triggers an **intent-forced route** (script takes over: prompt translation → generate → post to group; the model never gets a chance to fake success); within 10 minutes say `改一下` and the **redraw route** reuses the last prompt; audit blocks / rate limits are reported honestly
-- 🎬 **Text-to-video / image-to-video**: `生成××视频` triggers the same forced route (async task: submit → poll → download → post); quoting an image auto-routes to **image-to-video**; clips capped at 15 s (`vidgenMaxSeconds` hard check); download auto-retries; `vidgenEnabled` master switch
-- 📡 **Beacon**: shout the beacon phrase and get an instant scripted reply — zero tokens, proves she's alive
-- 🔁 **+1 echo**: repeats a repeated message once (four anti-loop guards)
-- 🧠 **Context memory**: auto-compression (triggers at 120k × 0.9), media association window (counts interactions with the bot), per-person reply attribution so cross-talk doesn't tangle
-- 🛠 **Admin commands**: `#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
-- ✅ **8-point self-check**: runtime / config / processes / LLM / search / menu lottery all ticked (QQ injection & link state deliberately not part of the report — check the admin WebUI for that)
+- 💬 **Chat** — @ her with text, a picture, or a short video; she answers in character, keeps the thread, and even accepts hand-typed `@柴郡 …` without the real AT segment
+- 💌 **Private chat** — DM her directly and she answers with the full skill set; only whitelisted QQ accounts get replies (everyone else is silently ignored)
+- 📺 **Watch a Bilibili video for you** — paste a `b23.tv` link anywhere and she pulls the video's stream, actually watches it, and replies with a full Chinese summary (times, key points); you can ask about that video afterwards and she remembers it. There's also a command-line tool (`bilibili-summarize.mjs`) that uses the exact same engine
+- 🔎 **Search the web** when a question isn't something she'd know
+- 🎙 **Speak** — short replies come out as synthesized voice with the text copy right after; the voice itself is described in one natural-language sentence ("girl's voice, a bit haughty, purrs when pleased") and you can rewrite it anytime. Say `语音：…` or `念出来…` and she reads something out loud specifically — no length cap on that
+- 🎵 **Sing** — ask with `唱歌 xxx`, she writes the lyrics and performs them; singing uses its own separate service, so talking and singing can sound differently
+- 🐾 **Random Cheshire meme** — `随机柴郡图` pulls a random meme from a GitHub-hosted collection, no repeats in a run
+- 🖼 **Draw** — `画一张××`; within 10 minutes, `改一下` or `性别错了` gets a revision of the same picture. Moderation blocks or quota exhaustion are reported honestly instead of silently failing
+- 🎬 **Make short videos** (15 s cap) — text-to-video, or image-to-video by quoting a picture
+- 📡 **Beacon** — shout the trigger phrase and get an instant scripted reply: zero tokens, proof she's alive
+- 🔁 **+1 echo** — joins a (+1) repeat chain once, with four guards against loops
+- 🧠 **Memory** — the conversation is summarized automatically when it grows too long, so she never "forgets" the group
+- 🛠 **Admin commands** — `#上下文` `#压缩` `#清空` `#模型` `#吃什么` `#战绩`
+- ✅ **Self-check** — an 8-point report tells you at a glance whether the bot, config, LLM, search and lottery are healthy
 
 ## Stack & safety
 
-- **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM (default: MiMo)
+- **Stack**: Bun + OneBot v11 (SnowLuma bridge) + any OpenAI-compatible LLM endpoint
 - **This repo contains no keys** — real keys live in gitignored runtime files (`secrets.json` for the LLM key + OneBot tokens; `mediaapi.json` / `llmstate.json` / `prompt.json` written by the panel); `config.mjs` ships placeholders only
 - Outbound requests on user-supplied URLs pass an **SSRF gate** (http/https only, loopback/private hosts rejected by literal check *and* DNS resolution, anti-rebinding); every external fetch has a hard timeout
 - Honest-error policy: audit blocks, rate limits, quota exhaustion and "couldn't reach the API" are reported as-is, never retried into silence
@@ -133,7 +135,7 @@ deeper troubleshooting in [docs/03-坑与排错.md](docs/03-坑与排错.md) (Ch
               ├ vidgen.mjs     video generation client (submit → poll → download)
               ├ tts.mjs        speech synthesis (dual protocol) + singing client
               └ foods.mjs      368 dishes, truly random draw (the model only writes blurbs)
-          LLM: any OpenAI-compatible endpoint (default OpenCode Go / mimo-v2.6-flash, thinking auto)
+          LLM: any OpenAI-compatible endpoint — pick in the local panel, swap without code changes
 
 ## Docs & known limits
 
@@ -161,39 +163,28 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 
 # 🇨🇳 中文文档
 
-## 功能一览
+## 她能干什么
 
-- 🗨️ **@ 对话**：文字 / 图片 / 视频识别。视频走 **URL 直传**——把 QQ 原始下载链接直接
-  发给多模态模型（零下载、零转码，绕开 base64 50MB 限制，上限 300MB）
-- 📺 **B站链接自动总结**：群里甩 `b23.tv` / BV 链接**免 @ 触发**，机器人自动取
-  playurl 音画合一 mp4 直链（实测不校验 Referer）喂给模型「亲眼看片」——
-  零下载零转存、免登录 720P、带提问模式、拒答检测 + 自动重试；
-  总结自动存档并进上下文，之后可继续追问。命令行入口 `bilibili-summarize.mjs` 共用同一引擎
-- 🔎 **联网搜索**：Exa MCP Server（`web_search` / `fetch_webpage`），无需 API key
-- 🎙 **语音回复**：普通回复 ≤`ttsAutoVoiceChars`（默认 50）字**先发语音**、文字版跟上；
-  **TTS 端点可插拔**——`ttsUrl` 指到 OpenAI 兼容 chat/completions（自然语言捏声线）或
-  豆包官方 seed-tts 协议（客户端按 URL 自动识别切协议）；声线=自然语言描述可随时改，
-  每条动态语气申报、触发那句原话一并喂进语境——腔调跟着内容走；
-  @ 说「语音：/说一段/用日语说」也开口；TTS 挂了自动回退纯文字
-- 🎵 **唱歌**：@ 说「唱歌/唱首/来一首 xxx」——LLM 现写歌词后走**唱歌专用通道**：
-  `ttsSingUrl/ttsSingModel/ttsSingKey` 独立配置，prompt 驱动的音频生成模型或
-  `(唱歌)` 标签预置音色都能接（按端点自动判形状）；说话和唱歌可各用各的服务商
-- 🐾 **随机柴郡图**：@ 说「随机柴郡图/来张柴郡猫猫/抽一张柴郡表情包」即从图源仓库
-  （GitHub 托管的柴郡表情包库）随机抓一张发群——脚本全程接管，骰子在脚本里掷、
-  模型没有插手环节；连抽不重样、限流人话报错（触发需「柴郡+图+随机词」三样齐全）
-- 🖼 **文生图**：@ 说「画一张××」触发**意图强制路由**（脚本接管：prompt 翻译 → 生图 → 发群，
-  模型没有装成功的机会）；10 分钟内说「改一下/性别错了」走**改稿路由**带上次 prompt 重画；
-  审核拦截/限流都如实转告
-- 🎬 **文生视频 / 图生视频**：@ 说「生成××视频」触发同样强制路由（异步任务：提交→轮询→下载→发群）；
-  引用图片要求生成视频自动走**图生视频**；成片上限 15 秒（`vidgenMaxSeconds` 硬检查）；
-  下载失败自动重试；`vidgenEnabled` 总闸可停业
-- 📡 **寻呼信标**：喊「柴郡柴郡」秒回，零 token 定位机器人在不在
-- 🔁 **+1 复读**：有人复读跟着复读一次（四道防死循环闸）
-- 🧠 **上下文记忆**：自动压缩（120k×0.9 触发）、图片关联窗口（按互动计数）、
-  多人插话不串线的回复署名
-- 🛠 **管理指令**：`#上下文` / `#压缩` / `#清空` / `#模型` / `#吃什么` / `#战绩`
-- ✅ **8 项自检**：运行时 / 配置 / 进程 / LLM / 搜索 / 抽签全打勾
-  （2026-10-30 起 QQ 注入/监听/身份**不进自检表**——链路状态看管理后台 WebUI）
+- 💬 **聊天**：@ 她就能聊——文字、图片、短视频都行；带上下文记忆，多人插话也不串线；
+  手打「@柴郡 …」也能喊到她
+- 💌 **私聊**：加她好友直接发消息也能聊（全套功能都在），但只对白名单 QQ 反应，
+  其他人的私聊一概不回、不留痕
+- 📺 **帮你看 B 站视频**：群里甩个 `b23.tv` 链接（**不用 @**），她自己取视频、自己看完，
+  用中文给你讲清楚讲明白；看完还能接着追问内容。命令行工具 `bilibili-summarize.mjs`
+  用的是同一套引擎
+- 🔎 **联网搜索**：群里聊到的她不知道的事，会自己上网查了再说
+- 🎙 **开口说话**：短回复先发**语音**再附文字版；声线就是一段自然语言
+  （「少女音，傲娇一点，开心了会呼噜」这么写的），想换嗓子改那一句就行。
+  说「语音：…」「念出来 xx」她会专门念给你听，长稿也不设字数上限
+- 🎵 **唱歌**：说「唱歌 xxx」，她现写歌词现唱；唱歌走独立通道，可以和说话用不同的服务商
+- 🐾 **随机柴郡图**：说「随机柴郡图」从表情包库里真随机抽一张，连抽不重样
+- 🖼 **画画**：说「画一张××」就画；10 分钟内说「改一下」「性别错了」她会带着原 prompt 重画。
+  审核拦截、限流这些都会如实说，不装死也不静默
+- 🎬 **生成短视频**：15 秒内的小片段，文字生成、引用一张图也会图生视频
+- 📡 **寻呼信标**：喊「柴郡柴郡」秒回——零开销确认她还活着
+- 🔁 **+1 复读**：有人 +1 她跟着复读一次（带死循环防护）
+- 🛠 **管理指令**：`#上下文` `#压缩` `#清空` `#模型` `#吃什么` `#战绩`
+- ✅ **自检**：一条命令 8 项体检，bot、配置、模型、搜索、抽签健不健康一眼可查
 
 > 上面每一项功能怎么配置、怎么自定义、改哪个文件哪个键、要不要重启——
 > 全部列在下面的**「自定义」**一节（配置键 + 位置 + 生效方式的完整对照表）。
@@ -213,7 +204,7 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
               ├ imggen.mjs     文生图客户端
               ├ vidgen.mjs     文生/图生视频客户端（异步任务：提交→轮询→下载）
               └ foods.mjs      368 道饭食真随机抽签（模型只写推荐语）
-          LLM：任意 OpenAI 兼容端点（默认 OpenCode Go / mimo-v2.6-flash，思考档 auto）
+          LLM：任意 OpenAI 兼容端点——本地面板里挑着换，不用改代码
 
 ## 快速开始
 
