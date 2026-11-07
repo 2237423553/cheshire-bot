@@ -1140,6 +1140,22 @@ function extractUserText(event) {
 }
 
 /**
+ * 从 QQ 分享卡片里抠 B 站入口（2026-11-07 群内实锤：视频分享卡是 json 段，
+ * extractUserText 只收 text 段 → 帖卡片整条静默吞、路由 zero 命中）。
+ * 卡片的 prompt/正文里带「…-哔哩哔哩】 https://b23.tv/xxxx」——只认 B 站指纹，
+ * 网易云/B站外站的 json 卡不误触发。文本段里的链接仍由 extractBvLink 负责。
+ */
+function extractBvFromCard(event) {
+  const raw = segments(event)
+    .filter((s) => s.type === 'json' || s.type === 'forward')
+    .map((s) => String(s.data?.data ?? s.data?.json ?? s.data?.content ?? ''))
+    .join('\n');
+  if (!raw) return null;
+  const m = raw.match(/https?:\/\/b23\.tv\/[0-9A-Za-z]+/i) ?? raw.match(/BV[0-9A-Za-z]{10}/);
+  return m ? m[0] : null;
+}
+
+/**
  * 群里的显示名：**群名片优先**（大家在群里看到的名字），没设群名片才退回 QQ 昵称。
  * ⚠️ 这俩是两个字段：拿错就会「认错人」——比如群名片叫「-ECN-柴俊」的人，
  * QQ 昵称可能是「(阿？惊慌)报喜职员刷屏了上墙」这种，模型用后者称呼他，群里看就是认错人。
@@ -1576,7 +1592,7 @@ bot.onGroupMessage(async (event, ctx) => {
   const beacon = !!cfg.beaconTrigger && userText.includes(cfg.beaconTrigger);
   const atMe = isAtMe(event, me.user_id, me.nickname);
   const cmd = userText ? parseCommand(userText) : null;
-  const bvLink = userText ? extractBvLink(userText) : null;   // B站链接算「正事」，不进复读链
+  const bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);   // B站链接算「正事」，不进复读链（分享卡 json 段也算）
 
   if (String(event.user_id) === String(me.user_id)) return;   // 别回自己的消息（防死循环）
 
@@ -1615,7 +1631,10 @@ bot.onGroupMessage(async (event, ctx) => {
   // 复读比的是「紧挨着的上一条」，中间插了别的东西就不算 +1 了。
   repeatState.delete(gid);
 
-  if (!atMe && !(beacon && featureOn('beacon', true))) return;   // 既没 @ 我、也没喊寻呼（或信标已关），就当没看见
+  // ⚠️ B站链接豁免这一条闸（2026-11-07 实锤回归：11-03 routeMatters 收口时,
+  // 原「bv 路由在闸前」被搬成了「闸在路由前」——纯文本链接不@也不再总结）。
+  // bv-only 的进 routeMatters 后首个分支就是 bv，命中即 return，不会误走对话。
+  if (!atMe && !(beacon && featureOn('beacon', true)) && !bvLink) return;   // 既没 @ 我、没喊寻呼、也不是 B 站链接，就当没看见
 
   // 冷却：防刷屏（寻呼和正常回复共用一个闸门，免得刷爆）
   const now = Date.now();
@@ -1709,7 +1728,7 @@ bot.onPrivateMessage((event, ctx) => {
   const gid = `pv${uid}`;
   const userText = extractUserText(event);
   const cmd = userText ? parseCommand(userText) : null;
-  const bvLink = userText ? extractBvLink(userText) : null;
+  const bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);
   routeMatters(event, ctx, gid, userText, true, cmd, bvLink)
     .catch((e) => console.error(`[bot] 私聊 ${uid} 正事链异常：`, e.message));
 });
