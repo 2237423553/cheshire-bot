@@ -250,7 +250,53 @@ function setFate(uid, nickname, arg) {
     [c.zh, c.jp, c.en].some((n) => n && normalizeName(n) === q));
   let score = 1;
 
-  // ② 没有精确命中再模糊：口径与旧版一致，只看中文名（中文名为空才退日文）。
+  // ② 子串命中：旧数据的 zh_name 全带舰级全称前缀（例：「希佩尔海军上将级
+  //    重巡洋舰3号舰欧根亲王（萨沃伊亲王）」），常用短名「欧根亲王」对上 22 字
+  //    全称的模糊分只有 0.18，连 0.3 阈值都够不着 —— 全军覆没（11-10 群内实锤）。
+  //    剥掉括号注记和 μ兵装 标记后做子串匹配；候选里有本体时剔掉 μ兵装变体
+  //    （不许变体顶替本体），有多个再挑最短（名字最「裸」的最像用户想要的）。
+  if (index < 0) {
+    // 剥括号注记要剥到剥不动为止 —— 旧数据有套娃（“（鹩(μ兵装)）”）
+    const stripNotes = (s) => {
+      let p = String(s ?? '');
+      for (;;) {
+        const n = p.replace(/[（(][^（）()]*[)）]/g, '');
+        if (n === p) break;
+        p = n;
+      }
+      return p;
+    };
+    const wantMu = q.includes('μ');   // 点名 μ兵装 的就来真的，本体不许顶
+    const chibi = (c) =>
+      c.zh.startsWith('小') || /ちゃん/.test(c.jp) || /litt|chan/i.test(c.en);
+    const isMu = (c) => /μ/.test(c.zh);
+    const hits = [];
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i];
+      // 剥了注记的和没剥的原串都当靶子 —— μ 用户会连着 μ兵装 一起报
+      const targets = new Set();
+      for (const n of [c.zh, c.jp, c.en].filter(Boolean)) {
+        const a = stripNotes(n);
+        targets.add(normalizeName(a));
+        targets.add(normalizeName(n));
+      }
+      targets.delete('');
+      if ([...targets].some((n) => n.includes(q))) hits.push(i);
+    }
+    let pick = hits.filter((i) => !chibi(list[i]));
+    if (pick.length && !wantMu && list.some((c) => !isMu(c) && !chibi(c))) {
+      pick = pick.filter((i) => !isMu(list[i]));   // 有本体在场，μ兵装变体不顶替
+    }
+    if (!pick.length) pick = hits;
+    if (pick.length) {
+      pick.sort((a, b) => normalizeName(stripNotes(list[a].zh || '')).length
+        - normalizeName(stripNotes(list[b].zh || '')).length || a - b);
+      index = pick[0];
+      score = 1;
+    }
+  }
+
+  // ③ 没有精确/子串命中再模糊：口径与旧版一致，只看中文名（中文名为空才退日文）。
   //    不能把日文名也拿来模糊 —— 「大凤」会被「大山」（日文名=大山）以更短的编辑距离抢走。
   if (index < 0) {
     let best = { score: -1, index: -1, len: Infinity };
