@@ -1401,8 +1401,13 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
         '（否定要求用 without / no X 等英文表达），一条都不许丢。' +
         '装备/舰船/坦克的中文别称必须翻成官方英文名，不许意译成别的词：' +
         '（例：「挑战者2黑夜」= Challenger 2 "Black Night"、「台风」= Eurofighter Typhoon、' +
-        '「暴风」= Hawker Tempest、「彗星」= Comet、「大凤」= Taihou、' +
-        '碧蓝航线的「纳尔逊」= Nelson）；' +
+        '「暴风」= Hawker Tempest、「彗星」= Comet、' +
+        '碧蓝航线的「纳尔逊」= Nelson、「大凤」= Taihou、「可畏」= Formidable、' +
+        '「光辉」= Illustrious、「独角兽」= Unicorn、「企业」= Enterprise、' +
+        '「欧根亲王」= Prinz Eugen、「贝尔法斯特」= Belfast、「黛朵」= Dido、「小贝法」= Little Bel、' +
+        '「圣路易斯」= St. Louis、「岛风」= Shimakaze、「大青花鱼」= Albacore；' +
+        '碰上不在表里的舰船名：先按官方英文名翻，翻不动就音译 + 按原舰描述特征，' +
+        '绝不许把舰名当形容词意译）；' +
         '遇到不确定的专有名词，按字面音译 + 在 prompt 里描述其特征，别编一个错误的名字。' +
         '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。';
     const msg = await callLLM(sid, [
