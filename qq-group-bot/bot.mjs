@@ -2071,6 +2071,9 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       // 让主 LLM 在现有群聊上下文里组织一份能念的口语稿（带本轮媒体，图片照常看得见）
       // 动态语气（10-23）：要求它在末尾另起一行报「语气指令：…」，防每条语音一个腔调
       // 字数不限（2026-11-01 指挥官明令：显式念=无视字数）——长稿在发送层切段连发
+      // 11-10 铁令：用户原话里明确点名的声线/腔调类要求是硬要求——语气指令行必须
+      // 原样保留那些字眼，不许改写、不许换成别的说法；补提示词只许加，不许动
+      const voiceReq = /用([\s\S]{1,30}?(?:的)?(?:声线|腔调|音色|嗓音|念法|唱腔))\s*(?:说|念|讲|来一段|开个腔)/.exec(voiceSubj)?.[1]?.trim() ?? '';
       const raw = await askLLM(`group-${gid}`, content.parts,
         '指挥官要求用语音回复：你的这段回话会被合成语音念到群里。字数不限——'
         + '要念的内容是多长就组织多长，完整念完，但别为长而长。'
@@ -2078,6 +2081,9 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         + '然后在回话末尾另起一行，用「语气指令：」开头写一句 20~40 字的念法描述'
         + '（情绪/音调/语速，要贴合内容和当下的心情，每条都不许雷同，'
         + '例：得意洋洋语速快尾音上扬／困到不行慢半拍／气鼓鼓音调拔高）。'
+        + (voiceReq
+          ? `指挥官明确点名了音色：「${voiceReq}」——这是硬要求，语气指令行里必须原样写进这个声线词，禁止改写成别的说法、禁止弱化或替换。`
+          : '')
         + `要聊的话题：${voiceSubj}`);
       // 先拆语气指令行、再洗成能念的口语（拆行必须在压平空白之前，见 splitToneLine 注释）
       const tl = splitToneLine(stripFakeDrawMark(raw));
@@ -2089,7 +2095,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
       console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字/${speakChunks.length} 条语音${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
       // 豆包「引用上文」：把指挥官的语音诉求当语境喂给 TTS，模型自己承接情绪（10-27）
       for (let i = 0; i < speakChunks.length; i++) {
-        const buf = await tts.generateSpeech(speakChunks[i], tone, voiceSubj);
+        const buf = await tts.generateSpeech(speakChunks[i], tone, voiceSubj, voiceReq);
         await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
         if (i < speakChunks.length - 1) await new Promise((r) => setTimeout(r, 500));
       }

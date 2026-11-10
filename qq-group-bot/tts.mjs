@@ -163,28 +163,37 @@ async function ttsRequest(body, ep = {}) {
  *  tone（可选）：本轮的动态语气描述——MiMo voicedesign 拼进音色描述；豆包模式并进语音指令。
  *  upstream（可选）：触发这条语音的那句用户原话——豆包「引用上文」用法（context_texts 里
  *  引用而不合成，模型自动承接语境情绪，10-27 官方文档查证）。
+ *  voiceReq（可选）：用户原话里**明确点名的**声线/音色/腔调要求（11-10 指挥官铁令：
+ *  明确要求原样直达，补提示词不许改写不许稀释——拼在最前，压过底色里的默认柴郡味）。
  *  ⚠️ 官方口径：context_texts 数组只第一个元素生效——底色/动态语气/上文必须拼成一条，分两条第二条会被静默丢弃。 */
-export async function generateSpeech(text, tone = '', upstream = '') {
+export async function generateSpeech(text, tone = '', upstream = '', voiceReq = '') {
   const t = String(text ?? '').trim();
   if (!t) throw new Error('没给要念的文本');
   if (t.length > 800) throw new Error('要念的文本太长了（上限 800 字）');
+  const req = String(voiceReq ?? '').trim();
 
   if (isVolc()) {
-    const ctx = String(cfg.ttsVoiceDesign).trim()
+    // 指挥官明令（11-10）：明确要求拼第一，原样直达——这一段一个字不改
+    const ctx = (req ? `音色要求（指挥官明确点名，照办）：${req}。` : '')
+      + String(cfg.ttsVoiceDesign).trim()
       + (tone ? `这一次的语气：${String(tone).trim().slice(0, 80)}。` : '')
       + (upstream ? `说话的语境：对方刚说：「${String(upstream).trim().slice(0, 120)}」。` : '');
     return volcRequest(t, [ctx]);
   }
 
-  // 底色在前保住「柴郡是谁」，动态语气在后只改这次的情绪/语速
-  const voiceDesign = tone
-    ? `${cfg.ttsVoiceDesign}这一次的语气：${String(tone).trim().slice(0, 80)}。`
+  // 底色在前保住「柴郡是谁」，动态语气在后只改这次的情绪/语速；
+  // 明确点名的音色要求压在 everything 前面（不稀释）
+  const voiceDesign = req
+    ? `音色要求（指挥官明确点名，照办）：${req}。${cfg.ttsVoiceDesign}`
     : cfg.ttsVoiceDesign;
+  const finalDesign = tone
+    ? `${voiceDesign}这一次的语气：${String(tone).trim().slice(0, 80)}。`
+    : voiceDesign;
 
   return ttsRequest({
     model: cfg.ttsModel,
     messages: [
-      { role: 'user', content: voiceDesign },
+      { role: 'user', content: finalDesign },
       { role: 'assistant', content: t },
     ],
     audio: { format: 'wav' },
