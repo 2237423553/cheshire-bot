@@ -11,3 +11,5 @@ B站总结/
 secrets.json
 tools/
 assets/
+# 本地素材：downloaded_images/（1793 张舰船角色图，114MB）只存磁盘不进仓不推送（11-10 指挥官拍板）
+downloaded_images/
