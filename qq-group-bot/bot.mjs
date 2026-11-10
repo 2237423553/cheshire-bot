@@ -1437,13 +1437,24 @@ async function handleWifeCommand(wcmd, event, ctx, gid) {
   try {
     for (const step of steps) {
       if (step.type === 'image') {
-        try {
-          const buf = readFileSync(step.path);
-          // 图片 2~5MB 走 highway 上传，SDK 默认 30s 不够，显式给 120s
-          await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
-        } catch (e) {
-          console.error('[bot] 老婆图发送失败：', e.message);
-          try { await ctx.reply(text(`⚠️ 老婆图没发出去喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+        // 「QQ returned no message receipt」是回执丢失型瞬时抖动（11-10 群内实锤），
+        // 按「先重试后认命」教义补一把重试；实在发不出去才报人话
+        let sent = false;
+        for (let attempt = 1; attempt <= 2 && !sent; attempt++) {
+          try {
+            const buf = readFileSync(step.path);
+            // 图片 2~5MB 走 highway 上传，SDK 默认 30s 不够，显式给 120s
+            await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+            sent = true;
+          } catch (e) {
+            if (attempt < 2) {
+              console.warn(`[bot] 老婆图第 ${attempt} 把没回执，歇 1.5s 重试：`, e.message);
+              await new Promise((r) => setTimeout(r, 1500));
+            } else {
+              console.error('[bot] 老婆图发送失败：', e.message);
+              try { await ctx.reply(text(`⚠️ 老婆图没发出去喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+            }
+          }
         }
         continue;
       }
