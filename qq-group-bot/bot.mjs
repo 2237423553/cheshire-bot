@@ -18,6 +18,7 @@ import * as wt from './wt.mjs';
 import * as imggen from './imggen.mjs';
 import * as vidgen from './vidgen.mjs';
 import * as tts from './tts.mjs';
+import * as wife from './wife.mjs';
 import { extractBvLink, summarizeVideo } from './bilibili.mjs';
 
 // ─────────── 限制 ───────────
@@ -1184,6 +1185,22 @@ function parseWtCommand(raw) {
 }
 
 /**
+ * 今日老婆 / 签到 / 本命老婆（旧版 project_g2_3.py 的同名功能接回）。
+ * 沿用旧版触发词，整句精确匹配；# 前缀可带可不带（与 COMMANDS 习惯一致）。
+ * 返回 { kind: 'today' | 'today2' | 'checkin' | 'fate', arg? }，不命中 null。
+ */
+function parseWifeCommand(raw) {
+  const t = String(raw ?? '').trim().replace(/^[#＃]\s*/, '');
+  if (!t) return null;
+  if (t === '签到') return { kind: 'checkin' };
+  if (t === '今日老婆') return { kind: 'today' };
+  if (/^今日老婆\s*[2２]$/.test(t)) return { kind: 'today2' };
+  const m = /^本命老婆(?:\s*[：:]?\s*([\s\S]*))?$/.exec(t);
+  if (m) return { kind: 'fate', arg: (m[1] ?? '').trim() };
+  return null;
+}
+
+/**
  * 生视频意图识别（和画图同理，宁漏勿错）。
  * 必须同时有「视频/影片/动画」关键词 + 动作词；纯提「视频」俩字不接。
  * 注意：parseDrawIntent 的文字产物名单里含「视频」，两闸互斥不抢活。
@@ -1393,6 +1410,49 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
   }
 }
 
+/**
+ * 今日老婆 / 签到 / 本命老婆：脚本直办，零 token。
+ * 步骤顺序由 wife.mjs 排好（扣魔方 → 图 → 名字 → 台词），这里只负责按序发。
+ * 图片走本地文件 base64 直发（与画图/随机柴郡图同一条媒体出口）。
+ */
+async function handleWifeCommand(wcmd, event, ctx, gid) {
+  const uid = String(event.user_id ?? '');
+  const nickname = displayName(event);
+  if (!uid) {
+    await ctx.reply(text('拿不到你的 QQ 号喵，抽不了老婆。'));
+    return;
+  }
+  let steps;
+  try {
+    steps = wife.run({ uid, nickname, kind: wcmd.kind, arg: wcmd.arg });
+  } catch (e) {
+    console.error('[bot] 老婆模块出错：', e.message);
+    try { await ctx.reply(text(`老婆系统打盹了喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  try {
+    for (const step of steps) {
+      if (step.type === 'image') {
+        try {
+          const buf = readFileSync(step.path);
+          // 图片 2~5MB 走 highway 上传，SDK 默认 30s 不够，显式给 120s
+          await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+        } catch (e) {
+          console.error('[bot] 老婆图发送失败：', e.message);
+          try { await ctx.reply(text(`⚠️ 老婆图没发出去喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+        }
+        continue;
+      }
+      await sendReply(ctx, step.text, { strip: false });
+    }
+  } catch (e) {
+    console.error('[bot] 老婆指令发送出错：', e.message);
+    return;
+  }
+  const texts = steps.filter((s) => s.type === 'text').map((s) => s.text);
+  console.log(`[bot] 💍 ${wcmd.kind} 群 ${gid} <- ${nickname}(${uid}) | ${texts.join(' | ').slice(0, 100)}`);
+}
+
 async function handleCommand(cmd, gid, ctx) {
   // ── #吃什么：唯一会真调大模型的指令 ──
   // 用独立会话 food-<gid>：
@@ -1574,6 +1634,14 @@ console.log(`[bot] 触发：群内 @ 我 · 或喊「${cfg.beaconTrigger}」（�
 console.log(`[bot] 指令：#上下文（查记忆） · #压缩（手动压缩） · #清空（清记忆） · #模型（查模型）——不耗 token`);
 console.log('[bot]      #战绩 <玩家名>（战争雷霆 K/D / 胜率，走 Thunderskill）');
 console.log(`[bot]      #吃什么（从 ${foodCount()} 道菜里真随机抽早/中/晚三餐，模型只写推荐语）`);
+try {
+  console.log(`[bot]      今日老婆 / 今日老婆2 / 签到 / 本命老婆 <名字>（从 ${wife.wifeCount()} 位里抽，魔方记账，不走 LLM）`);
+  const reg = wife.ensureRegisterTable();
+  if (reg.created) console.log(`[bot]      用户档不存在，已自动创建空表：${reg.path}`);
+  else if (reg.normalized) console.log(`[bot]      用户档是空文件，已补成空表：${reg.path}`);
+} catch (e) {
+  console.log(`[bot]      今日老婆 / 签到 / 本命老婆已注册（register_table 数据检查失败：${e.message}）`);
+}
 console.log(`[bot] 复读：群里出现「+1 复读」时跟着复读一次（同一内容只跟一次，防死循环）`);
 console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（「语音：xxx」「念一下/念出来 xx」触发 TTS 合成，字数不限、长稿自动分条）`);
 console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
@@ -1677,6 +1745,15 @@ async function routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink) {
       console.error(`[bot] B站总结 会话 ${gid} 出错：`, e.message);
       try { await ctx.reply(text(`⚠️ B站视频没看成喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
     }
+    return;
+  }
+
+  // ── 今日老婆 / 签到 / 本命老婆（纯脚本、零 token，2026-11-10 接回旧版功能）──
+  // 数据在 js/register_table/（fig_data.json 老婆池 + register_dict.json 用户表）；
+  // 命令需 @ 机器人（私聊白名单同样可用）。
+  const wcmd = parseWifeCommand(userText);
+  if (wcmd) {
+    await handleWifeCommand(wcmd, event, ctx, gid);
     return;
   }
 

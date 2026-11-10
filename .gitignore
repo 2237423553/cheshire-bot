@@ -11,3 +11,6 @@ B站总结/
 secrets.json
 tools/
 assets/
+register_table/register_dict.json
+register_table/register_dict.json.tmp
+downloaded_images/

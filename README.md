@@ -19,6 +19,7 @@ A Cheshire cat living in your QQ group. @-mention her to chat — she remembers 
 - 🎙 **Speak** — short replies come out as synthesized voice with the text copy right after; the voice itself is described in one natural-language sentence ("girl's voice, a bit haughty, purrs when pleased") and you can rewrite it anytime. Say `语音：…` or `念出来…` and she reads something out loud specifically — no length cap on that
 - 🎵 **Sing** — ask with `唱歌 xxx`, she writes the lyrics and performs them; singing uses its own separate service, so talking and singing can sound differently
 - 🐾 **Random Cheshire meme** — `随机柴郡图` pulls a random meme from a GitHub-hosted collection, no repeats in a run
+- 💍 **Daily wife** — `今日老婆` draws a ship-girl (picture + CN/JP/EN name + two voice lines) and costs 2 magic cubes; `签到` checks in for +10; `本命老婆 <name>` pins a favorite (50% chance to draw her for free). Data lives in `js/register_table/` (`fig_data.json` pool, `register_dict.json` user table)
 - 🖼 **Draw** — `画一张××`; within 10 minutes, `改一下` or `性别错了` gets a revision of the same picture. Moderation blocks or quota exhaustion are reported honestly instead of silently failing
 - 🎬 **Make short videos** (15 s cap) — text-to-video, or image-to-video by quoting a picture
 - 📡 **Beacon** — shout the trigger phrase and get an instant scripted reply: zero tokens, proof she's alive
@@ -178,6 +179,9 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
   说「语音：…」「念出来 xx」她会专门念给你听，长稿也不设字数上限
 - 🎵 **唱歌**：说「唱歌 xxx」，她现写歌词现唱；唱歌走独立通道，可以和说话用不同的服务商
 - 🐾 **随机柴郡图**：说「随机柴郡图」从表情包库里真随机抽一张，连抽不重样
+- 💍 **今日老婆**：@ 她说「今日老婆」抽一位舰娘（发图 + 中日英名 + 两条台词，扣 2 魔方）；
+  「签到」每天领 10 魔方；「本命老婆 <名字>」指定本命（五成概率直接出本命、不扣魔方）。
+  数据在 `js/register_table/`（`fig_data.json` 老婆池 + `register_dict.json` 用户表）
 - 🖼 **画画**：说「画一张××」就画；10 分钟内说「改一下」「性别错了」她会带着原 prompt 重画。
   审核拦截、限流这些都会如实说，不装死也不静默
 - 🎬 **生成短视频**：15 秒内的小片段，文字生成、引用一张图也会图生视频
@@ -203,6 +207,7 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
               ├ wt.mjs         战争雷霆战绩查询（Thunderskill）
               ├ imggen.mjs     文生图客户端
               ├ vidgen.mjs     文生/图生视频客户端（异步任务：提交→轮询→下载）
+              ├ wife.mjs       今日老婆/签到/本命（数据在 register_table/）
               └ foods.mjs      368 道饭食真随机抽签（模型只写推荐语）
           LLM：任意 OpenAI 兼容端点——本地面板里挑着换，不用改代码
 
