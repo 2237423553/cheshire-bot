@@ -85,6 +85,14 @@ async function generateImageInner(prompt, attempt, netRetry = false) {
       await new Promise((res) => setTimeout(res, wait * 1000));
       return generateImageInner(prompt, attempt + 1);
     }
+    // 404/5xx = 中转瞬时抖动（2026-11-10 群内实锤：健康端点偶发 404 Not Found，
+    // 半小时后原样复测 200 出图）——按「先重试后认命」教义并入梯队，缓 3s 再来；
+    // 真挂了的路径 3 把之后仍走原报错人话，不会无限锤
+    if (r.status === 404 || r.status >= 500) {
+      console.warn(`[bot] 生图接口 HTTP ${r.status} 瞬时抖动，3s 后重试（第 ${Math.min(attempt + 1, 3)}/3 次）`);
+      await new Promise((res) => setTimeout(res, 3000));
+      return generateImageInner(prompt, attempt + 1, netRetry);
+    }
     throw new Error(`生图失败（HTTP ${r.status}）：${msg.slice(0, 120)}`);
   }
 
