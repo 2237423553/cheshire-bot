@@ -1,0 +1,2234 @@
+// ═══════════════════════════════════════════════════════════
+//  QQ 群聊机器人 —— @ 我才回 · 全模态 · 自动补最近媒体
+//  LLM: OpenCode Go / MiMo-V2.6-Flash（thinking = 模型默认，可在群里 #接口 / #切换 热切换）
+//
+//  关键点：QQ 会把「文字+@」和「图片/语音/视频」拆成多条消息发出，
+//  所以被 @ 时若本条没有媒体，就回溯群历史，把最近的媒体一并喂给模型。
+// ═══════════════════════════════════════════════════════════
+import { readFile } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
+import { cfg } from './config.mjs';
+import { assertSafeUrl, CANNED_REFUSAL_RE } from './providers.mjs';
+import { SWITCHES } from './switches-meta.mjs';
+import { pickThree, foodCount } from './foods.mjs';
+import * as exa from './exa.mjs';
+import * as wt from './wt.mjs';
+import * as imggen from './imggen.mjs';
+import * as vidgen from './vidgen.mjs';
+import * as tts from './tts.mjs';
+import * as wife from './wife.mjs';
+import { extractBvLink, summarizeVideo } from './bilibili.mjs';
+
+// ─────────── 限制 ───────────
+const MAX_IMAGES = 3;
+const MAX_MEDIA_BYTES = cfg.maxMediaBytes;   // 见 config.mjs（15MB 会挡掉手机拍的视频）
+const VIDEO_OK = ['mp4', 'wmv', 'mov', 'avi'];   // API 只收这四种
+const LOOKBACK_COUNT = 30;                       // 回溯拉多少条群消息
+
+// ─────────── 会话状态 ───────────
+const history = new Map();
+const lastReplyAt = new Map();
+const groupSummary = new Map();   // gid -> 压缩后的历史摘要
+const promptTokens = new Map();   // gid -> 上次请求的真实 prompt_tokens
+const repeatState = new Map();    // gid -> 上一条消息 { sig, sender, joined }，用来识别「+1 复读」
+
+// ─────────── 功能开关（API 面板写 switches.json；每条消息现读，改了即刻生效，不用重启）───────────
+// 键：imggen(画图+改稿路由) / vidgenEnabled(生视频) / bilibili(免@总结) /
+//     search(联网搜索) / repeat(+1复读) / beacon(寻呼信标)。缺省=开；vidgen 缺省跟 cfg.vidgenEnabled。
+const SWITCH_PATH = fileURLToPath(new URL('./switches.json', import.meta.url));
+let swCache = { mtime: -1, data: null };
+function featureOn(name, dflt = true) {
+  try {
+    const m = statSync(SWITCH_PATH).mtimeMs;
+    if (m !== swCache.mtime) swCache = { mtime: m, data: JSON.parse(readFileSync(SWITCH_PATH, 'utf8')) };
+  } catch { swCache = { mtime: -1, data: swCache.data ?? null }; }
+  const v = swCache.data?.[name];
+  return v === undefined || v === null ? dflt : Boolean(v);
+}
+function toolsNow() {
+  // 联网搜索关了就不给模型 web_search / fetch_webpage；生图关了不给 generate_image（路由也会歇业）
+  const search = featureOn('search', true);
+  const imggenOn = featureOn('imggen', true);
+  return TOOLS.filter((t) => {
+    const n = t.function?.name;
+    if (!search && (n === 'web_search' || n === 'fetch_webpage')) return false;
+    if (!imggenOn && n === 'generate_image') return false;
+    return true;
+  });
+}
+const eatHistory = new Map();     // gid -> 最近推过的菜名，用来避免老推同样的几样
+const lastDrawByGroup = new Map(); // gid -> 最近一次画图 { prompt, subj, at }，供「改一下/重画」改稿路由用
+
+/** 本地日期键（YYYY-MM-DD）：搜索「每日上限」跨天归零用 */
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * content 可以是字符串（纯文字），也可以是 parts 数组（带图片/视频）。
+ * textOnly 是纯文字版 —— 这条掉出「媒体关联窗口」后就用它，图不再发给模型。
+ */
+function pushHistory(gid, role, content, textOnly) {
+  // ⚠️ 键名必须统一成 group-<gid>：historyForApi / buildSystem / #清空 都用这个键。
+  // 之前这里存的是裸数字键、读取用的是 group-<gid>，两套键对不上，
+  // 等于机器人从来没看见过历史 —— 多轮对话全是失忆状态。
+  const key = `group-${gid}`;
+  const arr = history.get(key) ?? [];
+  arr.push({ role, content, text: textOnly ?? content });
+  while (arr.length > cfg.maxTurns * 2) arr.shift();
+  history.set(key, arr);
+}
+
+/**
+ * 过滤出「可以进关联窗口」的 parts：太大的媒体直接剔掉（只保留文字）。
+ * data URL 的字节数按 base64 长度反推，不用真去解码。
+ */
+function stickyParts(parts) {
+  return parts.filter((p) => {
+    // 视频一律不进上下文（太重），走「描述式」——由模型写一句话描述代替，见 VIDEO_DESC_HINT
+    if (p?.type === 'video_url') return false;
+    const u = p?.image_url?.url ?? '';
+    if (!u.startsWith('data:')) return true;
+    const b64 = u.slice(u.indexOf(',') + 1);
+    const bytes = Math.floor((b64.length * 3) / 4);
+    return bytes <= cfg.mediaHistoryMaxBytes;
+  });
+}
+
+/**
+ * 取出要发给模型的历史，并套上「媒体关联窗口」。
+ *
+ * 窗口按「与机器人的互动」数：数 user 条（一条 = 一次和柴郡的互动），
+ * 最近 cfg.mediaMemoryWindow 次互动保留图片原样，更早的只留纯文字。
+ * 群里不 @ 机器人的闲聊根本不进 history，所以刷屏不会把图挤掉。
+ *
+ * 为什么不干脆不存图：那模型只在当轮看得见图，隔一句就问不出
+ * 「刚才那张图里有几个人」。留一个窗口 = 保住细节又不至于撑爆上下文。
+ */
+function historyForApi(sessionId) {
+  const arr = history.get(sessionId) ?? [];
+  // 从尾往前数 user 条，第 mediaMemoryWindow 次互动所在的下标就是窗口起点
+  let counted = 0;
+  let keepFrom = 0;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].role === 'user' && ++counted >= cfg.mediaMemoryWindow) {
+      keepFrom = i;
+      break;
+    }
+  }
+  // 露窗的历史在「进请求前」就地降级为纯文字：把几十 MB 的 base64 字符串
+  // 从 history 里真正放掉（10-30 评审：只在返回值里降级的话，内存一点没省）
+  for (let i = 0; i < keepFrom; i++) {
+    const e = arr[i];
+    if (Array.isArray(e.content)) e.content = e.text;
+  }
+  // 窗口内也要有总量预算：从新到旧累计 base64 字节，超预算的旧图整条降级为纯文字。
+  // 群聊高峰一张带三张图的 @ 很多，不设上限单请求能背几十 MB。
+  let budget = cfg.mediaWindowTotalBytes;
+  return arr.map((e, i) => {
+    if (i < keepFrom) return { role: e.role, content: e.text };
+    if (Array.isArray(e.content)) {
+      let bytes = 0;
+      for (const p of e.content) {
+        const u = p?.image_url?.url ?? '';
+        if (u.startsWith('data:')) bytes += Math.floor((u.length * 3) / 4);
+      }
+      if (bytes > budget) { e.content = e.text; return { role: e.role, content: e.text }; }
+      budget -= bytes;
+    }
+    return { role: e.role, content: e.content };
+  });
+}
+
+// ─────────── 媒体工具 ───────────
+const MIME_BY_EXT = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp',
+  wav: 'audio/wav', mp3: 'audio/mpeg', amr: 'audio/amr', silk: 'audio/silk',
+  ogg: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac',
+  mp4: 'video/mp4', wmv: 'video/wmv', mov: 'video/quicktime', avi: 'video/x-msvideo',
+};
+
+function extOf(s) {
+  const m = /\.([a-z0-9]{2,5})(?:$|[?#])/i.exec(s ?? '');
+  return (m?.[1] || '').toLowerCase();
+}
+
+function guessMime(name, fallback) {
+  return MIME_BY_EXT[extOf(name)] ?? fallback;
+}
+
+/**
+ * OneBot 媒体段：
+ *   image  -> data.url (下载地址) / data.image
+ *   record -> data.file (文件名.amr) / data.url (下载地址，无扩展名!)
+ *   video  -> data.file (文件名.mp4) / data.url (下载地址，无扩展名!)
+ * 关键：格式要从 file 判，下载要用 url
+ */
+function mediaInfo(seg) {
+  const d = seg.data ?? {};
+  return {
+    src: d.url || d.file || d.image || '',
+    name: d.file || d.image || d.url || '',
+  };
+}
+
+/**
+ * 下载/读取媒体，返回 { dataUrl, reason }。
+ * ⚠️ reason 一定要填 —— 失败时把它告诉模型，模型才能如实说明原因，
+ *    而不是像以前那样只能瞎猜「一片黑乎乎什么都看不到」。
+ *    以前 !src 和 buf 为空这两条路径是静默 return null，日志里什么都查不到。
+ */
+async function toDataUrl(seg, fallbackMime) {
+  const { src, name } = mediaInfo(seg);
+  const mb = (n) => (n / 1024 / 1024).toFixed(1) + 'MB';
+  if (!src) {
+    const keys = Object.keys(seg?.data ?? {}).join(',') || '(空)';
+    console.warn(`[bot] 媒体加载失败：segment 里没有 url/file 字段，实际字段=${keys}`);
+    return { dataUrl: null, reason: `没拿到媒体地址（segment 字段：${keys}）` };
+  }
+  try {
+    let buf;
+    let mime = guessMime(name, fallbackMime);
+    if (/^https?:\/\//i.test(src)) {
+      // SSRF 闸（10-24 评审）：URL 是群友塞进来的，不许指向内网/本地面板；
+      // 顺手补超时——这里原先也没有，和 exa.rpc 是同一类「挂起静默卡死」隐患
+      await assertSafeUrl(src);
+      const r = await fetch(src, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(60 * 1000),
+      });
+      if (!r.ok) {
+        console.warn(`[bot] 媒体下载失败 HTTP ${r.status}: ${String(src).slice(0, 60)}`);
+        return { dataUrl: null, reason: `下载失败 HTTP ${r.status}` };
+      }
+      const ct = (r.headers.get('content-type') || '').split(';')[0];
+      if (ct && ct !== 'application/octet-stream') mime = ct;
+      buf = Buffer.from(await r.arrayBuffer());
+    } else {
+      buf = await readFile(src.replace(/^file:\/\//i, ''));
+    }
+    if (!buf?.length) {
+      console.warn(`[bot] 媒体加载失败：下载到 0 字节，src=${String(src).slice(0, 60)}`);
+      return { dataUrl: null, reason: '下载到 0 字节（地址可能已过期）' };
+    }
+    if (buf.length > MAX_MEDIA_BYTES) {
+      console.warn(`[bot] 媒体过大已跳过：${mb(buf.length)} > 上限 ${mb(MAX_MEDIA_BYTES)}`);
+      return { dataUrl: null, reason: `文件 ${mb(buf.length)} 超过上限 ${mb(MAX_MEDIA_BYTES)}` };
+    }
+    console.log(`[bot] 媒体加载成功：${mb(buf.length)} mime=${mime}`);
+    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, reason: '' };
+  } catch (e) {
+    console.warn('[bot] 媒体读取失败:', String(src).slice(0, 60), e.message);
+    return { dataUrl: null, reason: `读取出错：${e.message}` };
+  }
+}
+
+/**
+ * 把一组媒体段转成 OpenAI content 片段。
+ * 同时把加载失败收集进 errors —— 失败必须当场说出口，
+ * 以前只写日志，指挥官根本不知道出了什么问题（只看到模型瞎猜「一片黑乎乎」）。
+ * 10-30 评审改两阶段：先分桶占位（保持原配额语义），再 **并行下载**
+ * 需要网络的片段（每把各自带 60s 超时闸，互不依赖）——
+ * 多图+视频的消息首字延迟从「相加」变「取最慢」。
+ */
+async function mediaToParts(segs) {
+  const plan = [];
+  let nImg = 0, nRec = 0, nVid = 0;
+  for (const s of segs) {
+    if (s.type === 'image' && nImg < MAX_IMAGES) {
+      nImg++;
+      plan.push({ kind: 'image', s });
+    } else if (s.type === 'record' && nRec < 1) {
+      nRec++;
+      plan.push({ kind: 'record', s });
+    } else if (s.type === 'video' && nVid < 1) {
+      nVid++;
+      // 格式从 file 判；无扩展名时放行尝试（QQ 一般就是 mp4）
+      const ext = extOf(mediaInfo(s).name);
+      if (ext && !VIDEO_OK.includes(ext)) plan.push({ kind: 'video-badfmt', s, ext });
+      // URL 方式（MiMo 官方支持，≤300MB）：把 QQ 原始下载链接直接给模型，不下载
+      else if (/^https?:\/\//i.test(mediaInfo(s).src)) plan.push({ kind: 'video-url', s });
+      // 拿不到网络链接（本地文件）才退回 base64
+      else plan.push({ kind: 'video-load', s });
+    }
+  }
+  const results = await Promise.all(plan.map((it) => (
+    it.kind === 'image' ? toDataUrl(it.s, 'image/jpeg')
+      : it.kind === 'video-load' ? toDataUrl(it.s, 'video/mp4')
+      : null
+  )));
+  const parts = [];
+  const errors = [];
+  plan.forEach((it, i) => {
+    if (it.kind === 'image') {
+      const r = results[i];
+      if (r?.dataUrl) {
+        parts.push({ type: 'image_url', image_url: { url: r.dataUrl } });
+      } else {
+        parts.push({ type: 'text', text: `[一张图片未能加载：${r?.reason ?? '未知原因'}]` });
+        errors.push(`图片加载失败（${r?.reason}）`);
+      }
+    } else if (it.kind === 'record') {
+      // 语音暂不支持：QQ 语音是腾讯 SILK v3 专有编码，模型不认。
+      // 不瞎喂，改成如实告知模型，让它老实说听不了，别编造内容。
+      parts.push({ type: 'text', text: '[群友发来一段语音消息，但你听不懂语音内容，请如实说听不了，不要编造]' });
+    } else if (it.kind === 'video-badfmt') {
+      parts.push({ type: 'text', text: `[一段视频未能加载：格式 ${it.ext} 不受支持]` });
+      errors.push(`视频格式 ${it.ext} 不受支持（只收 ${VIDEO_OK.join('/')}）`);
+    } else if (it.kind === 'video-url') {
+      // fps/media_resolution 是 MiMo 的精细度参数（fps 默认 2，范围 0.1~10）
+      parts.push({ type: 'video_url', video_url: { url: mediaInfo(it.s).src }, fps: 2, media_resolution: 'default' });
+    } else {
+      const r = results[i];
+      if (r?.dataUrl) {
+        parts.push({ type: 'video_url', video_url: { url: r.dataUrl } });
+      } else {
+        parts.push({ type: 'text', text: `[一段视频未能加载：${r?.reason}]` });
+        errors.push(`视频加载失败（${r?.reason}）`);
+      }
+    }
+  });
+  return { parts, errors };
+}
+
+// ─────────── 回溯最近媒体（QQ 把媒体和@拆开发）───────────
+/**
+ * 回溯群历史，只取「最近一条视频」。
+ *
+ * 为什么只取视频：QQ 会把「文字+@」和「视频/图片」拆成多条消息，所以被 @ 时
+ * 得回头找视频。但图片不该一起抓——用户发视频时附近常有无关图片，一起喂给
+ * 模型反而干扰它。图片只在 @ 那条消息里直接附带时才传。
+ *
+ * 不做时间窗口过滤：两次视频挨得近时，按时间累积会拿到旧的那条。
+ * messages 按时间正序返回，所以后出现的覆盖先出现的 = 留最新的。
+ */
+async function fetchRecentMedia(gid, senderId) {
+  try {
+    const j = await http.raw('get_group_msg_history', { group_id: gid, count: LOOKBACK_COUNT });
+    const msgs = j?.messages ?? [];
+
+    const pickLatestVideo = (filter) => {
+      let latest = null;
+      for (const m of msgs) {
+        if (!filter(m)) continue;
+        for (const s of (Array.isArray(m.message) ? m.message : [])) {
+          if (s.type === 'video') latest = s;
+        }
+      }
+      return latest ? [latest] : [];
+    };
+
+    // 只认「@ 我的那个人」自己发的视频。
+    // 不放宽到其他人：别人发的无关图片/视频不该被拖进上下文，否则机器人会
+    // 答非所问地评论别人发的东西。
+    return pickLatestVideo((m) => String(m.user_id) === String(senderId));
+  } catch (e) {
+    console.warn('[bot] 回溯群历史失败:', e.message);
+    return [];
+  }
+}
+
+// ─────────── 组装 content ───────────
+/**
+ * 展开「引用回复」：QQ 的 reply 段只带被引用消息的 id，内容要拿 id 去
+ * get_msg 拉回来 —— 不展开的话，指挥官引用一张图问「这台车的配置数据」，
+ * 模型根本看不见那张图。
+ * 引用里如果是合并转发（forward），再拉 get_forward_msg 取各节点内容。
+ * 只展开一层不套娃；拉不到就当没有，不影响主流程。
+ */
+async function expandReplySegs(segs) {
+  const replies = segs.filter((s) => s.type === 'reply' && s.data?.id);
+  // 10-30 评审：每条引用拉一次消息是独立网络请求，并行拿 + 保序合并
+  const loaded = await Promise.all(replies.map(async (s) => {
+    try {
+      const msg = await http.raw('get_msg', { message_id: s.data.id });
+      let inner = Array.isArray(msg?.message) ? msg.message : [];
+
+      // 合并转发：取最后 3 个节点的内容（最新的在后面）
+      if (inner.some((x) => x.type === 'forward')) {
+        const f = await http.raw('get_forward_msg', { message_id: s.data.id });
+        const nodes = Array.isArray(f?.messages) ? f.messages : [];
+        inner = nodes.slice(-3).flatMap((n) => (Array.isArray(n.content) ? n.content : []));
+      }
+
+      const quotedSender = msg?.sender?.card || msg?.sender?.nickname || '别人';
+      return [
+        { type: 'text', text: `[引用 ${quotedSender} 的消息]` },
+        ...inner.filter((x) => ['image', 'video', 'text'].includes(x.type)),
+      ];
+    } catch (e) {
+      console.warn('[bot] 展开引用消息失败:', e.message);
+      return [];
+    }
+  }));
+  return loaded.flat();
+}
+
+async function buildContent(event) {
+  const segs = segments(event);
+  const txt = segs
+    .filter((s) => s.type === 'text')
+    .map((s) => s.data?.text ?? '')
+    .join('')
+    .replace(/\[CQ:[^\]]*\]/g, '')
+    .trim();
+
+  let mediaSegs = segs.filter((s) => ['image', 'record', 'video'].includes(s.type));
+  let fromHistory = false;
+
+  // 引用回复：把被引用消息里的图/文拉进来（引用也算「看得见」，有它就不再回溯）
+  const quoted = await expandReplySegs(segs);
+  mediaSegs.push(...quoted.filter((s) => ['image', 'video'].includes(s.type)));
+  const quotedText = quoted
+    .filter((s) => s.type === 'text')
+    .map((s) => (s.data?.text ?? '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, 300);   // 引用的长文别全塞，截断防撑
+
+  // 本条消息没有媒体（含引用里也没有）-> 回溯（QQ 常把媒体和@拆成两条）
+  if (!mediaSegs.length) {
+    const recent = await fetchRecentMedia(event.group_id, event.user_id);
+    if (recent.length) {
+      mediaSegs = recent;
+      fromHistory = true;
+    }
+  }
+
+  const { parts, errors: mediaErrors } = await mediaToParts(mediaSegs);
+  const kinds = parts.map((p) => ({ image_url: '图片', audio_url: '语音', video_url: '视频' })[p.type]).filter(Boolean);
+
+  const prefix = kinds.length
+    ? `(群友发来：${[...new Set(kinds)].join('、')}${fromHistory ? '，来自刚才的消息' : ''})`
+    : '';
+  const body = [prefix, quotedText, txt].filter(Boolean).join(' ');
+  if (body) parts.push({ type: 'text', text: body });
+
+  // rawText = 用户真实说的话（不含「群友发来：图片」这类前缀），
+  // 只有它会进上下文历史，避免把媒体前缀当成长期记忆累积。
+  return parts.length ? { parts, rawText: txt, mediaErrors } : null;
+}
+
+// ─────────── 网络工具（Exa）───────────
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description:
+        '搜索互联网获取实时信息（新闻、天气、价格、事件等）。' +
+        '常识性问题不需要搜索，直接回答即可。' +
+        '重要：query 和 objective 都要用英文（本搜索引擎对英文的召回远好于中文）。' +
+        'query 写「理想结果的页面描述」而不是关键词堆砌，' +
+        '例如写 "blog post comparing React and Vue performance" 而不是 "React vs Vue"。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'English. Description of the ideal page to find' },
+          objective: {
+            type: 'string',
+            description: 'English. What this search is for: which pages should rank first, and what facts to pull from them',
+          },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'wt_stats',
+      description:
+        '查询战争雷霆（War Thunder 国际服）玩家的战绩统计。' +
+        '当指挥官想查某个游戏玩家在战争雷霆里的 K/D、胜率、场次时使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          nickname: { type: 'string', description: '游戏内玩家昵称，要完整精确（区分大小写、含特殊符号）' },
+        },
+        required: ['nickname'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'generate_image',
+      description:
+        '画一张图并发到群里（AI 文生图）。' +
+        '当指挥官想画画/生成图片/看某个画面时使用。' +
+        'prompt 用英文写，详细描述画面主体、风格、构图、光线，例如 ' +
+        '"a chubby gray cat in a royal navy uniform, cute cartoon style, warm lighting"。' +
+        '生成要等几十秒，画完会自动发到群里，你只需在文字里简单说一句画了什么。' +
+        '如果工具返回被审核拦截，如实告诉指挥官画不了，不要编造图片内容。',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'English. Detailed description of the image to generate' },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
+];
+
+let searchCount = 0;        // 当日搜索计数（简单保护）
+let searchCountDate = '';   // 计数所属日期 —— 跨天归零，「每日」限额才名副其实
+                            // （10-30 评审：此前只增不清，挂机几周搜索就永久哑掉））
+
+// 搜索/抓取都走 Exa MCP Server（exa.mjs），不再直连 REST API
+async function exaSearch(query, objective) {
+  const day = todayKey();
+  if (searchCountDate !== day) { searchCount = 0; searchCountDate = day; }
+  if (cfg.searchDailyLimit > 0 && searchCount >= cfg.searchDailyLimit) {
+    return '搜索次数已达今日上限，请直接根据已有知识回答。';
+  }
+  searchCount++;
+  try {
+    const text = await exa.search(query, objective, cfg.searchResults);
+    if (!text?.trim()) return '搜索没有返回任何结果。';
+    console.log(`[bot] 🔍 搜索 "${query}" -> ${text.length} 字（今日第 ${searchCount} 次）`);
+    return text.slice(0, cfg.searchResults * cfg.searchTextChars);
+  } catch (e) {
+    return '搜索出错：' + e.message;
+  }
+}
+
+async function exaFetch(url) {
+  try {
+    const text = await exa.fetchPage(url);
+    const t = (text ?? '').trim();
+    if (!t) return '该网页抓取不到正文内容。';
+    console.log(`[bot] 🌐 抓取 ${url} -> ${t.length} 字`);
+    return t.slice(0, cfg.fetchTextChars);
+  } catch (e) {
+    return '抓取出错：' + e.message;
+  }
+}
+
+async function runTool(name, args, gid) {
+  if (name === 'web_search') return exaSearch(String(args.query ?? ''), String(args.objective ?? ''));
+  if (name === 'fetch_webpage') return exaFetch(String(args.url ?? ''));
+  if (name === 'wt_stats') return wt.formatStats(await wt.fetchStats(String(args.nickname ?? '')));
+  if (name === 'generate_image') return generateImageTool(args, gid);
+  return '未知工具：' + name;
+}
+
+/** 画图工具：生成 -> 直接发群 -> 回执给模型。失败把原因喂回去让它如实转告 */
+// ── 画图后小表情（2026-10-24 指挥官指示）：每次真画完图，跟一张「营业中」贴纸 ──
+// 文件在 assets/（gitignore 挡着、不进仓库）；读不到就静默跳过，绝不碍着画图主线
+let drawStickerB64 = '';
+function drawStickerSeg() {
+  if (drawStickerB64) return { type: 'image', data: { file: 'base64://' + drawStickerB64 } };
+  try {
+    drawStickerB64 = readFileSync(fileURLToPath(new URL('./assets/draw-done.gif', import.meta.url))).toString('base64');
+    return { type: 'image', data: { file: 'base64://' + drawStickerB64 } };
+  } catch { return null; }   // 没装贴纸 = 什么也不发
+}
+async function sendDrawSticker(gid) {
+  const seg = drawStickerSeg();
+  if (!seg) return;
+  try {
+    await sendMediaSeg(gid, seg, 60 * 1000);
+  } catch (e) {
+    console.warn('[bot] 画图贴纸没发出去（不影响主线）:', e.message);
+  }
+}
+
+/** 发单段媒体（image/video/record/text）——群里和私聊发媒体的**唯一出口**（10-30 评审：
+ *  旧版 6 处复制粘贴，超时参数/贴纸时机散落，改一处漏五处；2026-11-03 私聊支持：
+ *  gid 以 'pv' 开头 = 私聊会话（pv<QQ号>），走 send_private_msg）。
+ *  ⚠️ timeoutMs 必须显式传（坑 35：图片 SDK 默认 30s 掐不死 highway 慢传）。 */
+async function sendMediaSeg(gid, seg, timeoutMs) {
+  if (String(gid).startsWith('pv')) {
+    await http.raw('send_private_msg', { user_id: Number(String(gid).slice(2)), message: [seg] }, { timeoutMs });
+    return;
+  }
+  await http.raw('send_group_msg', { group_id: Number(gid), message: [seg] }, { timeoutMs });
+}
+
+async function generateImageTool(args, gid) {
+  if (!gid) return '这里不是群聊，没法发图。';
+  console.log(`[bot] 🎨 画画：${args.prompt}`);
+  let buf;
+  try {
+    buf = await imggen.generateImage(args.prompt);
+  } catch (e) {
+    console.warn('[bot] 生图失败:', e.message);
+    // 失败原因别指望模型转告（它有时就吞了）——脚本直接发出去，返回值只要它别重复
+    try {
+      await sendMediaSeg(gid, text(`⚠️ 画画失败了喵：${humanizeError(e)}`), 60 * 1000);
+      return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
+    } catch (e2) {
+      console.error('[bot] 失败提示也发不出去:', e2.message);
+      return '画画失败：' + e.message;
+    }
+  }
+  try {
+    // 2~3MB 图走 highway 上传可能超过 SDK 默认 30s，实测超时报「发送失败」其实 QQ 侧还在传
+    await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+  } catch (e) {
+    console.warn('[bot] 图片发送失败:', e.message);
+    return `图已经画好了（${Math.round(buf.length / 1024)}KB）但发到群里失败：${e.message}`;
+  }
+  // 工具路径画的图也要记进 lastDraw，否则 10 分钟内的「改一下」会捞到上上次的旧 prompt
+  // （10-23 事故：雪乃烟花图走工具路径没记账，改稿路由拿两轮前的火箭 prompt 重画了火箭）
+  // 群键一律 Number()：意图路由存的是 event.group_id（数字），构造必须一致（坑 28）；
+  // 私聊会话键是 'pv<QQ号>' 字符串——独立命名空间，与群数字键互不混淆
+  if (gid != null) {
+    lastDrawByGroup.set(String(gid).startsWith('pv') ? gid : Number(gid), { prompt: args.prompt, subj: '(模型工具画)', at: Date.now() });
+  }
+  await sendDrawSticker(gid);   // 画完跟一张「营业中」贴纸（指挥官 10-24 指示）
+  return `图片已生成并发到群里（${Math.round(buf.length / 1024)}KB）。用一两句话告诉指挥官画的是什么即可。`;
+}
+
+// ─────────── LLM（带工具循环）───────────
+function buildSystem(sessionId, extraSystem = '') {
+  const summary = groupSummary.get(sessionId);
+  return [cfg.systemPrompt, summary ? `[之前对话摘要]\n${summary}` : '', extraSystem]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+async function callLLM(sessionId, messages, useTools) {
+  const body = {
+    model: cfg.model,
+    messages,
+  };
+  if (cfg.thinking && cfg.thinking !== 'default') body.thinking = cfg.thinking;   // 'default' = 不传，用模型默认
+  if (useTools) body.tools = toolsNow();   // 按开关现过滤（search/imggen 关了工具就从清单里消失）
+
+  // 空包重试（2026-11-06 群内实锤：HTTP 200 + {} 空体直接落群——网关偶发空包）。
+  // 只有「200 绿灯但没 choices」走重试；HTTP 硬错 / error 字段照旧当场抛，不耗时间。
+  let lastBad = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 3000));   // 网关缓一缓
+    const r = await fetch(cfg.llmUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cfg.llmKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'qq-group-bot/1.0',
+        // OpenCode Go 要求每个会话带稳定的会话 ID（路由 + 提示词缓存）；
+        // 其他服务商不理会这个头，实测（10-30 Token Plan）带上也无碍
+        'x-opencode-session': sessionId,
+        // 自定义头放最后 —— 允许覆盖上面任何一条（有些中转商要自己的鉴权头）
+        ...(cfg.llmHeaders ?? {}),
+      },
+      body: JSON.stringify(body),
+      // ⚠️ 必须带超时（2026-10-29 实锤：这里是主线唯一的无闸 fetch——对端挂起会让
+      // 这条 @ 永远悬着）。5 分钟是思考模型+长上下文的安全上限，正常回复 5~60s 内回。
+      signal: AbortSignal.timeout(5 * 60 * 1000),
+    });
+    // 先查 r.ok 再解析（10-30 评审）：网关 502 返 HTML 时裸 r.json() 会抛
+    // 「Unexpected token」乱码出群；非 200 且无 error 字段则静默空回复
+    const j = await r.json().catch(() => null);
+    if (!r.ok) {
+      const detail = String(j?.error?.message ?? (typeof j?.message === 'string' ? j.message : '') ?? '').trim()
+        || JSON.stringify(j ?? {}).slice(0, 100);
+      throw new Error(`LLM 接口 HTTP ${r.status}：${detail}`);
+    }
+    if (j?.error) throw new Error(`LLM ${r.status}: ${String(j.error?.message ?? JSON.stringify(j.error)).slice(0, 120)}`);
+    if (j?.choices?.[0]?.message) {
+      // 记下真实 prompt_tokens，用来判断何时该压缩（比按字数估算准）
+      const pt = j.usage?.prompt_tokens;
+      if (pt) promptTokens.set(sessionId, pt);
+      return j.choices[0].message;
+    }
+    lastBad = `${JSON.stringify(j ?? {}).slice(0, 80)}`;
+    console.warn(`[bot] LLM 返了 HTTP ${r.status} 没带 choices（${lastBad}），3s 后重试一把`);
+  }
+  throw new Error(`LLM 网关连着两把都回空包（少见，像是抖动）：${lastBad} —— 过一会儿再试喵`);
+}
+
+// ── 内部块泄漏抢救（10-31 群内实锤）──
+// 模型偶尔把内部工具块 [['{'type': 'tool_use', 'id': 'toolu_…', 'name':
+// 'generate_image', 'input': {…}}]] 以 Python repr 文本**整段吐成正文**：
+// 工具没执行、群里一坨语录。三层对策（见 askLLM/cleanToolArtifacts）：
+// 能解析就当真工具执行；解析不出就地重打；兜底把这类片段整段剥掉。
+// 'eom' 是独有内部指纹一起收——纯 text 块（text:None, eom:False）也会漏。
+const TOOL_TYPE_RE = /['"]type['"]\s*:\s*['"](?:tool_use|tool_call|function)['"]|['"]eom['"]\s*:/;
+
+/** 括号配对扫描：正文里「完整闭合且含内部块指纹」的片段抠出来。
+ *  群聊正常消息带这种含指纹的闭合块极罕见，误伤面可控。 */
+function findToolBlocks(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let depth = 0, start = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '[' || ch === '{') { if (depth === 0) start = i; depth++; }
+    else if (ch === ']' || ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          const seg = s.slice(start, i + 1);
+          if (TOOL_TYPE_RE.test(seg)) out.push(seg);
+          start = -1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Python repr → JSON 尽力转换（None/True/False、单引号串、裸键）。
+ *  只用于泄漏块抢救；串里有撇号之类解析失败就放弃，交给上层重打。 */
+function pyToJson(s) {
+  return s
+    .replace(/\bNone\b/g, 'null')
+    .replace(/\bTrue\b/g, 'true')
+    .replace(/\bFalse\b/g, 'false')
+    .replace(/'((?:[^'\\\n]|\\.)*)'/g, '"$1"')
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+}
+
+/** 泄漏片段 → 结构化 tool_calls（Anthropic 块格式为主）。
+ *  成功返回 [{id, type:'function', function:{name, arguments}}]，失败 null。 */
+function toolCallsFromSegments(segs) {
+  const calls = [];
+  for (const seg of segs) {
+    for (const candidate of [seg, pyToJson(seg)]) {
+      let obj = null;
+      try { obj = JSON.parse(candidate); } catch { continue; }
+      let blocks = obj;
+      if (Array.isArray(blocks) && blocks.length === 1 && Array.isArray(blocks[0])) blocks = blocks[0];
+      if (!Array.isArray(blocks)) continue;
+      for (const b of blocks) {
+        const name = b?.function?.name ?? b?.name;
+        if (!b || (b.type !== 'tool_use' && b.type !== 'function') || typeof name !== 'string') continue;
+        const args = b.input ?? b.arguments ?? b.function?.arguments ?? {};
+        calls.push({
+          id: String(b.id ?? `toolu_leak_${calls.length}`),
+          type: 'function',
+          function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+        });
+      }
+      break;   // 这段解析成了，不必再试 pyToJson 变体
+    }
+  }
+  return calls.length ? calls : null;
+}
+
+/**
+ * 清理「工具调用被当文本吐出来」的残留 —— 但只清真残留，不碰正常代码。
+ *
+ * 旧版无条件剥所有代码围栏和行内代码，群友问技术问题的答案在出群前
+ * 被静默删掉（10-30 评审）。真实残留的指纹是「内容长成工具调用 JSON 的围栏」
+ * 或伪标签语法 —— 围栏里命不中指纹就原样保留。
+ */
+function cleanToolArtifacts(s) {
+  let out = String(s ?? '');
+  // ① 围栏块：内容像工具调用 JSON（带 "name"+"arguments"/"function"）或者是
+  //    伪标签语法才删；真代码（脚本/配置片段）原样保留
+  out = out.replace(/```[a-z]*\n?([\s\S]*?)```/gi, (m, body) => {
+    const looksLikeToolCall = /"(?:name|function|arguments|tool_use)"|'(?:name|function|arguments|input|tool_use|eom)'|toolu_[A-Za-z0-9_]+|<tool_call>|<\/tool/i.test(body);
+    return looksLikeToolCall ? '' : m;
+  });
+  // ② 行内代码只删除内容确实是工具调用的（比如 `{"name":"web_search",...}`），
+  //    普通行像 `config.mjs` 一律放行
+  out = out.replace(/`([^`\n]+)`/g, (m, body) => (
+    /^\s*[{<]|"name"|['"](?:tool_use|eom)['"]|toolu_[A-Za-z0-9_]+|tool/i.test(body.trim()) ? '' : m
+  ));
+  // ③ 伪标签对（<tool_call>…</tool_call> 或任意 <tag>{json}</tag> 包工具调用的）照删：
+  //    这类语法群里正常聊天不会出现，剥了也不伤普通内容
+  out = out.replace(/<tool_call>[\s\S]*?<\/tool(?:_call)?>/gi, '');
+  out = out.replace(/<([a-z_]+)>\s*\{[\s\S]{0,300}?"(?:name|arguments)"[\s\S]{0,300}?\}\s*<\/\1>/gi, '');
+  // ④ 内部块整段泄漏（10-31 群内实锤：单引号 Python repr、不带围栏，①②③拦不住）
+  //    括号配对扫出含内部块指纹的完整片段整段剜掉；不平衡残段由 askLLM 重打路径兜
+  for (const seg of findToolBlocks(out)) out = out.split(seg).join('');
+  // ⑤ QQ 占位符号复读（2026-11-08 群内实锤：上下文里净是带 [图片] 的消息和含
+  //    「[图片][图片][图片」的个人名片，模型有样学样在回话开头挂一串 [图片] 装带图——
+  //    机器人真发图只有媒体段路由，文字里出现占位符纯属复读收口器拿掉，连空格成串拆光
+  out = out.replace(/(?:\s*\[(?:图片|语音|视频|文件|表情包?|动画表情|转发消息)\])+/g, '');
+  return out.trim();
+}
+
+/** 「[已画图: X]」是画图路由记进上下文的内部格式；模型有样学样打出来就是谎报/漏账，
+ *  这种行话不许漏到群里（10-23 事故：模型没调工具直接印「[已画图: Blackhole8伸治]」装画好）。
+ *  出群前一律剥掉，括号带不带、全角半角、带不带冒号都覆盖。 */
+function stripFakeDrawMark(s) {
+  return String(s ?? '')
+    .replace(/\[已画图\s*[:：][^\]】\n]{0,80}\]|\[已画图\]|【已画图\s*[:：]?[^】\n]{0,80}】/g, '')
+    .trim();
+}
+
+/** 群内报错的人话滤镜（10-30 评审：各路由把 e.message 裸发群——内部 URL/SDK 原文
+ *  观感差还可能泄露端点；主路径已有人话化、路由没有）。超时家族翻人话；
+ *  其它错误大多是我们自己抛的普通话，原样展示只截断。详细原文一律靠 console.error。 */
+function humanizeError(e) {
+  const raw = String(e?.message ?? e);
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    || e?.kind === 'timeout' || /The operation (?:timed out|was aborted)/i.test(raw)) {
+    return '对端半天没回话（这次请求超时了），缓一缓再试喵';
+  }
+  return raw.slice(0, 100);
+}
+
+/** 拆出末尾的「语气指令：…」行（动态语气，10-23 上线：防每条语音一个腔调）。
+ *  必须在压平空白**之前**调——那行自己占一行，压平了就跟正文搅一起拆不开了。 */
+function splitToneLine(s) {
+  const s0 = String(s ?? '');
+  const tm = /(?:^|\n)[ \t]*语气指令\s*[:：][ \t]*([^\n]{1,60})/.exec(s0);
+  if (!tm) return { text: s0, tone: '' };
+  // 只摘语气行本身，行后的内容原样保留——之前是 slice(0,index) 整段砍尾，
+  // 语气行写中间会把后面的〔视频描述〕等行话一并吞掉（10-24 评审）
+  return { text: (s0.slice(0, tm.index) + s0.slice(tm.index + tm[0].length)).trim(), tone: tm[1].trim() };
+}
+
+/** 把回话洗成能念的纯口语：剥代码块 / markdown 符号 / emoji / 内部注记，压平空白。
+ *  TTS 念不了那些东西；「语音路由」和「自动语音化」共用这一套口径。 */
+function sanitizeForSpeech(s) {
+  return String(s ?? '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/[*_`~#>｜|]/g, '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
+    .replace(/〔[^〕]*〕/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function askLLM(sessionId, userContent, extraSystem = '') {
+  const messages = [
+    { role: 'system', content: buildSystem(sessionId, extraSystem) },
+    ...historyForApi(sessionId),   // 套上媒体关联窗口：10 条内带图，更早的只留文字
+    { role: 'user', content: userContent },
+  ];
+
+  // 工具循环：模型说要调工具 -> 执行 -> 喂回去 -> 再问
+  // 注意：每一轮都必须带 tools。中途撤掉 tools 会让模型用文本伪造工具调用语法。
+  let drewImage = false;   // 本轮有没有真的调过 generate_image（防「嘴上画好了图却不存在」）
+  let dumpRetries = 0;     // 内部块泄漏抢救失败的重打计数
+  for (let round = 0; round < cfg.maxToolRounds; round++) {
+    const msg = await callLLM(sessionId, messages, true);
+    let toolCalls = msg.tool_calls?.length ? msg.tool_calls : null;
+    const rawContent = typeof msg.content === 'string' ? msg.content : contentToText(msg.content ?? '');
+    if (!toolCalls && CANNED_REFUSAL_RE.test(rawContent)) {
+      // 11-02 群内实锤（「翻译粤语」返回英文审核罐头当正文）——B站那条修复只盖了
+      // 视频总结引擎，主聊天路径也要接。打法同工具块抢救：坏回复不入上下文、
+      // 不喂回模型防学样，重打 ≤2（审核有抖动），连中 N 把就回人话兜底。
+      if (++dumpRetries <= 2) {
+        console.warn('[bot] 模型返回上游审核罐头（英文拒收提示），重打一轮');
+        continue;
+      }
+      return '这轮被上游审核拦下来了喵（模型那边回了句拒收提示），换个问法再试试～';
+    }
+    if (!toolCalls && TOOL_TYPE_RE.test(rawContent)) {
+      // 10-31 群内实锤：模型把内部工具块 [['{'type': 'tool_use', …}]] 以 Python repr
+      // 当正文整段吐出来——工具没执行，群里一坨语录。先抢救成真工具调用执行；
+      // 抢救不出就重打一轮（坏回复不入上下文、不喂回模型防学样），最多 2 次。
+      toolCalls = toolCallsFromSegments(findToolBlocks(rawContent));
+      if (toolCalls) {
+        console.warn(`[bot] 从正文抢救出 ${toolCalls.length} 个工具调用（模型漏了内部块）`);
+      } else if (++dumpRetries <= 2) {
+        console.warn('[bot] 模型把内部块吐成正文且抢救失败，重打一轮');
+        continue;
+      } else {
+        return '柴郡刚卡了一下壳喵，再叫我一次试试～';
+      }
+    }
+    if (!toolCalls) {
+      const content = cleanToolArtifacts(rawContent);
+      // 模型有样学样：上下文里全是「画好啦喵～」的成功句式，它就会跳过工具直接编一句。
+      // 声称画好 / 承诺马上画（「这就重新画」）但这轮没调过画图工具 => 图不存在，
+      // 当场戳穿让它真调工具或如实说（2026-10-21 补承诺式，改稿请求最容易嘴遁）。
+      // 10-30 评审补前置：**只在「本轮确实在聊画图」时才触发**——旁观聊天里说
+      // 「把截图发群里」被模型答「图已发出去了」/ 口头「马上画个重点」都会被旧正则
+      // 误当谎报，白烧一整轮全量上下文。行话判定（[已画图…]）不受前置约束。
+      const lastUserText = (() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            return typeof messages[i].content === 'string' ? messages[i].content : contentToText(messages[i].content);
+          }
+        }
+        return '';
+      })();
+      const drawContexted = /画|图|image|draw|动漫|立绘/i.test(lastUserText) || /已画图/.test(content);
+      //「图已发出去了」＝转发语义不是生成语义——正是评审点名的误伤样本，从触发词里摘掉
+      if (!drewImage && drawContexted
+        && /画好|画完|图片已(生成)|图已(经)?生成|\[?已画图|这就(去|重新)?画|马上(就)?画|这就给你画/.test(content)) {
+        // 谎话原样回传再指责（10-24 评审）：不回传的话下轮模型看到的是「凭空被骂」，
+        // 不知道自己错在哪、容易答非所问白费轮次
+        messages.push({
+          role: 'assistant',
+          content,
+          ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+        });
+        messages.push({
+          role: 'user',
+          content: '[系统提示：你说「画好了」，但这一轮你并没有真的调用 generate_image 工具，群里的图片并不存在。' +
+            '如果指挥官确实想要图，现在就调用 generate_image 工具；不想画或画不了就如实说，绝不许谎报。]',
+        });
+        continue;
+      }
+      // 剥掉学样打出来的「[已画图: …]」行话——真画过的图由路由/工具路径自己发图+记账，
+      // 这串文字出现在回话里只能说明模型在装，露出去群里假到肉眼难辨
+      return stripFakeDrawMark(content);
+    }
+
+    // MiMo 官方要求：思考模式下带工具调用的 assistant 消息必须完整回传
+    // reasoning_content，缺失会 400（见 MiMo 文档「深度思考-多轮对话回传要求」）
+    messages.push({
+      role: 'assistant',
+      // 抢救路径（工具调用是从正文里捞的）残渣不喂回——喂回去模型会学样接着吐
+      content: msg.tool_calls?.length ? (msg.content ?? '') : '',
+      tool_calls: toolCalls,
+      ...(msg.reasoning_content ? { reasoning_content: msg.reasoning_content } : {}),
+    });
+    // 同轮多工具并行执行（10-30 评审：模型一轮发两个搜索时逐个 await，Exa 单次
+    // 5~60s 直接翻倍）。按 tool_call_id 保序回填；失败当场转成文字结果喂回，
+    // 不让一个工具的异常炸掉整轮。
+    const toolResults = await Promise.all(toolCalls.map(async (tc) => {
+      let args = {};
+      try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { /* 保持空对象 */ }
+      if (tc.function?.name === 'generate_image') drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
+      const gid = sessionId.startsWith('group-') ? sessionId.slice(6) : null;
+      try {
+        const result = await runTool(tc.function?.name, args, gid);
+        return { tc, result };
+      } catch (e) {
+        console.warn(`[bot] 工具 ${tc.function?.name} 执行异常：`, e.message);
+        return { tc, result: `工具 ${tc.function?.name} 执行出错：${e.message}` };
+      }
+    }));
+    for (const { tc, result } of toolResults) {
+      messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+    }
+  }
+
+  // 轮数用完 -> 提示它收手出答案（仍然带 tools，见上方注释）
+  messages.push({
+    role: 'user',
+    content: '[系统提示：工具调用次数已达上限，请不要再调用任何工具，直接给出最终回答]',
+  });
+  const final = await callLLM(sessionId, messages, true);
+  const finalText = stripFakeDrawMark(cleanToolArtifacts(final.content ?? ''));
+  // 10-30 评审：最终轮还带 tool_calls / 只吐空内容时，旧版返回空串——
+  // @ 的人什么都收不到（群里静默）。兜底一句，起码知道占线挂了
+  if (!finalText) {
+    return '柴郡查不动了喵：连环调工具没出结果，换个问法或过一会再来试试～';
+  }
+  return finalText;
+}
+
+// ─────────── 上下文自动压缩 ───────────
+/** 把旧对话压成摘要，只保留最近 keepRecent 条原文 */
+async function compressHistory(gid) {
+  // ⚠️ 键名统一 group-<gid>（同 pushHistory，见那里的注释）
+  const key = `group-${gid}`;
+  const arr = history.get(key) ?? [];
+  if (arr.length <= cfg.keepRecent) return false;
+
+  const keep = arr.slice(-cfg.keepRecent);
+  const old = arr.slice(0, arr.length - cfg.keepRecent);
+  // 用纯文字版拼摘要稿：m.content 可能是 parts 数组，直接插字符串会变成 [object Object]
+  const transcript = old.map((m) => `${m.role === 'user' ? '群友' : '柴郡'}: ${m.text ?? m.content}`).join('\n');
+
+  try {
+    // 不走 askLLM（10-24 评审）：askLLM 会套 systemPrompt 人设（摘要可能带喵味）
+    // 和工具清单（理论上可能触发搜索白花钱）——压缩就是压缩，直调 callLLM 不带工具
+    const summary = (
+      await callLLM(
+        `summary-${gid}`,
+        [
+          {
+            role: 'system',
+            content: '你是上下文压缩器。把下面的群聊记录压成简明中文摘要（300 字以内），' +
+              '必须保留：人物、话题、结论、未解决的问题、关键事实与数字。' +
+              '只输出摘要本身，不要客套、不要 markdown、不要标题。',
+          },
+          { role: 'user', content: transcript },
+        ],
+        false,
+      )
+    ).trim();
+
+    groupSummary.set(key, summary);
+    history.set(key, keep);
+    // 注意：不要把 promptTokens 清零。它的语义是「上次真实请求的 prompt_tokens」，
+    // 压缩后的真实大小要等下一次请求才知道，清零会让 #上下文 显示假 0。
+    console.log(`[bot] 群 ${gid} 🗜️上下文已压缩：${old.length} 条 → 摘要 ${summary.length} 字，保留最近 ${keep.length} 条`);
+    return true;
+  } catch (e) {
+    console.warn('[bot] 上下文压缩失败:', e.message);
+    return false;
+  } finally {
+    // 压缩会话的 token 计数用完即焚（10-30 评审：img/vid/sing 会话都有 finally 清，
+    // 摘要这条漏了，promptTokens['summary-<gid>'] 会随群数永久累积）
+    promptTokens.delete(`summary-${gid}`);
+  }
+}
+
+/**
+ * 当前上下文 token 数 = **上一次真实请求的 prompt_tokens**（API 回报值）。
+ *
+ * 语义说明：这是「最近一次发给模型的上下文大小」，不是估算值。
+ * 因为 history 与 promptTokens 都在内存里，重启后一起归零——这是自洽的
+ * （重启=失忆，占用自然为 0）。在任何 LLM 调用之前查，也会是 0。
+ */
+function currentContextTokens(gid) {
+  return promptTokens.get(`group-${gid}`) ?? 0;
+}
+
+/** 达到阈值就压缩（连续压到降到阈值以下为止） */
+async function maybeCompress(gid) {
+  const limit = cfg.contextTokenLimit * cfg.compressRatio;
+  let guard = 0;
+  while (currentContextTokens(gid) >= limit && guard++ < 3) {
+    if (!(await compressHistory(gid))) break;
+  }
+}
+
+// ─────────── 消息工具 ───────────
+function segments(event) {
+  return Array.isArray(event.message) ? event.message : [];
+}
+
+function isAtMe(event, myUin, myNickname = '') {
+  if (segments(event).some((s) => s.type === 'at' && String(s.data?.qq) === String(myUin))) return true;
+  // 纯文本 @（2026-11-01 群内实锤：魅魔群成员手打「@柴油郡 随机柴郡图」三连发静默吞——
+  // 手打的只是字符不是 AT 段，原闸直接漏）。限句首匹配「@昵称」或「@柴郡」人设名，
+  // 后面接词也算（「@柴油郡谢谢请我吃饭」同样是点名）；只兜群名片=昵称的场景，
+  // 群名片带装饰前缀的（如 -ECN-柴油郡）打真 AT 不受影响、手打别名「@柴郡」照样命中。
+  const t = String(contentToText(event?.message ?? event));
+  if (!myNickname) return /^\s*@\s*柴郡/.test(t);
+  const re = new RegExp(`^\\s*@(?:${escapeRegExp(String(myNickname).trim())}|柴郡)`);
+  return re.test(t);
+}
+
+/** 正则元字符转义（昵称里可能有特殊字符） */
+function escapeRegExp(s) {
+  return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  return (content ?? []).filter((p) => p.type === 'text').map((p) => p.text).join(' ').trim();
+}
+
+function describeMedia(content) {
+  const kinds = (content ?? []).map((p) => ({ image_url: '图', audio_url: '语音', video_url: '视频' })[p.type]).filter(Boolean);
+  return kinds.length ? `[${[...new Set(kinds)].join('+')}]` : '';
+}
+
+/** 去掉 markdown 记号 —— QQ 里 **粗体** 会显示成一堆星号 */
+function stripMd(s) {
+  return s
+    .replace(/```[a-z]*\n?([\s\S]*?)```/gi, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/~~([^~\n]+)~~/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '· ')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * 把长文本拆成若干条 QQ 消息（按段落 → 句子）。
+ *
+ * **不做条数硬限制、不截断内容** —— 条数靠「让模型按预算生成」来控制
+ * （见 askLLM 的 lengthHint），这里只负责把已经生成好的文本切开发出去。
+ * 之前那种「超过 3 条就 slice 砍掉」会丢内容，已经去掉。
+ */
+function splitMessage(s, max) {
+  if (s.length <= max) return [s];
+
+  // ① 先把段落切成不超 max 的「块」（超长段落按句子切）
+  // 切句正则补了英文句号（10-30 评审）：`.` 后面跟空格才算断句（末尾强制零宽断点），
+  // 不然无换行的长英文段/带 URL 的段整个一块，超长也切不动；
+  // 单句超过 max 的硬切兜底（中文没断点符号的一整段也能切出）
+  const blocks = [];
+  for (const para of s.split(/\n{2,}/)) {
+    if (para.length <= max) { blocks.push(para); continue; }
+    let cur = '';
+    const pushChunk = (txt) => {
+      if (!txt) return;
+      while (txt.length > max) { blocks.push(txt.slice(0, max)); txt = txt.slice(max); }
+      if (cur && (cur.length + txt.length) > max) { blocks.push(cur); cur = ''; }
+      cur += txt;
+    };
+    for (const sent of para.split(/(?<=[。！？!?；;\n])(?=\S)|(?<=\.)(?=\s)/)) pushChunk(sent);
+    if (cur) blocks.push(cur);
+  }
+
+  // ② 合并短块、塞满为止 —— 少了这步会导致「N 个段落 = N 条消息」的碎片化刷屏
+  const out = [];
+  let cur = '';
+  for (const b of blocks) {
+    const joiner = cur ? '\n\n' : '';
+    if (cur && (cur.length + joiner.length + b.length) > max) {
+      out.push(cur.trim());
+      cur = b;
+    } else {
+      cur += joiner + b;
+    }
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+/**
+ * 视频走「描述式」：本轮仍发原片给模型看（不然没法解析视频），
+ * 但要它在同一次回答里顺带写一句画面描述，由系统摘走放进上下文 —— 原片不留。
+ * 零额外调用：描述和回答出自同一次请求。
+ *
+ * ⚠️ 标记用〔〕而不是尖括号：往提示词里塞工具协议的标签字面量会截断工具调用（见下篇坑 11）。
+ */
+const VIDEO_DESC_HINT =
+  '\n【额外要求】回答完之后，另起一行写「〔视频描述〕」，后面跟一句对这段视频画面的客观描述（25 字以内）。' +
+  '这一行由系统单独取走、不会发给群友，所以正文里别提到它。';
+
+/** 动态语气申报（10-23 随语音功能上线）：提示模型末尾附一行念法，系统拆走拼给 TTS */
+const TONE_HINT =
+  '\n【额外要求】回答完之后，另起一行用「语气指令：」开头，写一句 20~40 字的念法描述' +
+  '（情绪/音调/语速，贴合内容和当下的心情，每条不许雷同，' +
+  '例：得意洋洋语速快尾音上扬／困到不行慢半拍／气鼓鼓音调拔高）。' +
+  '这一行由系统单独取走、不会发给群友，所以正文里别提到它。';
+
+/** 思考强度的展示文案（启动日志和 #模型 指令共用，免得两处写得不一致） */
+function thinkingLabel() {
+  return !cfg.thinking || cfg.thinking === 'default' ? '模型默认（不传参数）' : JSON.stringify(cfg.thinking);
+}
+
+/** 给模型的长度预算说明 —— 让它自己生成「刚好装下或更少」的回复 */
+function lengthHint() {
+  const budget = cfg.maxReplyChunks * cfg.chunkChars;
+  return (
+    `【长度要求】把回答控制在约 ${budget} 字以内（这样能装进 ${cfg.maxReplyChunks} 条消息）。` +
+    '内容多时自己取舍重点、精炼表达，保持完整不残缺，宁可少写也别啰嗦。'
+  );
+}
+
+/**
+ * 发送长文本，自动分段 + 可选去 markdown。
+ * ⚠️ 参数名不能叫 `text` —— 会遮蔽从 @snowluma/sdk 导入的 text() 构造函数，
+ * 导致 text(chunks[i]) 变成「把字符串当函数调用」而抛 TypeError。
+ */
+async function sendReply(ctx, msg, { strip = true } = {}) {
+  const body = strip ? stripMd(msg) : msg;
+  if (!body) return;
+  const chunks = splitMessage(body, cfg.chunkChars);
+  for (let i = 0; i < chunks.length; i++) {
+    await ctx.reply(text(chunks[i]));
+    if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+// ─────────── 管理指令（不走 LLM，不耗 token）───────────
+/**
+ * 指令用 # 开头，也认中文关键词。**整句精确匹配**，避免误触发
+ * （比如有人聊天里说到「压缩」不该被当成指令）。
+ */
+const COMMANDS = {
+  context: ['上下文', '记忆', '查上下文', 'ctx', 'context', 'history'],
+  compress: ['压缩', '压缩上下文', 'compress', 'zip'],
+  clear: ['清空', '清空上下文', 'clear', 'reset'],
+  model: ['模型', '当前模型', 'model'],
+  // ⚠️ 只有这个是「真调大模型」的，上面三个都是纯脚本零 token
+  eat: ['吃什么', '今天吃什么', '今日吃什么', '吃啥', '三餐', '今日三餐', 'eat', 'food'],
+};
+
+function extractUserText(event) {
+  return segments(event)
+    .filter((s) => s.type === 'text')
+    .map((s) => s.data?.text ?? '')
+    .join('')
+    .replace(/\[CQ:[^\]]*\]/g, '')
+    .trim();
+}
+
+/**
+ * 从 QQ 分享卡片里抠 B 站入口（2026-11-07 群内实锤：视频分享卡是 json 段，
+ * extractUserText 只收 text 段 → 帖卡片整条静默吞、路由 zero 命中）。
+ * 卡片的 prompt/正文里带「…-哔哩哔哩】 https://b23.tv/xxxx」——只认 B 站指纹，
+ * 网易云/B站外站的 json 卡不误触发。文本段里的链接仍由 extractBvLink 负责。
+ */
+function extractBvFromCard(event) {
+  const raw = segments(event)
+    .filter((s) => s.type === 'json' || s.type === 'forward')
+    .map((s) => String(s.data?.data ?? s.data?.json ?? s.data?.content ?? ''))
+    .join('\n');
+  if (!raw) return null;
+  const m = raw.match(/https?:\/\/b23\.tv\/[0-9A-Za-z]+/i) ?? raw.match(/BV[0-9A-Za-z]{10}/);
+  return m ? m[0] : null;
+}
+
+/**
+ * 群里的显示名：**群名片优先**（大家在群里看到的名字），没设群名片才退回 QQ 昵称。
+ * ⚠️ 这俩是两个字段：拿错就会「认错人」——比如群名片叫「-ECN-柴俊」的人，
+ * QQ 昵称可能是「(阿？惊慌)报喜职员刷屏了上墙」这种，模型用后者称呼他，群里看就是认错人。
+ */
+function displayName(event) {
+  const s = event.sender ?? {};
+  return String(s.card || s.nickname || '').trim() || '群友';
+}
+
+function parseCommand(raw) {
+  const t = raw.trim().replace(/^[#＃]/, '').replace(/\s+/g, '').toLowerCase();
+  if (!t) return null;
+  for (const [cmd, aliases] of Object.entries(COMMANDS)) {
+    if (aliases.some((a) => t === a.toLowerCase())) return cmd;
+  }
+  return null;
+}
+
+/**
+ * #战绩 <玩家名>：带参数的指令，和整句精确匹配的 COMMANDS 分开认。
+ * 玩家名允许空格/特殊符号，取「战绩」后面的整段。
+ */
+function parseWtCommand(raw) {
+  const m = /^[#＃]\s*战绩[\s　]+([\s\S]+)$/.exec(raw.trim());
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * 今日老婆 / 签到 / 本命老婆（旧版 project_g2_3.py 的同名功能接回）。
+ * 沿用旧版触发词，整句精确匹配；# 前缀可带可不带（与 COMMANDS 习惯一致）。
+ * 返回 { kind: 'today' | 'today2' | 'checkin' | 'fate', arg? }，不命中 null。
+ */
+function parseWifeCommand(raw) {
+  const t = String(raw ?? '').trim().replace(/^[#＃]\s*/, '');
+  if (!t) return null;
+  if (t === '签到') return { kind: 'checkin' };
+  if (t === '今日老婆') return { kind: 'today' };
+  if (/^今日老婆\s*[2２]$/.test(t)) return { kind: 'today2' };
+  const m = /^本命老婆(?:\s*[：:]?\s*([\s\S]*))?$/.exec(t);
+  if (m) return { kind: 'fate', arg: (m[1] ?? '').trim() };
+  return null;
+}
+
+/**
+ * 生视频意图识别（和画图同理，宁漏勿错）。
+ * 必须同时有「视频/影片/动画」关键词 + 动作词；纯提「视频」俩字不接。
+ * 注意：parseDrawIntent 的文字产物名单里含「视频」，两闸互斥不抢活。
+ */
+function parseVideoIntent(raw) {
+  let t = String(raw ?? '').trim();
+  t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
+  if (!t || t.length > 80) return null;
+  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词)/.test(t)) return null;
+  if (!/(视频|影片|动画)/.test(t)) return null;
+  if (!/(?:生成|画|做|来|出|拍|给我)/.test(t)) return null;
+  return t;
+}
+
+/**
+ * 把生视频诉求翻成英文视频 prompt（独立小会话 vid-<gid>）。
+ * 同翻译层否决权：不是要视频就 NO，放行正常对话。
+ */
+async function translateVideoPrompt(sid, subj) {
+  try {
+    const msg = await callLLM(sid, [
+      {
+        role: 'system',
+        content:
+          '你是文生视频 prompt 翻译器。把用户请求翻成一段高质量的英文生视频 prompt：' +
+          '描述场景、主体、动作/镜头运动、氛围（30~80 词英文），直接输出 prompt 本身，无解释、无引号。' +
+          '如果用户的请求根本不是要生成一段视频（要代码/文字/图片/闲聊等），只回复 NO。',
+      },
+      { role: 'user', content: subj },
+    ], false);
+    const p = cleanToolArtifacts(msg.content ?? '').trim();
+    if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
+    return p.slice(0, 800);
+  } catch (e) {
+    console.warn('[bot] 生视频 prompt 翻译失败:', e.message);
+    return null;
+  }
+}
+
+/**
+ * 英文详单直通判定：主体基本是英文（CJK 字符占比 <15%）且够长，就当作现成的
+ * 细致英文 prompt——跳过翻译层原样发给生图模型（2026-10-22 指挥官指示：
+ * 这种 prompt 不许二次转手，转手只会丢细节），最多补画质词。
+ */
+function looksLikeEnglishPrompt(t) {
+  const cjk = (t.match(/[一-鿿]/g) ?? []).length;
+  return t.length >= 40 && cjk / t.length < 0.15;
+}
+
+/**
+ * 画图意图识别（意图强制路由的闸门）。
+ * 命中：@ 后「画…」开头（画一张/画个/画大凤…），或「生成/来/出 …图(片/照片)」句式。
+ * 原则：**宁漏勿错** —— 文字类产物（代码/脚本/文档…）绝对不接画，闲聊疑似灵活放行。
+ * 返回要画的主题原文（交给翻译层 Plumbing 成英文 prompt），不命中返回 null。
+ */
+function parseDrawIntent(raw) {
+  // 摘掉开头的 @某人和询呼词，剩下才是诉求本体
+  let t = String(raw ?? '').trim();
+  t = t.replace(new RegExp(cfg.beaconTrigger, 'g'), '').trim();
+  // 长度上限 5000（原 80，2026-10-22 指挥官指示）：精细画图需求（编号列表逐条提要求）
+  // 实测能到 150+ 字，80 上限把这种挡在闸门外、掉进普通对话被模型嘴上画图（坑 34 同族）。
+  // 误触风险不用怕：后面还有翻译层否决权（不是画图诉求回 NO）兜底。
+  if (!t || t.length > 5000) return null;
+  // 明确要的是文字/视频产物：接了必错，直接放行（视频走 vidgen 路由，别被画图闸抢走）
+  if (/(脚本|代码|程序|文件|文档|表格|配置|翻译|总结|摘要|作文|文章|小说|歌词|视频|影片|动画)/.test(t)) return null;
+  // 「画」必须在句首附近才算画图诉求（防「你上次画的大凤呢」这种越聊越歪的）
+  const headDraw = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}画[\s\S]{1,60}$/.test(t);
+  // 「画一张 X」「生成一张 X」：有量词就算（群里真实句式「生成一张赛车大凤」没有图字）
+  const counterDraw = /(?:画|生成)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)/.test(t);
+  // 「来张 X 的图」「生成 X 图片」：动词弱，必须有图字才认
+  const nounDraw = /(?:画|生成|来|出)\s*[^。？！]{0,50}(?:图|图片|照片)/.test(t);
+  // 「生成 X」「画 X」句首裸动词也接（10-31 群内实锤：「生成尼古喵喵中的主角佐藤雅尼子」
+  // 没有量词也没有图字，上面三条全漏 → 掉进带工具的正常对话，模型一抽风把内部工具块
+  // 整段当正文吐进群）。误触保护三道兜底：文字产物黑名单 + 长度上限 + 翻译层否决权，
+  // 「生成个跑腿脚本」「生成作文」根本到不了这。
+  const headGenerate = /^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}(?:画|生成)\s*\S[\s\S]{0,60}$/.test(t);
+  if (!headDraw && !counterDraw && !nounDraw && !headGenerate) return null;
+  return t;
+}
+
+/**
+ * 唱歌意图（唱歌路由的闸门）：「唱歌 xxx」「唱首/唱一段/唱个/来一首 xxx」，
+ * 裸「唱歌」也接（自由发挥）。返回话题原文（可为空串），不命中返回 null。
+ */
+function parseSongIntent(raw) {
+  const t = String(raw ?? '').trim();
+  const m = /^(?:唱歌|唱首|唱一段|唱个|来一首|来首歌)\s*[：:]?\s*([\s\S]{0,60})$/.exec(t);
+  if (m) return m[1].trim();
+  const m2 = /^(?:唱|来一首)\s*[：:]\s*([\s\S]{1,60})$/.exec(t);
+  return m2 ? m2[1].trim() : null;
+}
+
+// 显式语音路由的长稿切段长度（视 TTS 合成/QQ 语音单条上限，约 1 分钟语音一段）。
+// 注意：这不是字数限制——指挥官明令「显式念=无视字数」（2026-11-01），任何长度都念，
+// 只是长稿自动分多条语音连发。
+const VOICE_CHUNK_CHARS = 220;
+
+/**
+ * 语音回复意图（语音路由的闸门）。返回**完整原文**当话题（不剥触发词）——
+ * 「用日语说一段小故事」这种语言/文风要求全在触发词里，剥了模型就不知道要念日语了。
+ * 命中四类：
+ *  ①「语音：xxx」「语音说 xxx」「用语音说 xxx」（显式点名要语音）
+ *  ②「用<某种话>说/念/讲 xxx」——用日语说一段小故事…（话种列表白名单，宁漏勿错）
+ *  ③「说/念/讲一段 xxx」——明确「要我开口」的句式（10-23 事故：被当文字诉求写成长文贴墙）
+ *  ④「念一下（xx）」「念出来（xx）」（2026-11-01 群内实锤收编：光「念出来」掉普通闲聊后，
+ *     模型自己回「我发不出声音」还被自动语音化念出来，体验拧巴）——念字开局=要点语音，
+ *     与「语音：」同权同闸；主题跟着正文走（念一下telur 之类），空主题靠上下文承接。
+ *     只锁「念」字打头，不收「说/讲」——「说一下你的看法」这种诉求句不能误触发语音。
+ */
+function parseVoiceIntent(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t) return null;
+  if (/^(?:用语音说|语音说|语音)\s*[：:]?\s*[\s\S]{2,120}$/.test(t)) return t;
+  if (/^用(?:日语|中文|英文|英语|韩语|法语|德语|俄语|粤语|普通话|东北话|四川话|河南话|广东话|方言|文言)\s*(?:说|念|讲|来一段|开个腔)\s*[\s\S]{2,100}$/.test(t)) return t;
+  if (/^(?:说|念|讲)\s*一段\s*[\s\S]{2,100}$/.test(t)) return t;
+  // ⑤「用<某种声线/腔调>说/念/讲」——2026-11-10 群内实锤（乐正绫声线念咏鹅漏闸成
+  //    文字表演）：语言白名单只认话种不认声线，这里收「声线/腔调/音色/嗓音」类修饰，
+  //    只锁「用」字开局 + 五十字内自带声线名词，别的一律宁漏勿错
+  if (/^用[^\s，。！？#＃]{1,20}?(?:的)?(?:声线|腔调|音色|嗓音|念法|唱腔)\s*(?:说|念|讲|来一段|开个腔)\s*[\s\S]{2,100}$/.test(t)) return t;
+  if (/^念(?:一下|出来|出来啦|出来吧|出来呗|给我听)\s*[，,。：:]?\s*[\s\S]{0,120}$/.test(t)) return t;
+  return null;
+}
+
+/**
+ * 随机柴郡图意图（2026-10-29 指挥官指示）：「随机柴郡图」「来张柴郡猫猫」「抽一张柴郡表情包」…
+ * 必须「柴郡」+「图/表情」+ 随机词三样齐全、句子短——裸「柴郡图」不抓（可能是闲聊），
+ * 长句（问怎么画的）也不抓。返回原文，不命中 null。
+ */
+function parseCatIntent(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t || t.length > 20) return null;
+  if (!/柴郡/.test(t)) return null;
+  if (!/(图|图片|表情|动图|猫猫)/.test(t)) return null;
+  if (!/随机|[抽发]一?张|来[一]?张|换[一]?张|换[个张]/.test(t)) return null;
+  return t;
+}
+
+// ── 随机柴郡图图源：GitHub 仓库 1143520/chaijun（「柴郡 の 小窝」mao.1143520.xyz 的后端）──
+// ⚠️ 下载全程走 api.github.com（2026-10-29 实测：raw/jsdelivr/gitmirror 在本机网络全被掐，
+// 只有 api.github.com 通）——列表用 git/trees，文件用 contents 接口 + raw 媒体类型（base64 不用解，
+// Accept: raw 直接回字节流）。contents 通道实测 ≤1MB 稳通、大档超时 → 随机池限定 ≤1MB（956/1000 张）
+let chaijunCache = { at: 0, files: [] };
+let chaijunLastPick = '';   // 连着抽不重样：同一张躲一次
+async function chaijunFiles() {
+  if (Date.now() - chaijunCache.at < 60 * 60 * 1000 && chaijunCache.files.length) return chaijunCache.files;
+  const r = await fetch('https://api.github.com/repos/1143520/chaijun/git/trees/main?recursive=1', {
+    signal: AbortSignal.timeout(20 * 1000),
+  });
+  if (!r.ok) throw new Error(`图源列表拉取失败 HTTP ${r.status}`);
+  const j = await r.json();
+  const files = (j.tree ?? [])
+    .filter((t) => t.type === 'blob' && /\.(gif|png|jpe?g|webp)$/i.test(t.path) && (t.size ?? 0) <= 1024 * 1024)
+    .map((t) => ({ p: t.path, s: t.size ?? 0 }));
+  if (!files.length) throw new Error('图源列表是空的（仓库可能改了）');
+  chaijunCache = { at: Date.now(), files };
+  return files;
+}
+/** 真随机抽一张并下载成 Buffer（随机在脚本里掷，模型没有插手的环节） */
+async function randomCheshireImage() {
+  const files = await chaijunFiles();
+  let pick = files[Math.floor(Math.random() * files.length)];
+  if (pick.p === chaijunLastPick && files.length > 1) {
+    pick = files[Math.floor(Math.random() * files.length)];   // 重样就再掷一把，还不重样就认命
+  }
+  chaijunLastPick = pick.p;
+  const r = await fetch('https://api.github.com/repos/1143520/chaijun/contents/' +
+    pick.p.split('/').map(encodeURIComponent).join('/'), {
+    headers: { 'Accept': 'application/vnd.github.raw' },   // raw 媒体类型 = 直接回字节流，省 base64 解码
+    signal: AbortSignal.timeout(60 * 1000),
+  });
+  if (r.status === 403) throw new Error('GitHub 限流了（匿名 60 次/小时），过会儿再抽喵');
+  if (!r.ok) throw new Error(`图源下载失败 HTTP ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!buf.length) throw new Error('图源下载到 0 字节');
+  return buf;
+}
+
+/**
+ * 把画图诉求翻成英文生图 prompt（独立小会话，不吃群记忆、不占上下文、不带工具）。
+ * 翻译层带否决权：根本不是画图诉求时回复 NO，路由退回正常对话（双保险）。
+ * prevPrompt 有值 = 改稿模式：这是对上一次成图的修改请求，翻成「修改版 prompt」。
+ * 返回 null = 否决或空译文。
+ */
+async function translateDrawPrompt(sid, subj, prevPrompt = '') {
+  try {
+    const sys = prevPrompt
+      ? `这是对上一次 AI 生成图片的修改请求。上一次使用的英文生图 prompt：\n${prevPrompt}\n\n` +
+        '按用户的反馈修改这张图的 prompt：只改被点名的部分，没提到的保持原样，' +
+        '直接输出修改后的完整英文 prompt（30~80 词），无解释、无引号。' +
+        '身份铁律同新画模式：用户点名的要求/角色名逐项保留（同一条铁律——判定是角色' +
+        '就按官方名/原词保留到底，禁当形容词、禁换角色、禁省略），只在此基础上做点名修改。' +
+        '如果用户的反馈根本不是在要求修改这张图（纯闲聊/问别的事），只回复 NO。'
+      : '你是文生图 prompt 翻译器。把用户请求翻成一段高质量的英文生图 prompt：' +
+        '补全画面主体、风格、构图、光线等细节，直接输出 prompt 本身（40~120 词英文），无解释、无引号。' +
+        '身份铁律（指挥官明令）：这是补全提示词，不是改写需求——用户**明确点名**的主体、' +
+        '角色、人名舰名、风格、构图、否定清单，逐项原样保留并全部翻入，禁省略、禁合并、禁替换。' +
+        '点名的是不是「角色」由你自己判断：只要判定是角色（不限作品——游戏/动画/影视/' +
+        '真人/原创都算），名字就保留到底：有官方英文名/罗马音的按官方名代入，' +
+        '没有的保留原词或音译。' +
+        '⚠️ 角色的外形/发色/服饰细节**一个字都不要编**——生图模型自己认识那个角色，' +
+        '你编了的特征要是错了会直接画歪（11-10 实锤：胡德被编成白发王冠贵妇）；' +
+        '你只补场景/构图/光线/画风/画质这类**非身份**细节，除非用户亲手点名某特征。' +
+        '不许把角色名当普通形容词意译、不许换成别的角色——Formidable 仍是可畏本人。' +
+        '没被点名的细节才由你自由补全。' +
+        '用户列的编号要求/否定要求（「1.不要文字」「2.背景是X」这类）必须逐条翻进 prompt' +
+        '（否定要求用 without / no X 等英文表达），一条都不许丢。' +
+        '装备/舰船/坦克的中文别称必须翻成官方英文名，不许意译成别的词：' +
+        '（例：「挑战者2黑夜」= Challenger 2 "Black Night"、「台风」= Eurofighter Typhoon、' +
+        '「暴风」= Hawker Tempest、「彗星」= Comet、' +
+        '碧蓝航线的「纳尔逊」= Nelson、「大凤」= Taihou、「可畏」= Formidable、' +
+        '「光辉」= Illustrious、「独角兽」= Unicorn、「企业」= Enterprise、' +
+        '「欧根亲王」= Prinz Eugen、「贝尔法斯特」= Belfast、「黛朵」= Dido、「小贝法」= Little Bel、' +
+        '「圣路易斯」= St. Louis、「岛风」= Shimakaze、「大青花鱼」= Albacore；' +
+        '碰上不在表里的舰船名：先按官方英文名翻，翻不动就音译；同样别给舰娘编外形' +
+        '（同上面的铁律，生图模型自己认知）；' +
+        '绝不许把舰名当形容词意译）；' +
+        '遇到不确定的专有名词，按字面音译 + 在 prompt 里描述其特征，别编一个错误的名字。' +
+        '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。';
+    const msg = await callLLM(sid, [
+      { role: 'system', content: sys },
+      { role: 'user', content: subj },
+    ], false);
+    const p = cleanToolArtifacts(msg.content ?? '').trim();
+    if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
+    return p.slice(0, 800);   // prompt 太长也没意义，截到 800
+  } catch (e) {
+    console.warn('[bot] 生图 prompt 翻译失败:', e.message);
+    return null;
+  }
+}
+
+/**
+ * 今日老婆 / 签到 / 本命老婆：脚本直办，零 token。
+ * 步骤顺序由 wife.mjs 排好（扣魔方 → 图 → 名字 → 台词），这里只负责按序发。
+ * 图片走本地文件 base64 直发（与画图/随机柴郡图同一条媒体出口）。
+ */
+async function handleWifeCommand(wcmd, event, ctx, gid) {
+  const uid = String(event.user_id ?? '');
+  const nickname = displayName(event);
+  if (!uid) {
+    await ctx.reply(text('拿不到你的 QQ 号喵，抽不了老婆。'));
+    return;
+  }
+  let steps;
+  try {
+    steps = wife.run({ uid, nickname, kind: wcmd.kind, arg: wcmd.arg });
+  } catch (e) {
+    console.error('[bot] 老婆模块出错：', e.message);
+    try { await ctx.reply(text(`老婆系统打盹了喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  try {
+    for (const step of steps) {
+      if (step.type === 'image') {
+        // 「QQ returned no message receipt」是回执丢失型瞬时抖动（11-10 群内实锤），
+        // 按「先重试后认命」教义补一把重试；实在发不出去才报人话
+        let sent = false;
+        for (let attempt = 1; attempt <= 2 && !sent; attempt++) {
+          try {
+            const buf = readFileSync(step.path);
+            // 图片 2~5MB 走 highway 上传，SDK 默认 30s 不够，显式给 120s
+            await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+            sent = true;
+          } catch (e) {
+            if (attempt < 2) {
+              console.warn(`[bot] 老婆图第 ${attempt} 把没回执，歇 1.5s 重试：`, e.message);
+              await new Promise((r) => setTimeout(r, 1500));
+            } else {
+              console.error('[bot] 老婆图发送失败：', e.message);
+              try { await ctx.reply(text(`⚠️ 老婆图没发出去喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+            }
+          }
+        }
+        continue;
+      }
+      await sendReply(ctx, step.text, { strip: false });
+    }
+  } catch (e) {
+    console.error('[bot] 老婆指令发送出错：', e.message);
+    return;
+  }
+  const texts = steps.filter((s) => s.type === 'text').map((s) => s.text);
+  console.log(`[bot] 💍 ${wcmd.kind} 群 ${gid} <- ${nickname}(${uid}) | ${texts.join(' | ').slice(0, 100)}`);
+}
+
+async function handleCommand(cmd, gid, ctx) {
+  // ── #吃什么：唯一会真调大模型的指令 ──
+  // 用独立会话 food-<gid>：
+  //   · 不吃群聊记忆（每次都是纯随机，不会被聊天内容带偏）
+  //   · 不进上下文统计（不占用 #上下文 的额度）
+  //   · 不带工具（报菜名用不上搜索，省下 Exa 额度）
+  if (cmd === 'eat') {
+    const sid = `food-${gid}`;
+    try {
+      // 抽签交给脚本做：靠模型「自己随机」不靠谱 —— 实测它每次都往盖饭、汉堡钻。
+      // 这样随机性由 Math.random 保证、自动避开最近推过的菜，模型只剩「写推荐语」的活，挑不了食。
+      const recent = eatHistory.get(gid) ?? [];
+      const { breakfast, lunch, dinner } = pickThree(recent);
+      const picked = [breakfast.name, lunch.name, dinner.name];
+      const plain = `早餐：${breakfast.name}\n午餐：${lunch.name}\n晚餐：${dinner.name}`;
+
+      const msg = await callLLM(
+        sid,
+        [
+          { role: 'system', content: buildSystem(sid) },
+          {
+            role: 'user',
+            content: `柴郡已经替指挥官抽好了今天三餐（菜名不能改、也不能换）：\n${plain}\n\n${cfg.eatPrompt}`,
+          },
+        ],
+        false,   // 不带工具
+      );
+      const reply = cleanToolArtifacts(msg.content ?? '').trim();
+
+      // 这三道进黑名单，下次抽签自动避开（只留最近 18 个，免得越攒越长）
+      eatHistory.set(gid, [...recent, ...picked].slice(-18));
+
+      // 万一模型没按格式输出，也至少把抽签结果发出去，别让指挥官白等
+      await sendReply(ctx, reply || plain, { strip: cfg.stripMarkdown });
+    } finally {
+      promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
+    }
+    return;
+  }
+
+  // ── #模型：报当前用的模型（纯脚本零 token）──
+  // 接口那行从 llmUrl 里取主机名，以后换服务商这行会自动跟着变，不用改代码
+  if (cmd === 'model') {
+    const host = new URL(cfg.llmUrl).host;
+    const think = thinkingLabel();
+    await sendReply(
+      ctx,
+      `当前模型：${cfg.model}\n接口：${host}\n思考强度：${think}`,
+      { strip: false },
+    );
+    return;
+  }
+
+  const key = `group-${gid}`;
+  const arr = history.get(key) ?? [];
+  const summary = groupSummary.get(key);
+  const tok = currentContextTokens(gid);
+  const limit = cfg.contextTokenLimit;
+  const pct = limit ? Math.round((tok / limit) * 100) : 0;
+
+  if (cmd === 'context') {
+    await sendReply(
+      ctx,
+      `当前上下文Token 占用：${tok} / ${limit}（${pct}%，压缩阈值 ${Math.round(cfg.compressRatio * 100)}%）`,
+      { strip: false },
+    );
+    return;
+  }
+
+  if (cmd === 'compress') {
+    const before = arr.length;
+    const ok = await compressHistory(gid);
+    const after = (history.get(key) ?? []).length;
+    if (ok) {
+      // 只报条数，不报新 token 数：压缩后的真实占用要等下次请求才知道
+      await sendReply(ctx, `已压缩：${before} → ${after} 条 + 摘要`, { strip: false });
+    } else if (before <= cfg.keepRecent) {
+      await sendReply(ctx, `无需压缩：${before} 条`, { strip: false });
+    } else {
+      await sendReply(ctx, '压缩失败', { strip: false });
+    }
+    return;
+  }
+
+  if (cmd === 'clear') {
+    history.delete(key);
+    groupSummary.delete(key);
+    promptTokens.delete(key);
+    await sendReply(ctx, '已清空', { strip: false });
+  }
+}
+
+// ─────────── B站链接自动总结 ───────────
+// 直链直传引擎在 bilibili.mjs；这里只管群里的编排：
+// 缓存（2h 内同一视频秒回）、防重入（正在看再发不重复烧钱）、ack（看片要几分钟，先吭一声）。
+const bvCache = new Map();       // key -> { at, text }
+const bvBusy = new Set();        // 正在总结中的 key
+const BV_CACHE_TTL = 2 * 60 * 60 * 1000;
+const BV_CACHE_MAX = 120;        // 条数上限：超过先淘汰最老（10-30 评审：旧版只增不清，挂机数月线性涨）
+function bvCacheSet(key, value) {
+  if (!bvCache.has(key) && bvCache.size >= BV_CACHE_MAX) {
+    const oldest = bvCache.keys().next().value;
+    bvCache.delete(oldest);
+  }
+  bvCache.set(key, value);
+}
+
+async function handleBilibili(link, userText, event, ctx, gid) {
+  // 链接之外的话（去掉QQ分享标题【…】后够长）当作对视频的提问
+  const qRaw = userText
+    .replace(/【[^】]*】/g, ' ')
+    .replace(link, ' ')
+    .replace(/-哔哩哔哩/g, ' ')
+    .trim();
+  const question = qRaw.length >= 4 ? qRaw : '';
+
+  const bv = link.match(/BV[0-9A-Za-z]{10}/);
+  const pm = userText.match(/[?&]p=(\d+)/);
+  const key = `${bv ? bv[0] : link}:P${pm ? pm[1] : 1}:${question}`;
+
+  const cached = bvCache.get(key);
+  if (cached && Date.now() - cached.at < BV_CACHE_TTL) {
+    await ctx.reply(text(`这部咱看过喵～之前的总结再发一遍：\n\n${cached.text}`));
+    console.log(`[bot] B站总结 群 ${gid} <- ${key} (缓存秒回)`);
+    return;
+  }
+  if (bvBusy.has(key)) return;   // 正在看这条，别重复点火（双发=双倍烧钱）
+  bvBusy.add(key);
+  try {
+    await ctx.reply(text('收到链接喵！咱这就去看片（720P 直传，看完就回～）'));
+    const r = await summarizeVideo(link, question, (line) =>
+      console.log(`[bot] B站 群 ${gid}: ${line.slice(0, 50)}`));
+
+    const reply = `📺 ${r.title}（${r.owner}｜${r.durationText}）\n\n${r.summary}`;
+    bvCacheSet(key, { at: Date.now(), text: reply });
+
+    // 进上下文：之后群里能接着追问这部视频的内容（纯文字，不重传视频）
+    pushHistory(gid, 'user', `分享B站视频《${r.title}》${question ? ` 并问：${question}` : ''}`, true);
+    pushHistory(gid, 'assistant', `[回 ${displayName(event)}] ${reply}`);
+
+    // 长总结分段连发（和主回复同一套节流）
+    const chunks = splitMessage(reply, cfg.chunkChars);
+    for (let i = 0; i < chunks.length; i++) {
+      await ctx.reply(text(chunks[i]));
+      if (i < chunks.length - 1) await new Promise((r2) => setTimeout(r2, 500));
+    }
+    const tok = r.usage ? ` | tok=${r.usage.prompt_tokens}/${r.usage.completion_tokens}` : '';
+    console.log(`[bot] B站总结 群 ${gid} <- ${r.bvid} P${r.page} ${question ? '(带提问)' : ''} | ${r.quality}P/${r.sizeMB}MB${tok} | 已分${chunks.length}条`);
+  } finally {
+    bvBusy.delete(key);
+  }
+}
+
+// ─────────── 启动 ───────────
+const http = new SnowLumaHttpClient({ baseUrl: cfg.obHttp, accessToken: cfg.obHttpToken });
+
+// SnowLuma 没就绪时不要当场崩溃 —— 启动顺序随意，注入完自动连上。
+// 不设超时：机器人本来就是常驻服务，等多久都无所谓，别让它因为「等过头」而躺平。
+const t0 = Date.now();
+let me = null;
+for (let n = 0; ; n++) {
+  try {
+    me = await http.getLoginInfo();
+    break;
+  } catch {
+    const waited = Math.round((Date.now() - t0) / 1000);
+    if (n === 0) {
+      console.log(`[bot] SnowLuma 未就绪（${cfg.obHttp}），等待「进程注入」中……（不设超时，注入完自动连上）`);
+      console.log('[bot] 顺序随意：也可以先注入再启动机器人');
+    } else if (waited % 60 < 3) {
+      console.log(`[bot] 仍在等待 SnowLuma 注入…… 已等 ${waited}s`);
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+console.log(`[bot] 已连接 OneBot：${me.nickname} (UIN ${me.user_id})`);
+console.log(`[bot] 模型=${cfg.model}  思考=${thinkingLabel()}  冷却=${cfg.cooldownMs}ms`);
+console.log(`[bot] 触发：群内 @ 我 · 或喊「${cfg.beaconTrigger}」（寻呼信标 ->「${cfg.beaconReply}」，不用 @、不耗 token）`);
+console.log(`[bot] 指令：#上下文（查记忆） · #压缩（手动压缩） · #清空（清记忆） · #模型（查模型）——不耗 token`);
+console.log('[bot]      #战绩 <玩家名>（战争雷霆 K/D / 胜率，走 Thunderskill）');
+console.log(`[bot]      #吃什么（从 ${foodCount()} 道菜里真随机抽早/中/晚三餐，模型只写推荐语）`);
+try {
+  console.log(`[bot]      今日老婆 / 今日老婆2 / 签到 / 本命老婆 <名字>（从 ${wife.wifeCount()} 位里抽，魔方记账，不走 LLM）`);
+  const reg = wife.ensureRegisterTable();
+  if (reg.created) console.log(`[bot]      用户档不存在，已自动创建空表：${reg.path}`);
+  else if (reg.normalized) console.log(`[bot]      用户档是空文件，已补成空表：${reg.path}`);
+} catch (e) {
+  console.log(`[bot]      今日老婆 / 签到 / 本命老婆已注册（register_table 数据检查失败：${e.message}）`);
+}
+console.log(`[bot] 复读：群里出现「+1 复读」时跟着复读一次（同一内容只跟一次，防死循环）`);
+console.log(`[bot] 支持：文字 / 图片 / 视频 / 语音回复（「语音：xxx」「念一下/念出来 xx」触发 TTS 合成，字数不限、长稿自动分条）`);
+console.log(`[bot] 被@时自动补【自己发的】最近一条视频（图片一律不回溯、他人媒体一律不回溯）`);
+{
+  // 开机打一眼当前开关状态（面板改了开关不用重启，这行只在启动时打一次快照）
+  // 键与标签来自 switches-meta.mjs（唯一来源，10-30 评审：之前两处手抄已漂移）
+  const states = SWITCHES.map((s) => `${s.label}=${featureOn(s.key, s.def === 'config' ? cfg.vidgenEnabled !== false : s.def) ? '开' : '关'}`);
+  console.log(`[bot] 功能开关：${states.join(' · ')}（switches.json，每条消息现读，面板改了即刻生效）`);
+}
+
+const bot = new SnowLumaWebSocketClient({ url: cfg.obWs, accessToken: cfg.obWsToken, reconnect: true });
+
+bot.onGroupMessage(async (event, ctx) => {
+  const gid = event.group_id;
+  const userText = extractUserText(event);
+  const beacon = !!cfg.beaconTrigger && userText.includes(cfg.beaconTrigger);
+  const atMe = isAtMe(event, me.user_id, me.nickname);
+  const cmd = userText ? parseCommand(userText) : null;
+  let bvLink = null;
+  try {
+    bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);   // B站链接算「正事」，不进复读链（分享卡 json 段也算）
+  } catch (e) { console.error('[bot] bvLink 链接识别炸了：', e.message); }
+
+  if (String(event.user_id) === String(me.user_id)) return;   // 别回自己的消息（防死循环）
+
+  // ── +1 复读：有人把上一条原样再发一遍（QQ 会挂个 +1 气泡）时，机器人跟着发一次 ──
+  // 🔒 防死循环四道闸：
+  //    ① 不处理自己的消息 —— 机器人不会复读自己的复读（上面那行 return）
+  //    ② 同一个内容只跟一次 —— joined 一旦置位就不再跟，直到群里换了新内容才重置
+  //    ③ 先置位再发送 —— 就算发送失败也绝不重试，杜绝「失败重试 -> 无限刷屏」
+  //    ④ 必须换个人来重复 —— 同一个人连发同样的话不算复读
+  // 寻呼 / 指令 / @ 我都算「正事」，不参与复读，免得把复读链搅乱。
+  const last = repeatState.get(gid);
+  if (userText && !beacon && !cmd && !atMe && !bvLink && featureOn('repeat', true)) {
+    const sameAsLast = !!last && last.sig === userText;
+    const byAnother = sameAsLast && String(last.sender) !== String(event.user_id);
+
+    if (byAnother) {
+      if (!last.joined) {
+        last.joined = true;   // ⚠️ 必须先置位再发
+        try {
+          await ctx.reply(text(userText));
+          console.log(`[bot] +1 复读 群 ${gid} <- ${userText.slice(0, 18)}`);
+        } catch { /* 发不出去就算了 */ }
+      }
+      return;   // 重复的这条只负责跟一次，不进 LLM
+    }
+
+    repeatState.set(gid, {
+      sig: userText,
+      sender: String(event.user_id),
+      // 内容没变就沿用旧的 joined —— 堵死「A 发 B 发 A 发 B 发」轮流刷机器人的漏洞
+      joined: sameAsLast ? last.joined : false,
+    });
+    return;   // 普通闲聊：记一笔就走，不打扰
+  }
+  // 走到这儿的都是「打断复读链」的情况：寻呼 / 指令 / @ 我 / 纯媒体消息。
+  // 复读比的是「紧挨着的上一条」，中间插了别的东西就不算 +1 了。
+  repeatState.delete(gid);
+
+  // ⚠️ B站链接豁免这一条闸（2026-11-07 实锤回归：11-03 routeMatters 收口时,
+  // 原「bv 路由在闸前」被搬成了「闸在路由前」——纯文本链接不@也不再总结）。
+  // bv-only 的进 routeMatters 后首个分支就是 bv，命中即 return，不会误走对话。
+  if (!atMe && !(beacon && featureOn('beacon', true)) && !bvLink) return;   // 既没 @ 我、没喊寻呼、也不是 B 站链接，就当没看见
+
+  // 冷却：防刷屏（寻呼和正常回复共用一个闸门，免得刷爆）
+  const now = Date.now();
+  if (now - (lastReplyAt.get(gid) ?? 0) < cfg.cooldownMs) return;
+  lastReplyAt.set(gid, now);
+
+  // ── 寻呼信标：喊「柴郡柴郡」就自动蹦出来 ──
+  // 纯脚本回复，不走 LLM、不耗 token、瞬间到达；目的就是让指挥官搜得到机器人在哪。
+  if (beacon && featureOn('beacon', true)) {
+    try {
+      await ctx.reply(text(cfg.beaconReply));
+      console.log(`[bot] 寻呼信标触发 群 ${gid} <- ${userText.slice(0, 18)}  ->  ${cfg.beaconReply}`);
+    } catch { /* 发不出去就算了 */ }
+    if (!atMe) return;   // 只是喊一嗓子的话，到此为止，别再走 LLM
+  }
+
+  // ── B站链接 / #战绩 / 指令 / 正事：群与私聊完全同构，收口到 routeMatters ──
+  await routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink);
+});
+
+/**
+ * 正事统一入口（2026-11-03 从 onGroupMessage 尾部提炼：私聊支持要求两条入口
+ * **共用同一套路由**，防止第二份复制漂移）。调用前调用方各自把关
+ * 自跳过 / 白名单 / 冷却 / 信标这些「入口闸」。内部顺序：
+ *   B站链接即触发（免@、缓存 2h） → #战绩（纯查询） → 只读指令立即答 → 正事并发。
+ */
+async function routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink) {
+  // ── B站链接：出现就自动总结（不用 @，链接即触发）──
+  // 同一条视频 2 小时内只「看」一遍（缓存秒回），正在看的时候再发不重复点火。
+  // ⚠️ 这里不许再做旧值冷却检查（2026-11-07 探针实锤：入口闸先盖章、这里再 old 查，
+  // saw saw「刚盖的章」= 每条链接必然静默 return——11-03 收口引入的回归，免@/带@全灭）。
+  // 防刷由入口闸（1s 共享冷却）和 bvBusy（同视频防重入）负责，此处直接处理。
+  if (bvLink && featureOn('bilibili', true)) {
+    try {
+      await handleBilibili(bvLink, userText, event, ctx, gid);
+    } catch (e) {
+      console.error(`[bot] B站总结 会话 ${gid} 出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ B站视频没看成喵：${humanizeError(e)}`)); } catch { /* 发不出去就算了 */ }
+    }
+    return;
+  }
+
+  // ── 今日老婆 / 签到 / 本命老婆（纯脚本、零 token，2026-11-10 接回旧版功能）──
+  // 数据在 ../register_table/（fig_data.json 老婆池 + register_dict.json 用户表）；
+  // 命令需 @ 机器人（私聊白名单同样可用）。
+  const wcmd = parseWifeCommand(userText);
+  if (wcmd) {
+    await handleWifeCommand(wcmd, event, ctx, gid);
+    return;
+  }
+
+  // ── #战绩 <玩家名>：战争雷霆战绩查询（纯查询，不走 LLM、不耗 token）──
+  const wtNick = parseWtCommand(userText);
+  if (wtNick !== null) {
+    try {
+      if (!wtNick) {
+        await sendReply(ctx, '用法：#战绩 <游戏内昵称>\n例：#战绩 PhlyDaily', { strip: false });
+      } else {
+        const d = await wt.fetchStats(wtNick);
+        await sendReply(ctx, wt.formatStats(d), { strip: false });
+        console.log(`[bot] 会话 ${gid} #战绩 ${wtNick} -> ${d.nick}`);
+      }
+    } catch (e) {
+      console.error('[bot] #战绩 出错：', e.message);
+      try { await ctx.reply(text(`⚠️ ${e.message}`)); } catch { /* 发不出去就算了 */ }
+    }
+    return;
+  }
+
+  // ── 只读指令**立即答、不排队**（10-30 实战反馈：B站长任务在跑时连 #上下文
+  // 都要排在后面吃「在忙」，太憋屈）。#吃什么 用独立会话、#模型/#上下文 纯读——
+  // 都不写 history；写 history 的 #压缩/#清空 走正事链与对话同源才安全。
+  if (cmd && ![ 'compress', 'clear' ].includes(cmd)) {
+    try {
+      await handleCommand(cmd, gid, ctx);
+    } catch (e) {
+      console.error(`[bot] 指令 ${cmd} 出错：`, e.message);
+      try { await ctx.reply(text(`指令执行失败：${humanizeError(e)}`)); } catch { /* 连回复都失败就算了 */ }
+    }
+    return;
+  }
+
+  // ── 正事并发跑（2026-10-30 指挥官拍板：不要排队，模型能并发）──
+  // 曾试过群级串行任务链（防并发流水线双写 history 乱序），实战体感是
+  // 「长任务压住后面所有 @」，指挥官明确不要排队。已知取舍（记录在案）：
+  // 两条流水线并发时 history 插入顺序可能交错（A 的回复插在 B 的诉求后面）、
+  // 压缩可能与另一轮对话并发踩散条目——踩到了再补针对性闸。
+  // 各路由自己的错误早已各自上报，这里只兜住逃逸异常。
+  handleAtMe(event, ctx, gid, userText, atMe, cmd)
+    .catch((e) => console.error(`[bot] 会话 ${gid} 正事链异常：`, e.message));
+}
+
+// ── 私聊：**仅对白名单 QQ 号反应**（2026-11-03 指挥官指示）──
+// 会话建模成 gid='pv<QQ号>'：历史/压缩/指令键统一走 group-<gid>，全链复用；
+// 发媒体由 sendMediaSeg 的私聊分支送出。没有 @/信标/复读概念，atMe 恒真、不做冷却。
+bot.onPrivateMessage((event, ctx) => {
+  const uid = String(event.user_id);
+  if (uid === String(me.user_id)) return;                    // 自环不回（message_sent 也不理）
+  if (uid !== String(cfg.privateChatOwner)) return;          // 白名单外：一概不回、不发提示
+  const gid = `pv${uid}`;
+  const userText = extractUserText(event);
+  const cmd = userText ? parseCommand(userText) : null;
+  const bvLink = extractBvLink(userText ?? '') || extractBvFromCard(event);
+  routeMatters(event, ctx, gid, userText, true, cmd, bvLink)
+    .catch((e) => console.error(`[bot] 私聊 ${uid} 正事链异常：`, e.message));
+});
+
+// @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来便于并发调用）；
+// 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。
+async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
+
+  // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
+  // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
+  // 全程模型没有「装成功」的机会（翻 prompt 那步模型只当翻译器）。
+  // 改稿路由：刚画过的 10 分钟内，「性别错了/改一下/重画」这类没有画图句式的
+  // 追加意见也接管重画（沿用上次 prompt + 用户反馈），否则模型只会嘴上答应不干活。
+  // ── 随机柴郡图路由（2026-10-29 指挥官指示）：脚本直抓直发、不过模型——
+  // 随机在脚本里掷、图在脚本里下载，模型没有「嘴上发了」的机会（坑 34 同族预防）。
+  // 必须排在画图路由前面：「来张柴郡图」会被画图闸的 nounDraw 规则捞走。
+  const catSubj = atMe ? parseCatIntent(userText) : null;
+  if (catSubj) {
+    try {
+      await ctx.reply(text('Nyahallo～去猫窝里翻一张出来喵，稍等～'));
+      const buf = await randomCheshireImage();
+      await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+      // 进上下文一条轻记录，之后可以接着聊这张猫猫
+      pushHistory(gid, 'user', userText, `${displayName(event)}: ${userText} [要求随机柴郡图]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发随机柴郡图] Nyahallo～这张猫猫归你了喵`);
+      console.log(`[bot] 🐾 群 ${gid} 随机柴郡图已发`);
+    } catch (e) {
+      console.error('[bot] 随机柴郡图失败:', e.message);
+      try { await ctx.reply(text(`⚠️ 猫窝暂时翻不动了喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 猫图失败提示也发不出去：', e2.message); }
+    }
+    return;
+  }
+
+  const lastDraw = lastDrawByGroup.get(gid);
+  const drawSubj = atMe ? (parseDrawIntent(userText)
+    ?? (lastDraw
+      && Date.now() - lastDraw.at < 10 * 60 * 1000
+      && userText.length <= 60
+      && /(改|换|重画|重新画|不对|错了|不像|性别|再来|画错|加个|不要)/.test(userText)
+      ? userText : null)) : null;
+  const isRedraw = !!(drawSubj && !parseDrawIntent(userText) && lastDraw
+    && Date.now() - lastDraw.at < 10 * 60 * 1000);
+  let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
+  if (drawSubj && !featureOn('imggen', true)) {
+    // 生图总闸关着：直接回歇业，不进普通对话（防模型嘴上承诺画却零动作，坑 34 同族）
+    console.log(`[bot] 群 ${gid} 生图业务已暂停，直接回绝 <- ${drawSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('画画业务暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  if (drawSubj) {
+    const sid = `img-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
+    try {
+      // 英文详单直通：剥掉中文引导头（生成一张/画一张），原样发，最多补画质词；
+      // 改稿请求不直通（要结合上次 prompt 修改，必须过翻译层）
+      let prompt = null;
+      let englishDirect = false;
+      if (!isRedraw && looksLikeEnglishPrompt(drawSubj)) {
+        englishDirect = true;
+        prompt = drawSubj
+          .replace(/^(?:帮我|给我|请|柴郡|出示)?[，,。！!～\s]{0,3}(?:画|生成|来|出)\s*(?:一|两|三)?\s*(?:张|幅|个|款|副)?\s*/i, '')
+          .replace(/[。\s]+$/, '')
+          .trim();
+        if (!/detail|quality|sharp|8k|4k|high[- ]?res|photorealistic/i.test(prompt)) {
+          prompt += ', ultra-detailed, high quality, crisp detail';
+        }
+      }
+      if (!prompt) prompt = await translateDrawPrompt(sid, drawSubj, isRedraw ? lastDraw.prompt : '');
+      if (!prompt) {
+        // 翻译层否决：不是画图诉求，走正常对话继续
+        drawVeto = true;
+        console.log(`[bot] 群 ${gid} 画图意图被翻译层否决 <- ${drawSubj.slice(0, 18)}`);
+      } else {
+        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : englishDirect ? '意图路由（英文直通）' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt}`);
+        await ctx.reply(text(isRedraw
+          ? `收到喵，按「${drawSubj.slice(0, 20)}」重新画，要等十几秒～`
+          : `正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
+
+        // 路由本身有 drewImage 语义：走到这步就必然真生成真发送，不存在嘴遁环节
+        const buf = await imggen.generateImage(prompt);
+        // 大图 highway 慢传，给到 120s（坑 35）
+        await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+        const caption = isRedraw
+          ? `改好啦喵～按「${drawSubj.slice(0, 30)}」重新画了一版`
+          : `画好啦喵～给指挥官画的是：${drawSubj}`;
+        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+        await sendDrawSticker(gid);   // 画完跟一张「营业中」贴纸（意图/改稿两条线都在这）
+
+        // 记下这次的 prompt：10 分钟内的「改一下/性别错了」能接着改稿
+        lastDrawByGroup.set(gid, { prompt, subj: drawSubj, at: Date.now() });
+
+        // 进对话线（纯文字）：user 记诉求、assistant 记 [已画图]，之后可以接着聊这张画
+        pushHistory(gid, 'user', drawSubj, `${displayName(event)}: ${drawSubj}${isRedraw ? ' [要求改图]' : ' [要求画图]'}`);
+        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已画图: ${drawSubj}] ${caption}`);
+      }
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 画图出错：`, e.message);
+      // 失败提示必须送达（22:41 事故：只 log 没发群里，指挥官干等）；再发不出去也留痕
+      try { await ctx.reply(text(`⚠️ 画画失败了喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 画图失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);   // 独立会话的 token 数别留在表里越攒越多
+    }
+    if (!drawVeto) return;   // 接管成功或失败都到此为止；被否决才放行到正常对话
+  }
+
+  // ── 生视频意图强制路由（2026-10-21 上线）─────────────
+  // 放在 buildContent 之后（见下方调用处）：要支持图生视频，图来自消息本体或引用。
+  // 这里只留个声明位，实际接管在 buildContent 拿到媒体之后。
+
+  // ── 管理指令：不走 LLM、不耗 token、立即返回 ──
+  if (cmd) {
+    try {
+      await handleCommand(cmd, gid, ctx);
+    } catch (e) {
+      console.error(`[bot] 指令 ${cmd} 出错：`, e.message);
+      // 一定要给用户反馈，别让群里静悄悄
+      try {
+        await ctx.reply(text(`指令执行失败：${humanizeError(e)}`));
+      } catch { /* 连回复都失败就算了 */ }
+    }
+    return;
+  }
+
+  const content = await buildContent(event);
+  if (!content) return;
+
+  // ⚠️ 媒体加载失败必须当场说出口 —— 以前只写进 bot.err，指挥官根本不知道出了什么问题。
+  // 放在 LLM 之前发：万一后面 LLM 挂了，这条诊断也已经送达了。
+  if (content.mediaErrors?.length) {
+    try {
+      await ctx.reply(text(`⚠️ [媒体] ${content.mediaErrors.join('；')}`));
+    } catch { /* 发不出去就算了，别影响后面的回复 */ }
+  }
+
+  // ── 生视频意图强制路由（2026-10-21 上线；下午起支持图生视频）──
+  // 放在 buildContent 之后：图生视频的图来自消息本体或引用（expandReplySegs 已并进 parts）。
+  // 同画图路由：脚本接管（翻译 -> 提交 -> 轮询 -> 下载 -> 发群），模型没有装成功的机会。
+  const videoSubj = atMe ? parseVideoIntent(userText) : null;
+  let vidVeto = false;
+  if (videoSubj && !featureOn('vidgenEnabled', cfg.vidgenEnabled !== false)) {
+    // 总闸关着：直接告知歇业，不放行进普通对话（免得模型嘴上承诺「这就生成」又装成功，坑 34 同族）
+    console.log(`[bot] 群 ${gid} 生视频业务已暂停，直接回绝 <- ${videoSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('生视频业务暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  if (videoSubj) {
+    const sid = `vid-${gid}`;   // 独立翻译会话：不吃群聊记忆、不占 #上下文 额度
+    try {
+      // 图生视频：拿本轮视觉里的第一张图（消息附带的或引用里的都算）
+      const imgPart = content.parts.find((p) =>
+        p.type === 'image_url' && String(p.image_url?.url ?? '').startsWith('data:'));
+      const imgDataUrl = imgPart ? imgPart.image_url.url : '';
+
+      const prompt = await translateVideoPrompt(sid, videoSubj);
+      if (!prompt) {
+        vidVeto = true;
+        console.log(`[bot] 群 ${gid} 生视频意图被翻译层否决 <- ${videoSubj.slice(0, 18)}`);
+      } else {
+        console.log(`[bot] 🎬 ${imgDataUrl ? '图生视频' : '文生视频'}意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt}`);
+        await ctx.reply(text(imgDataUrl
+          ? `收到喵，按指挥官给的图生视频，要几分钟，别干等～`
+          : `正在给指挥官生成视频喵，这个要几分钟，先去干点别的别干等～`));
+
+        const buf = await vidgen.generateVideo(prompt, imgDataUrl);
+        // 视频比图大（实测 5.5MB/8s），highway 上传更慢，超时给到 5 分钟
+        await sendMediaSeg(gid, { type: 'video', data: { file: 'base64://' + buf.toString('base64') } }, 300 * 1000);
+        const caption = imgDataUrl
+          ? `生成好啦喵～按指挥官给的图做的是：${videoSubj}`
+          : `生成好啦喵～给指挥官做的是：${videoSubj}`;
+        await sendReply(ctx, caption, { strip: cfg.stripMarkdown });
+
+        // 进对话线（纯文字），之后可以接着聊这条视频
+        pushHistory(gid, 'user', videoSubj, `${displayName(event)}: ${videoSubj} [要求生视频${imgDataUrl ? '，按图' : ''}]`);
+        pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已生成视频: ${videoSubj}] ${caption}`);
+      }
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 生视频出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 生成视频失败了喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 生视频失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);
+    }
+    if (!vidVeto) return;
+  }
+
+  // ── 唱歌路由（2026-10-23 上线）：(唱歌) 标签是 mimo-v2.5-tts「预置音色」专属，
+  // voicedesign 不能唱（官方互斥设计）——说话用捏的柴郡声线，唱歌借预置嗓子。
+  // 流程：LLM 写歌词（独立小会话）→ (唱歌) 合成 → record 发群 → 🎵 歌词跟上。
+  const songSubj = atMe ? parseSongIntent(userText) : null;
+  if (songSubj !== null) {   // 注意用 !== null：话题为空串（裸「唱歌」）也是命中
+    const sid = `sing-${gid}`;
+    try {
+      if (!featureOn('tts', true)) {
+        console.log(`[bot] 群 ${gid} 语音功能已暂停（含唱歌），直接回绝`);
+        await ctx.reply(text('语音功能暂停营业喵，恢复时间等指挥官通知～'));
+        return;
+      }
+      const sys = '你是歌词写手。按话题写一段中文歌词，直接输出歌词本身：2~4 句、每句不超过 14 字、'
+        + '总共 30~80 字，适合演唱、有记忆点；话题太小或太怪就自由发挥。无解释、无标题、无 markdown、无 emoji。'
+        + `话题：${songSubj || '柴郡（俏皮的猫系女仆）想让指挥官开心，写一首她的俏皮短歌'}`;
+      const raw = await callLLM(sid, [
+        { role: 'system', content: sys },
+        { role: 'user', content: songSubj || '随便来一段' },
+      ], false);
+      let lyrics = stripFakeDrawMark(raw.content ?? '')
+        .replace(/```[\s\S]*?```/g, '')
+        .replace(/[*_`#>]/g, '')
+        .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')
+        .trim();
+      if (!lyrics) throw new Error('没写出能唱的词');
+      if (lyrics.length > 200) lyrics = lyrics.slice(0, 200);
+      console.log(`[bot] 🎵 唱歌路由接管 群 ${gid}：${lyrics.length} 字 <- ${songSubj.slice(0, 18) || '(自由发挥)'}`);
+      await ctx.reply(text('清清嗓子喵～歌要等十几秒就到～'));
+      const buf = await tts.generateSong(lyrics);
+      await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+      await sendReply(ctx, `🎵 ${lyrics}`, { strip: cfg.stripMarkdown });
+      pushHistory(gid, 'user', songSubj || '(想听歌)', `${displayName(event)}: 想听${songSubj ? `「${songSubj}」` : '咱唱歌'} [要求唱歌]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已唱歌] 🎵 ${lyrics}`);
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 唱歌出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 没唱出去喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 唱歌失败提示也发不出去：', e2.message); }
+    } finally {
+      promptTokens.delete(sid);
+    }
+    return;   // 接管成功或失败都到此为止
+  }
+
+  // ── 语音回复路由（2026-10-23 上线：MiMo TTS + SnowLuma record 自动转 SILK）──
+  // 触发：@ 说「语音：xxx」/「语音说 xxx」——脚本接管全程：LLM 出一段口语化回话
+  // -> TTS 合成 wav -> record 段发群 -> 文字版跟上。模型没有装成功的机会。
+  const voiceSubj = atMe ? parseVoiceIntent(userText) : null;
+  if (voiceSubj && !featureOn('tts', true)) {
+    console.log(`[bot] 群 ${gid} 语音功能已暂停，直接回绝 <- ${voiceSubj.slice(0, 18)}`);
+    try { await ctx.reply(text('语音功能暂停营业喵，恢复时间等指挥官通知～')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
+  if (voiceSubj) {
+    try {
+      // 让主 LLM 在现有群聊上下文里组织一份能念的口语稿（带本轮媒体，图片照常看得见）
+      // 动态语气（10-23）：要求它在末尾另起一行报「语气指令：…」，防每条语音一个腔调
+      // 字数不限（2026-11-01 指挥官明令：显式念=无视字数）——长稿在发送层切段连发
+      // 11-10 铁令：用户原话里明确点名的声线/腔调类要求是硬要求——语气指令行必须
+      // 原样保留那些字眼，不许改写、不许换成别的说法；补提示词只许加，不许动
+      const voiceReq = /用([\s\S]{1,30}?(?:的)?(?:声线|腔调|音色|嗓音|念法|唱腔))\s*(?:说|念|讲|来一段|开个腔)/.exec(voiceSubj)?.[1]?.trim() ?? '';
+      const raw = await askLLM(`group-${gid}`, content.parts,
+        '指挥官要求用语音回复：你的这段回话会被合成语音念到群里。字数不限——'
+        + '要念的内容是多长就组织多长，完整念完，但别为长而长。'
+        + '纯口语——不许用 markdown、表情符号、编号或换行，那些 TTS 念出来很难听。'
+        + '然后在回话末尾另起一行，用「语气指令：」开头写一句 20~40 字的念法描述'
+        + '（情绪/音调/语速，要贴合内容和当下的心情，每条都不许雷同，'
+        + '例：得意洋洋语速快尾音上扬／困到不行慢半拍／气鼓鼓音调拔高）。'
+        + (voiceReq
+          ? `指挥官明确点名了音色：「${voiceReq}」——这是硬要求，语气指令行里必须原样写进这个声线词，禁止改写成别的说法、禁止弱化或替换。`
+          : '')
+        + `要聊的话题：${voiceSubj}`);
+      // 先拆语气指令行、再洗成能念的口语（拆行必须在压平空白之前，见 splitToneLine 注释）
+      const tl = splitToneLine(stripFakeDrawMark(raw));
+      const tone = tl.tone;
+      let speak = sanitizeForSpeech(tl.text);
+      if (!speak) throw new Error('没拿到能念的话');
+      //长稿切段逐条发：QQ 语音/TTS 单条合成有长响上限，切段是发送层的必要动作（不是限字数）
+      const speakChunks = splitMessage(speak, VOICE_CHUNK_CHARS);
+      console.log(`[bot] 🎙 语音路由接管 群 ${gid}：念 ${speak.length} 字/${speakChunks.length} 条语音${tone ? `（语气：${tone}）` : '（语气：默认）'} <- ${voiceSubj.slice(0, 18)}`);
+      // 豆包「引用上文」：把指挥官的语音诉求当语境喂给 TTS，模型自己承接情绪（10-27）
+      for (let i = 0; i < speakChunks.length; i++) {
+        const buf = await tts.generateSpeech(speakChunks[i], tone, voiceSubj, voiceReq);
+        await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+        if (i < speakChunks.length - 1) await new Promise((r) => setTimeout(r, 500));
+      }
+      await sendReply(ctx, `🗣️ ${speak}`, { strip: cfg.stripMarkdown });
+
+      // 进对话线：user 记诉求、assistant 记语音说了什么，之后可以接着聊
+      pushHistory(gid, 'user', voiceSubj, `${displayName(event)}: ${voiceSubj} [要求语音回复]`);
+      pushHistory(gid, 'assistant', `[回 ${displayName(event)}] [已发语音] ${speak}`);
+    } catch (e) {
+      console.error(`[bot] 群 ${gid} 语音出错：`, e.message);
+      try { await ctx.reply(text(`⚠️ 语音没发出去喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 语音失败提示也发不出去：', e2.message); }
+    }
+    return;   // 接管成功或失败都到此为止
+  }
+
+  try {
+    // 压缩改到回复发出**之后**再跑（10-30 评审，见本 try 块末尾）：
+    // 撞上阈值的那轮不让用户先干等 30~90s 的压缩调用
+
+    const hasVideo = content.parts.some((p) => p.type === 'video_url');
+    const baseText = `${displayName(event)}: ${content.rawText || '[发来一条媒体消息]'}`;
+
+    // 视频走「描述式」：本轮发原片给模型看（否则没法解析视频），
+    // 同时要它在同一次回答里写一句画面描述，由下面摘走放进上下文。
+    let reply = (await askLLM(
+      `group-${gid}`,
+      content.parts,
+      lengthHint() + (hasVideo ? VIDEO_DESC_HINT : '')
+        // 动态语气（10-23）：语音开关开着就让它顺手申报念法；拆行在下面统一做，
+        // 就算这轮回复太长没语音化，那行行话也会被摘走、不会漏到群里
+        + (featureOn('tts', true) ? TONE_HINT : ''),
+    )).trim();
+
+    // 行话摘取改为顺序无关（10-24 评审）：TONE_HINT 和 VIDEO_DESC_HINT 没规定先后，
+    // 模型把〔视频描述〕写在语气行之后时，旧的「先拆语气再摘描述」会把描述整段吞掉——
+    // 而原片本来就不进上下文，那条视频就在记忆里消失了。现在两行各自独立正则摘除，
+    // 谁先谁后都拆得干净。
+    let videoDesc = '';
+    if (hasVideo) {
+      const m = /(?:^|\n)\s*〔视频描述〕\s*([^\n]*)/.exec(reply);
+      if (m) {
+        videoDesc = m[1].trim().slice(0, 60);   // 先去空格再截，行内只取一行不会带进语气行
+        reply = (reply.slice(0, m.index) + reply.slice(m.index + m[0].length)).trim();
+      }
+    }
+    const { text: replyBody, tone: voiceTone } = splitToneLine(reply);
+    reply = replyBody;
+
+    // 模型看到上下文里全是「[回 xxx]」开头的记录，会有样学样自己也编一个（还常编错人）。
+    // 发出去之前摘掉，署名统一由下面一行用正确的名字加。
+    reply = reply.replace(/^\s*\[回[^\]]*\]\s*/, '').trim();
+
+    // ⚠️ 历史必须在 LLM 调用之后再存 —— 否则同一条消息会同时出现在 history 和 userContent 里，
+    //    图片/视频被发两遍、白白双倍计费。
+    pushHistory(
+      gid,
+      'user',
+      stickyParts(content.parts),   // 视频不进、超大图不进
+      videoDesc ? `${baseText} [视频：${videoDesc}]` : baseText,
+    );
+    // 署名：群聊多人插话，标明这条回复是回给谁的，模型才不会张冠李戴。
+    // 用户消息本来就带「群名片: 内容」前缀，assistant 这条补上对应关系。
+    pushHistory(gid, 'assistant', `[回 ${displayName(event)}] ${reply}`);
+
+    if (!reply) return;
+    if (cfg.stripMarkdown) reply = stripMd(reply);
+    if (cfg.maxReplyChars > 0 && reply.length > cfg.maxReplyChars) {
+      reply = reply.slice(0, cfg.maxReplyChars) + '…';
+    }
+
+    // ── 自动语音化（2026-10-23 指挥官指示）：≤300 字的回复先发语音，文字版跟上 ──
+    // TTS 挂了/被审核就回退纯文字，回话不能丢；长回复（>300）维持纯文字分段连发
+    let voiceOk = false;
+    if (reply.length <= cfg.ttsAutoVoiceChars && featureOn('tts', true)) {
+      try {
+        const speak = sanitizeForSpeech(reply);
+        if (speak) {
+          // 豆包「引用上文」：把触发回复的那句用户原话当语境喂给 TTS（自动语音化 10-27 升级）
+          const buf = await tts.generateSpeech(speak, voiceTone, content.rawText);
+          await sendMediaSeg(gid, { type: 'record', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+          voiceOk = true;
+          console.log(`[bot] 🎙 群 ${gid} 自动语音：念 ${speak.length} 字${voiceTone ? `（语气：${voiceTone}）` : '（默认语气）'}`);
+        }
+      } catch (e) {
+        console.error('[bot] 自动语音失败，回退纯文字：', e.message);
+      }
+    }
+
+    // 长回复自动分段连发，避免单条被 QQ 吞掉或挤成一坨
+    const chunks = splitMessage(reply, cfg.chunkChars);
+    for (let i = 0; i < chunks.length; i++) {
+      await ctx.reply(text((voiceOk && i === 0 ? '🗣️ ' : '') + chunks[i]));
+      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 500));
+    }
+    const tok = promptTokens.get(`group-${gid}`) ?? '?';
+    console.log(`[bot] 群 ${gid}${describeMedia(content.parts)} <- ${content.rawText.slice(0, 18) || '[媒体]'}  ->  ${reply.slice(0, 22)} | tok=${tok}${chunks.length > 1 ? ` 已分${chunks.length}条` : ''}`);
+
+    // 回复发完了才压缩（10-30 评审）：撞上阈值的那轮用户已经拿到回复，
+    // 这段压缩谁也不用等。压缩与同群下一轮对话可能并发（指挥官拍板不排队）——
+    // compressHistory 的 history.set 整表替换有踩散并发条目的已知风险，踩到再补闸
+    await maybeCompress(gid);
+  } catch (e) {
+    // 超时类错误先翻译成人话（2026-10-29：裸英文「The operation timed out.」曾直接漏到群里）
+    const msg = e.name === 'TimeoutError' || e.message === 'The operation timed out.'
+      ? '对端半天没回话，这次请求超时了（服务缓一缓再试）'
+      : e.message;
+    console.error(`[bot] 群 ${gid} 出错：`, msg);
+    // 出错也要回一句，别让群里静悄悄（媒体过大、接口拒收时尤其需要）
+    try {
+      await ctx.reply(text(`柴郡这边卡住了一下喵：${String(msg).slice(0, 80)}`));
+    } catch { /* 连回复都失败就算了 */ }
+  }
+}
+// handleAtMe 到此为止 —— 它由 onGroupMessage 直接并发调用（2026-10-30 指挥官拍板不排队）
+
+await bot.connect();
+console.log('[bot] 事件流已连接，等待 @ …');
