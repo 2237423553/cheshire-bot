@@ -19,6 +19,7 @@ import * as imggen from './imggen.mjs';
 import * as vidgen from './vidgen.mjs';
 import * as tts from './tts.mjs';
 import * as wife from './wife.mjs';
+import { stripInventedAppearance } from './appearanceGate.mjs';
 import { extractBvLink, summarizeVideo } from './bilibili.mjs';
 
 // ─────────── 限制 ───────────
@@ -1237,7 +1238,8 @@ async function translateVideoPrompt(sid, subj) {
     ], false);
     const p = cleanToolArtifacts(msg.content ?? '').trim();
     if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
-    return p.slice(0, 800);
+    // 同生图：外形硬闸兜底（视频里出现角色同样会被编外形）
+    return stripInventedAppearance(p, subj).text.slice(0, 800);
   } catch (e) {
     console.warn('[bot] 生视频 prompt 翻译失败:', e.message);
     return null;
@@ -1403,7 +1405,9 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
         '角色、人名舰名、风格、构图、否定清单，逐项原样保留并全部翻入，禁省略、禁合并、禁替换。' +
         '点名的是不是「角色」由你自己判断：只要判定是角色（不限作品——游戏/动画/影视/' +
         '真人/原创都算），名字就保留到底：有官方英文名/罗马音的按官方名代入，' +
-        '没有的保留原词或音译。' +
+        '没有的保留原词或音译；拿不准官方英文名/罗马音的，直接把用户原话里的名字原词' +
+        '（中文原字）保留进 prompt——生图引擎认得中文角色名，禁止自造音译' +
+        '（11-11 实锤：霞之丘诗羽官方罗马音是 Utaha，自造成 Kasumigaoka Shu 引擎不认、画成路人）。' +
         '⚠️ 角色的外形/发色/服饰细节**一个字都不要编**——生图模型自己认识那个角色，' +
         '你编了的特征要是错了会直接画歪（11-10 实锤：胡德被编成白发王冠贵妇）；' +
         '你只补场景/构图/光线/画风/画质这类**非身份**细节，除非用户亲手点名某特征。' +
@@ -1429,7 +1433,10 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
     ], false);
     const p = cleanToolArtifacts(msg.content ?? '').trim();
     if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
-    return p.slice(0, 800);   // prompt 太长也没意义，截到 800
+    // 外形硬闸（脚本层兜底）：铁律是软约束、模型会破防（11-11 诗羽被编成银发实锤），
+    // 出口处机械删「用户没点名的发色/发型/瞳色」+「definitely not X」否定句；
+    // 用户亲口点名的特征原样保留（闸不拦用户要的东西）
+    return stripInventedAppearance(p, subj).text.slice(0, 800);   // prompt 太长也没意义，截到 800
   } catch (e) {
     console.warn('[bot] 生图 prompt 翻译失败:', e.message);
     return null;
