@@ -461,7 +461,10 @@ const TOOLS = [
       name: 'generate_image',
       description:
         '画一张图并发到群里（AI 文生图）。' +
-        '当指挥官想画画/生成图片/看某个画面时使用。' +
+        '只在指挥官**明确要求**画图/生成图片/修改上一张画好的图时使用。' +
+        '提问、咨询、知识问答（「有没有X」「X是什么」「多少X」「X贵吗」这类）' +
+        '**一律禁止用本工具**——直接用文字回答问题。' +
+        '改上一张图仅当上一轮真的画过图、且指挥官在描述对那张图的修改。' +
         'prompt 用英文写，详细描述画面主体、风格、构图、光线，例如 ' +
         '"a chubby gray cat in a royal navy uniform, cute cartoon style, warm lighting"。' +
         '生成要等几十秒，画完会自动发到群里，你只需在文字里简单说一句画了什么。' +
@@ -517,6 +520,25 @@ async function runTool(name, args, gid) {
   if (name === 'wt_stats') return wt.formatStats(await wt.fetchStats(String(args.nickname ?? '')));
   if (name === 'generate_image') return generateImageTool(args, gid);
   return '未知工具：' + name;
+}
+
+/** 画图工具的脚本硬闸（2026-11-13 群内实锤：装备问句「有没有60kg左右的弓」被模型
+ *  扯进上文女仆画图语境开了画——工具描述是软约束拦不住）。正则意图路由那条路本来
+ *  就要求显式「画/生成」措辞，不经过此闸；本闸只管 LLM 自主调工具的路径：
+ *  用户这句是疑问/咨询形（有没有/是不是/多少/为什么/问号…），且本句没有画图词、
+ *  也没有改稿动词时 → 拒绝执行，把话术喂回模型让它文字作答。 */
+function drawToolVeto(userText) {
+  const t = typeof userText === 'string' ? userText : contentToText(userText);
+  const ts = t.trim();
+  const isQuestion = /[?？]|有没有|是不是|多少|为什么|什么是|什么意思|哪有|属于不/.test(t)
+    || /[吗呢吧][\s\S]{0,2}$/.test(ts);
+  if (!isQuestion) return null;
+  // 本句明说要图/改图 → 放行（「有没有空？画一张」「能不能把背景改白」）
+  if (/画|图|照片|生成|来一|头像|壁纸|表情包/.test(t)) return null;
+  if (/改成|换成|加上|去掉|改一下|重新|重画|再来/.test(t)) return null;
+  console.log(`[bot] 🚫 画图工具被闸拒绝（提问非画图）<- ${ts.slice(0, 30)}`);
+  return '不执行画图：指挥官这句话是提问/咨询（问某样东西有没有/是多少/是什么），不是在要图。' +
+    '直接用文字回答这个问题，这一轮不要再调用画图工具。';
 }
 
 /** 画图工具：生成 -> 直接发群 -> 回执给模型。失败把原因喂回去让它如实转告 */
@@ -886,7 +908,12 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       let args = {};
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { /* 保持空对象 */ }
-      if (tc.function?.name === 'generate_image') drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
+      if (tc.function?.name === 'generate_image') {
+        // 脚本硬闸：提问/咨询形的话不准画（11-13 实锤），拦下后话术喂回让模型文字作答
+        const veto = drawToolVeto(userContent);
+        if (veto) return { tc, result: veto };
+        drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
+      }
       const gid = sessionId.startsWith('group-') ? sessionId.slice(6) : null;
       try {
         const result = await runTool(tc.function?.name, args, gid);
