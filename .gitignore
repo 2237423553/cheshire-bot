@@ -15,3 +15,5 @@ assets/
 downloaded_images/
 register_table/register_dict.json
 register_table/register_dict.json.tmp
+bot-*.log
+bot-*.err

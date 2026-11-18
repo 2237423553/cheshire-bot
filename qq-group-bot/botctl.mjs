@@ -35,6 +35,27 @@ export function isBotRunning() {
 export function restartBot() {
   const log = path.join(__dir, 'bot.log');
   const err = path.join(__dir, 'bot.err');
+  // ── 重启前备份日志（2026-11-18 指挥官令）──
+  // Start-Process 的重定向会直接覆盖旧 bot.log/bot.err，出了问题就无从回溯
+  // （11-18 旗袍合照诉求无声消失、想查旧日志发现已被抹掉，就是这个坑）。
+  // 备份为 bot-<当天日期>.log/.err；同一天多次重启以后一次的为准（只留当天）。
+  const d = new Date();
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  for (const [src, tag] of [[log, 'log'], [err, 'err']]) {
+    try {
+      if (fs.existsSync(src) && fs.statSync(src).size > 0) {
+        fs.copyFileSync(src, path.join(__dir, `bot-${day}.${tag}`));
+      }
+    } catch { /* 备份失败不挡重启 */ }
+  }
+  // 「只保留当天的」：名字带日期的备份里，非今天的顺手清掉，不堆积历史
+  try {
+    for (const f of fs.readdirSync(__dir)) {
+      if (/^bot-\d{4}-\d{2}-\d{2}\.(log|err)$/.test(f) && !f.includes(day)) {
+        fs.unlinkSync(path.join(__dir, f));
+      }
+    }
+  } catch { /* 清理失败不挡重启 */ }
   const ps = [
     "$ErrorActionPreference='SilentlyContinue'",
     "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'bun.exe' -and $_.CommandLine -like '*bot.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
