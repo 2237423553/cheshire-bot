@@ -32,6 +32,12 @@ assert.equal(isEditIntent('把图里的人物换成痞老板', true), true);
 assert.equal(isEditIntent('把背景换成夜晚', true), true);
 assert.equal(isEditIntent('把话说清楚', true), false);
 assert.equal(isEditIntent('把群名改成测试', true), false);
+// 11-18 群内实锤回归：场景式改图（无改图字面、引用图）
+const sceneReq = '全身出镜，然后让俺春物的平冢静，由比滨结衣，一色彩羽都穿修身旗袍（根据人物特性设计）几人在一起合照';
+assert.equal(isEditIntent(sceneReq, true), true);
+assert.equal(isEditIntent(sceneReq, false), false);
+assert.equal(isEditIntent('这张图的表情绝了', true), false);
+assert.equal(isEditIntent('这张图全身都露出来了？', true), false);
 assert.equal(await run(event('u', [{type:'text',data:{text:'这张图片是什么？'}},{type:'image'}])), false);
 await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少参考图片/);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), /仅支持单张/);

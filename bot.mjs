@@ -1861,7 +1861,12 @@ async function routeMatters(event, ctx, gid, userText, atMe, cmd, bvLink) {
   // 压缩可能与另一轮对话并发踩散条目——踩到了再补针对性闸。
   // 各路由自己的错误早已各自上报，这里只兜住逃逸异常。
   handleAtMe(event, ctx, gid, userText, atMe, cmd)
-    .catch((e) => console.error(`[bot] 会话 ${gid} 正事链异常：`, e.message));
+    .catch(async (e) => {
+      console.error(`[bot] 会话 ${gid} 正事链异常：`, e.message);
+      // 只写 stderr = 群里静默（11-18 实锤：引用图改图诉求无声消失）。兜底也要让群里听见
+      try { await ctx.reply(text(`柴郡这边摔了一跤喵：${humanizeError(e)}`)); }
+      catch (e2) { console.error('[bot] 正事链异常提示也发不出去：', e2.message); }
+    });
 }
 
 // ── 私聊：**仅对白名单 QQ 号反应**（2026-11-03 指挥官指示）──
@@ -2014,7 +2019,13 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
   }
 
   const content = await buildContent(event);
-  if (!content) return;
+  if (!content) {
+    // buildContent 返回空 = 整条消息没构建出任何内容——以前静默 return（幽灵静默同族），
+    // 现在必须留痕：log + 群里说一声，别让 @ 的人干等
+    console.warn(`[bot] 群 ${gid} buildContent 空内容 <- ${(userText ?? '').slice(0, 30)}`);
+    try { await ctx.reply(text('这条消息柴郡一个字都没读出来喵，再发一次试试？')); } catch { /* 发不出去就算了 */ }
+    return;
+  }
 
   // ⚠️ 媒体加载失败必须当场说出口 —— 以前只写进 bot.err，指挥官根本不知道出了什么问题。
   // 放在 LLM 之前发：万一后面 LLM 挂了，这条诊断也已经送达了。
@@ -2222,7 +2233,12 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     // 用户消息本来就带「群名片: 内容」前缀，assistant 这条补上对应关系。
     pushHistory(gid, 'assistant', `[回 ${displayName(event)}] ${reply}`);
 
-    if (!reply) return;
+    if (!reply) {
+      // LLM 回了空正文（以前静默 return = 群里无声，11-18 实锤同族）——必须让群里听见
+      console.warn(`[bot] 群 ${gid} LLM 空回复 <- ${(content.rawText || '').slice(0, 30)}`);
+      try { await ctx.reply(text('柴郡这边卡壳了喵，一时没想出话来——再说一次？')); } catch { /* 发不出去就算了 */ }
+      return;
+    }
     if (cfg.stripMarkdown) reply = stripMd(reply);
     if (cfg.maxReplyChars > 0 && reply.length > cfg.maxReplyChars) {
       reply = reply.slice(0, cfg.maxReplyChars) + '…';
