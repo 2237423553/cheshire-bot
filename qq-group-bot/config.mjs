@@ -102,12 +102,14 @@ export const cfg = {
   //   ⚠️ Grok 的 quality 不传 = auto = 生成走 low 最低档；档位上限就是 medium（没有 high）。
   // 注意中转审核很敏感，正常内容也可能被 400 拦，imggen.mjs 会如实转告。
   imggenUrl: 'https://www.sui-xiang.net/v1/images/generations',
+  imggenEditUrl: 'https://www.sui-xiang.net/v1/images/edits',
+  imggenEditProtocol: 'openai-multipart', // GPT Image edits 的 multipart 协议；需恢复中转额度后实图验收
   imggenKey: 'sk-在这里填你的生图密钥',
-  imggenModel: 'gpt-image-2',   // 2026-10-22 从 grok-imagine-image-2.0 切回（指挥官指示）
+  imggenModel: 'gpt-image-2.6-sunburst',   // 2026-11-11 指挥官指示从 gpt-image-2 切换
   // —— Grok 系参数（换回 gpt-image 系则用 imggenSize + imggenQuality:'high'）——
   imggenAspectRatio: 'auto',   // auto=模型按画面选最佳比例；要固定可填 16:9/1:1/21:9 等
   imggenResolution: '2k',      // 1k/2k，按张收费直接 2k
-  imggenSize: '1024x1024',     // 仅 gpt-image 系生效
+  imggenSize: 'auto',          // 仅 gpt-image 系生效；auto=画幅自动（模型按画面选比例）
   imggenQuality: 'high',       // gpt-image 系最高档；Grok 系上限只到 medium
 
   // ── 文生视频（sui-xiang.net Grok 通道，异步任务制，只支持文生）──
@@ -193,6 +195,7 @@ try {
 //   之前 bot/面板两处手抄已经漂移（面板漏了 TTS 三键），加键只改这里（10-30 评审）
 export const MEDIA_OVERRIDE_KEYS = [
   'imggenUrl', 'imggenKey', 'imggenModel', 'imggenSize',
+  'imggenEditUrl', 'imggenEditProtocol',
   'vidgenUrl', 'vidgenKey', 'vidgenModel', 'vidgenMaxSeconds',
   'ttsUrl', 'ttsKey', 'ttsModel', 'ttsVoiceDesign', 'ttsVoice',
   'ttsAutoVoiceChars', 'ttsSingModel', 'ttsSingUrl', 'ttsSingKey', 'ttsSingVoice',

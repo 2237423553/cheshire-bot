@@ -16,9 +16,12 @@ import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
 import * as imggen from './imggen.mjs';
+import { ImageEditRouter } from './image-edit.mjs';
+const imageEdits = new ImageEditRouter();
 import * as vidgen from './vidgen.mjs';
 import * as tts from './tts.mjs';
 import * as wife from './wife.mjs';
+import { stripInventedAppearance } from './appearanceGate.mjs';
 import { extractBvLink, summarizeVideo } from './bilibili.mjs';
 
 // ─────────── 限制 ───────────
@@ -460,7 +463,10 @@ const TOOLS = [
       name: 'generate_image',
       description:
         '画一张图并发到群里（AI 文生图）。' +
-        '当指挥官想画画/生成图片/看某个画面时使用。' +
+        '只在指挥官**明确要求**画图/生成图片/修改上一张画好的图时使用。' +
+        '提问、咨询、知识问答（「有没有X」「X是什么」「多少X」「X贵吗」这类）' +
+        '**一律禁止用本工具**——直接用文字回答问题。' +
+        '改上一张图仅当上一轮真的画过图、且指挥官在描述对那张图的修改。' +
         'prompt 用英文写，详细描述画面主体、风格、构图、光线，例如 ' +
         '"a chubby gray cat in a royal navy uniform, cute cartoon style, warm lighting"。' +
         '生成要等几十秒，画完会自动发到群里，你只需在文字里简单说一句画了什么。' +
@@ -518,6 +524,25 @@ async function runTool(name, args, gid) {
   return '未知工具：' + name;
 }
 
+/** 画图工具的脚本硬闸（2026-11-13 群内实锤：装备问句「有没有60kg左右的弓」被模型
+ *  扯进上文女仆画图语境开了画——工具描述是软约束拦不住）。正则意图路由那条路本来
+ *  就要求显式「画/生成」措辞，不经过此闸；本闸只管 LLM 自主调工具的路径：
+ *  用户这句是疑问/咨询形（有没有/是不是/多少/为什么/问号…），且本句没有画图词、
+ *  也没有改稿动词时 → 拒绝执行，把话术喂回模型让它文字作答。 */
+function drawToolVeto(userText) {
+  const t = typeof userText === 'string' ? userText : contentToText(userText);
+  const ts = t.trim();
+  const isQuestion = /[?？]|有没有|是不是|多少|为什么|什么是|什么意思|哪有|属于不/.test(t)
+    || /[吗呢吧][\s\S]{0,2}$/.test(ts);
+  if (!isQuestion) return null;
+  // 本句明说要图/改图 → 放行（「有没有空？画一张」「能不能把背景改白」）
+  if (/画|图|照片|生成|来一|头像|壁纸|表情包/.test(t)) return null;
+  if (/改成|换成|加上|去掉|改一下|重新|重画|再来/.test(t)) return null;
+  console.log(`[bot] 🚫 画图工具被闸拒绝（提问非画图）<- ${ts.slice(0, 30)}`);
+  return '不执行画图：指挥官这句话是提问/咨询（问某样东西有没有/是多少/是什么），不是在要图。' +
+    '直接用文字回答这个问题，这一轮不要再调用画图工具。';
+}
+
 /** 画图工具：生成 -> 直接发群 -> 回执给模型。失败把原因喂回去让它如实转告 */
 // ── 画图后小表情（2026-10-24 指挥官指示）：每次真画完图，跟一张「营业中」贴纸 ──
 // 文件在 assets/（gitignore 挡着、不进仓库）；读不到就静默跳过，绝不碍着画图主线
@@ -561,7 +586,9 @@ async function generateImageTool(args, gid) {
     console.warn('[bot] 生图失败:', e.message);
     // 失败原因别指望模型转告（它有时就吞了）——脚本直接发出去，返回值只要它别重复
     try {
-      await sendMediaSeg(gid, text(`⚠️ 画画失败了喵：${humanizeError(e)}`), 60 * 1000);
+      // ⚠️ SDK 的 text() 返回的是「段数组」，sendMediaSeg 要单段——直接塞数组
+      // 会发出嵌套 [[段]]，OneBot 报 segment entries must be objects（11-18 实锤）
+      await sendMediaSeg(gid, { type: 'text', data: { text: `⚠️ 画画失败了喵：${humanizeError(e)}` } }, 60 * 1000);
       return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
     } catch (e2) {
       console.error('[bot] 失败提示也发不出去:', e2.message);
@@ -885,7 +912,12 @@ async function askLLM(sessionId, userContent, extraSystem = '') {
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       let args = {};
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { /* 保持空对象 */ }
-      if (tc.function?.name === 'generate_image') drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
+      if (tc.function?.name === 'generate_image') {
+        // 脚本硬闸：提问/咨询形的话不准画（11-13 实锤），拦下后话术喂回让模型文字作答
+        const veto = drawToolVeto(userContent);
+        if (veto) return { tc, result: veto };
+        drewImage = true;   // 调过就算（哪怕失败，也已如实回报）
+      }
       const gid = sessionId.startsWith('group-') ? sessionId.slice(6) : null;
       try {
         const result = await runTool(tc.function?.name, args, gid);
@@ -1231,13 +1263,16 @@ async function translateVideoPrompt(sid, subj) {
         content:
           '你是文生视频 prompt 翻译器。把用户请求翻成一段高质量的英文生视频 prompt：' +
           '描述场景、主体、动作/镜头运动、氛围（30~80 词英文），直接输出 prompt 本身，无解释、无引号。' +
+          '专有名词（角色/人名/舰名/作品名/装备型号）一律原样保留用户原词（中文原字直接进' +
+          ' prompt，引擎自己认），禁止翻成英文/罗马音/音译（11-13 指挥官明令：名字不做转英文）。' +
           '如果用户的请求根本不是要生成一段视频（要代码/文字/图片/闲聊等），只回复 NO。',
       },
       { role: 'user', content: subj },
     ], false);
     const p = cleanToolArtifacts(msg.content ?? '').trim();
     if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
-    return p.slice(0, 800);
+    // 同生图：外形硬闸兜底（视频里出现角色同样会被编外形）
+    return stripInventedAppearance(p, subj).text.slice(0, 800);
   } catch (e) {
     console.warn('[bot] 生视频 prompt 翻译失败:', e.message);
     return null;
@@ -1402,26 +1437,17 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
         '身份铁律（指挥官明令）：这是补全提示词，不是改写需求——用户**明确点名**的主体、' +
         '角色、人名舰名、风格、构图、否定清单，逐项原样保留并全部翻入，禁省略、禁合并、禁替换。' +
         '点名的是不是「角色」由你自己判断：只要判定是角色（不限作品——游戏/动画/影视/' +
-        '真人/原创都算），名字就保留到底：有官方英文名/罗马音的按官方名代入，' +
-        '没有的保留原词或音译。' +
+        '真人/原创都算），名字一律**原样直传**——用户写什么字就保留什么字，' +
+        '中文原词直接进 prompt（生图引擎自己认识这些角色和舰船，中文名照认），' +
+        '**禁止翻成英文/罗马音/音译**（11-13 指挥官明令：名字不做转英文——' +
+        '转写错了引擎就不认得了，11-11 实锤：霞之丘诗羽官方 Utaha 被自造成 Kasumigaoka Shu 画成路人）。' +
         '⚠️ 角色的外形/发色/服饰细节**一个字都不要编**——生图模型自己认识那个角色，' +
         '你编了的特征要是错了会直接画歪（11-10 实锤：胡德被编成白发王冠贵妇）；' +
         '你只补场景/构图/光线/画风/画质这类**非身份**细节，除非用户亲手点名某特征。' +
-        '不许把角色名当普通形容词意译、不许换成别的角色——Formidable 仍是可畏本人。' +
+        '不许把角色名当普通形容词意译、不许换成别的角色。' +
         '没被点名的细节才由你自由补全。' +
         '用户列的编号要求/否定要求（「1.不要文字」「2.背景是X」这类）必须逐条翻进 prompt' +
         '（否定要求用 without / no X 等英文表达），一条都不许丢。' +
-        '装备/舰船/坦克的中文别称必须翻成官方英文名，不许意译成别的词：' +
-        '（例：「挑战者2黑夜」= Challenger 2 "Black Night"、「台风」= Eurofighter Typhoon、' +
-        '「暴风」= Hawker Tempest、「彗星」= Comet、' +
-        '碧蓝航线的「纳尔逊」= Nelson、「大凤」= Taihou、「可畏」= Formidable、' +
-        '「光辉」= Illustrious、「独角兽」= Unicorn、「企业」= Enterprise、' +
-        '「欧根亲王」= Prinz Eugen、「贝尔法斯特」= Belfast、「黛朵」= Dido、「小贝法」= Little Bel、' +
-        '「圣路易斯」= St. Louis、「岛风」= Shimakaze、「大青花鱼」= Albacore；' +
-        '碰上不在表里的舰船名：先按官方英文名翻，翻不动就音译；同样别给舰娘编外形' +
-        '（同上面的铁律，生图模型自己认知）；' +
-        '绝不许把舰名当形容词意译）；' +
-        '遇到不确定的专有名词，按字面音译 + 在 prompt 里描述其特征，别编一个错误的名字。' +
         '如果用户的请求根本不是要生成一张图片（要代码/文字/闲聊等），只回复 NO。';
     const msg = await callLLM(sid, [
       { role: 'system', content: sys },
@@ -1429,7 +1455,10 @@ async function translateDrawPrompt(sid, subj, prevPrompt = '') {
     ], false);
     const p = cleanToolArtifacts(msg.content ?? '').trim();
     if (!p || /^N[Oo]$/.test(p) || /^否/.test(p)) return null;
-    return p.slice(0, 800);   // prompt 太长也没意义，截到 800
+    // 外形硬闸（脚本层兜底）：铁律是软约束、模型会破防（11-11 诗羽被编成银发实锤），
+    // 出口处机械删「用户没点名的发色/发型/瞳色」+「definitely not X」否定句；
+    // 用户亲口点名的特征原样保留（闸不拦用户要的东西）
+    return stripInventedAppearance(p, subj).text.slice(0, 800);   // prompt 太长也没意义，截到 800
   } catch (e) {
     console.warn('[bot] 生图 prompt 翻译失败:', e.message);
     return null;
@@ -1853,6 +1882,26 @@ bot.onPrivateMessage((event, ctx) => {
 // @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来便于并发调用）；
 // 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。
 async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
+  // 在 buildContent/随机图/翻译器之前截获，禁止引用文字和媒体描述混进 prompt。
+  if (atMe) {
+    try {
+      if (await imageEdits.run({
+        event, scope: gid, enabled: featureOn('imggen', true),
+        loadReply: id => http.raw('get_msg', { message_id: id }),
+        loadImage: async segment => {
+          const loaded = await toDataUrl(segment, 'image/jpeg');
+          if (!loaded?.dataUrl) throw new Error('参考图片加载失败，请重新附图');
+          return Buffer.from(loaded.dataUrl.slice(loaded.dataUrl.indexOf(',') + 1), 'base64');
+        },
+        // 铁令：原文直传，尤其不能经过 appearanceGate（会删掉用户否定/外形词）。
+        edit: (prompt, reference) => imggen.editImage(prompt, reference),
+        send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000),
+      })) return;
+    } catch (e) {
+      await ctx.reply(text(`图生图失败：${humanizeError(e)}`));
+      return;
+    }
+  }
 
   // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
   // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
@@ -1881,14 +1930,8 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
   }
 
   const lastDraw = lastDrawByGroup.get(gid);
-  const drawSubj = atMe ? (parseDrawIntent(userText)
-    ?? (lastDraw
-      && Date.now() - lastDraw.at < 10 * 60 * 1000
-      && userText.length <= 60
-      && /(改|换|重画|重新画|不对|错了|不像|性别|再来|画错|加个|不要)/.test(userText)
-      ? userText : null)) : null;
-  const isRedraw = !!(drawSubj && !parseDrawIntent(userText) && lastDraw
-    && Date.now() - lastDraw.at < 10 * 60 * 1000);
+  const drawSubj = atMe ? parseDrawIntent(userText) : null;
+  const isRedraw = false; // 改图已由上方真实参考图通道接管，禁止历史 prompt 重画冒充编辑。
   let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
   if (drawSubj && !featureOn('imggen', true)) {
     // 生图总闸关着：直接回歇业，不进普通对话（防模型嘴上承诺画却零动作，坑 34 同族）
@@ -1919,7 +1962,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         drawVeto = true;
         console.log(`[bot] 群 ${gid} 画图意图被翻译层否决 <- ${drawSubj.slice(0, 18)}`);
       } else {
-        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : englishDirect ? '意图路由（英文直通）' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        console.log(`[bot] 🎨 ${isRedraw ? '改稿路由' : englishDirect ? '意图路由（英文直通）' : '意图路由'}接管：${drawSubj.slice(0, 30)}\n[bot]    prompt: ${prompt}`);
         await ctx.reply(text(isRedraw
           ? `收到喵，按「${drawSubj.slice(0, 20)}」重新画，要等十几秒～`
           : `正在给指挥官画「${drawSubj.slice(0, 30)}」喵，画画要等十几秒到一分钟，别急～`));
@@ -2005,7 +2048,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         vidVeto = true;
         console.log(`[bot] 群 ${gid} 生视频意图被翻译层否决 <- ${videoSubj.slice(0, 18)}`);
       } else {
-        console.log(`[bot] 🎬 ${imgDataUrl ? '图生视频' : '文生视频'}意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt.slice(0, 90)}`);
+        console.log(`[bot] 🎬 ${imgDataUrl ? '图生视频' : '文生视频'}意图路由接管：${videoSubj.slice(0, 30)}\n[bot]    prompt: ${prompt}`);
         await ctx.reply(text(imgDataUrl
           ? `收到喵，按指挥官给的图生视频，要几分钟，别干等～`
           : `正在给指挥官生成视频喵，这个要几分钟，先去干点别的别干等～`));

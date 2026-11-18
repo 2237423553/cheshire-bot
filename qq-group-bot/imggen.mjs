@@ -12,6 +12,48 @@ import { classifyUpstreamError } from './providers.mjs';
 
 const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可贵等也不要误报
 
+/** 显式启用的 OpenAI multipart 编辑协议。绝不推测 URL/能力、不降级、不自动重试付费任务。
+ * options 仅用于离线 mock 注入；运行时默认使用 cfg/fetch。prompt 不做 trim/改写。 */
+export async function editImage(prompt, image, { config = cfg, fetchImpl = fetch } = {}) {
+  if (!config.imggenEditUrl || config.imggenEditProtocol !== 'openai-multipart') {
+    throw new Error('图生图尚未启用：需确认服务商支持编辑协议，并配置 imggenEditUrl 和 imggenEditProtocol=openai-multipart；不会转文生图');
+  }
+  if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('缺少本轮改图文字');
+  if (!Buffer.isBuffer(image) || !image.length) throw new Error('缺少真实参考图片');
+  // 真实字节识别格式，不把任意错误页当图片上传。
+  const mime = image.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png'
+    : image[0] === 255 && image[1] === 216 && image[2] === 255 ? 'image/jpeg'
+    : image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP' ? 'image/webp' : null;
+  if (!mime) throw new Error('参考图片仅支持 PNG、JPEG、WebP');
+  const form = new FormData();
+  form.set('model', config.imggenModel);
+  form.set('prompt', prompt);
+  form.set('image', new Blob([image], { type: mime }), 'reference.' + mime.split('/')[1]);
+  form.set('n', '1');
+  if (config.imggenQuality) form.set('quality', config.imggenQuality);
+  if (config.imggenSize) form.set('size', config.imggenSize);
+  const r = await fetchImpl(config.imggenEditUrl, {
+    method: 'POST', headers: { Authorization: `Bearer ${config.imggenKey}` },
+    body: form, signal: AbortSignal.timeout(TIMEOUT),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error || j.code) {
+    const kind = classifyUpstreamError(r.status, j.error ?? j);
+    if (kind === 'quota') throw new Error('图生图 API 额度已用完，请充值或调整 Key 限额；未转文生图');
+    if (kind === 'moderation') throw new Error('图生图被服务商安全审核拒绝；用户原文未修改，未自动重试');
+    if (kind === 'key') throw new Error('图生图 API Key 无效或无权限');
+    if (kind === 'rate') throw new Error('图生图接口限流，请稍后再试；未自动重试');
+    throw new Error(`图生图编辑接口失败（HTTP ${r.status}），请检查编辑协议/权限/额度；未转文生图`);
+  }
+  const d = j.data?.[0];
+  if (d?.b64_json) {
+    const output = Buffer.from(d.b64_json, 'base64');
+    if (output.length) return output;
+  }
+  // 首版只接受 b64_json；不从不受信任的响应 URL 发起额外请求。
+  throw new Error('编辑接口未返回有效 b64_json 图片，请核对服务商响应协议');
+}
+
 /** 画一张图，返回 PNG Buffer。失败抛 Error（消息直接给模型/群里看）。
  *  外壳只做参数校验；真正的抓取在内层（429 限流时内层自己等一把重试，最多重试 3 次）。 */
 export async function generateImage(prompt) {

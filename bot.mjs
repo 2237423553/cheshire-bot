@@ -16,6 +16,8 @@ import { pickThree, foodCount } from './foods.mjs';
 import * as exa from './exa.mjs';
 import * as wt from './wt.mjs';
 import * as imggen from './imggen.mjs';
+import { ImageEditRouter } from './image-edit.mjs';
+const imageEdits = new ImageEditRouter();
 import * as vidgen from './vidgen.mjs';
 import * as tts from './tts.mjs';
 import * as wife from './wife.mjs';
@@ -584,7 +586,9 @@ async function generateImageTool(args, gid) {
     console.warn('[bot] 生图失败:', e.message);
     // 失败原因别指望模型转告（它有时就吞了）——脚本直接发出去，返回值只要它别重复
     try {
-      await sendMediaSeg(gid, text(`⚠️ 画画失败了喵：${humanizeError(e)}`), 60 * 1000);
+      // ⚠️ SDK 的 text() 返回的是「段数组」，sendMediaSeg 要单段——直接塞数组
+      // 会发出嵌套 [[段]]，OneBot 报 segment entries must be objects（11-18 实锤）
+      await sendMediaSeg(gid, { type: 'text', data: { text: `⚠️ 画画失败了喵：${humanizeError(e)}` } }, 60 * 1000);
       return '画画失败，失败原因已经直接发到群里了。简短回应一句即可，不要重复报错细节。';
     } catch (e2) {
       console.error('[bot] 失败提示也发不出去:', e2.message);
@@ -1878,6 +1882,26 @@ bot.onPrivateMessage((event, ctx) => {
 // @ 我之后的全部正事路由从这里整段承接（从 onGroupMessage 搬出来便于并发调用）；
 // 头部那几样解析产物直接当参数传进来，缩进保持原样、语义零变化。
 async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
+  // 在 buildContent/随机图/翻译器之前截获，禁止引用文字和媒体描述混进 prompt。
+  if (atMe) {
+    try {
+      if (await imageEdits.run({
+        event, scope: gid, enabled: featureOn('imggen', true),
+        loadReply: id => http.raw('get_msg', { message_id: id }),
+        loadImage: async segment => {
+          const loaded = await toDataUrl(segment, 'image/jpeg');
+          if (!loaded?.dataUrl) throw new Error('参考图片加载失败，请重新附图');
+          return Buffer.from(loaded.dataUrl.slice(loaded.dataUrl.indexOf(',') + 1), 'base64');
+        },
+        // 铁令：原文直传，尤其不能经过 appearanceGate（会删掉用户否定/外形词）。
+        edit: (prompt, reference) => imggen.editImage(prompt, reference),
+        send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000),
+      })) return;
+    } catch (e) {
+      await ctx.reply(text(`图生图失败：${humanizeError(e)}`));
+      return;
+    }
+  }
 
   // 不信模型的自觉（坑 34：它见惯「画好啦喵～」会跳过工具装成功），
   // 命中画图句式时脚本直接接管：翻译 prompt -> 生图 -> 发群 -> 报告，
@@ -1906,14 +1930,8 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
   }
 
   const lastDraw = lastDrawByGroup.get(gid);
-  const drawSubj = atMe ? (parseDrawIntent(userText)
-    ?? (lastDraw
-      && Date.now() - lastDraw.at < 10 * 60 * 1000
-      && userText.length <= 60
-      && /(改|换|重画|重新画|不对|错了|不像|性别|再来|画错|加个|不要)/.test(userText)
-      ? userText : null)) : null;
-  const isRedraw = !!(drawSubj && !parseDrawIntent(userText) && lastDraw
-    && Date.now() - lastDraw.at < 10 * 60 * 1000);
+  const drawSubj = atMe ? parseDrawIntent(userText) : null;
+  const isRedraw = false; // 改图已由上方真实参考图通道接管，禁止历史 prompt 重画冒充编辑。
   let drawVeto = false;   // 翻译层否决 = 不是画图诉求，退回正常对话（不许静默挂起）
   if (drawSubj && !featureOn('imggen', true)) {
     // 生图总闸关着：直接回歇业，不进普通对话（防模型嘴上承诺画却零动作，坑 34 同族）
