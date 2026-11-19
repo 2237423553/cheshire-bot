@@ -194,6 +194,7 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
   const MODERATION_RE = CANNED_REFUSAL_RE;
 
   let modTries = 0;
+  let emptyTries = 0;      // 「200 空正文」重试计次（只想不写的思考模型空包）
   let zhRetried = false;   // 语言MISS（英文出稿）重打计次：只放一次额外轮
   for (let attempt = 1; attempt <= 3; attempt++) {
     const { url: directUrl, quality, sizeMB } = await fetchDirectUrl(bvid, pg.cid, (m) => onStep(m));
@@ -215,7 +216,18 @@ export async function summarizeVideo(input, question = '', onStep = () => {}) {
     });
 
     const content = j.choices?.[0]?.message?.content;
-    if (!content) throw new Error(`LLM 没返回正文：${JSON.stringify(j).slice(0, 300)}`);
+    if (!content) {
+      // 空正文不再当场抛（2026-11-19 空指部实锤：HTTP 200、reasoning_content 一大篇、
+      // content 空串、finish_reason=stop——思考模型偶发的「只想不写」空包）。
+      // 按教义先重试后认命：继续循环（直链重取），连着两把空才明着报错。
+      emptyTries++;
+      const finish = j.choices?.[0]?.finish_reason ?? '?';
+      if (emptyTries >= 2) {
+        throw new Error(`LLM 连着 ${emptyTries} 把只思考没写正文（finish_reason=${finish}），这条视频总结不了，过一会儿再试`);
+      }
+      onStep('模型只出思考没写正文（空包抖动），缓一缓重试一把…');
+      continue;
+    }
 
     if (MODERATION_RE.test(content)) {
       modTries++;
