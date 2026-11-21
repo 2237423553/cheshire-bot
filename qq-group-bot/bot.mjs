@@ -6,8 +6,9 @@
 //  所以被 @ 时若本条没有媒体，就回溯群历史，把最近的媒体一并喂给模型。
 // ═══════════════════════════════════════════════════════════
 import { readFile } from 'node:fs/promises';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { SnowLumaHttpClient, SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { cfg } from './config.mjs';
 import { assertSafeUrl, CANNED_REFUSAL_RE } from './providers.mjs';
@@ -564,6 +565,23 @@ async function sendDrawSticker(gid) {
   }
 }
 
+// ── 生成图落盘（2026-11-19 指挥官指示）：生图链路产出的图存一份到本地 generated/，
+// 群里看得着、电脑里也找得着，不用去浏览器下载里翻。文件名带用途+日期时间；
+// 落盘失败只留日志，绝不挡发群。
+const GEN_DIR = fileURLToPath(new URL('./generated', import.meta.url));
+function saveGeneratedImage(buf, tag) {
+  try {
+    mkdirSync(GEN_DIR, { recursive: true });   // recursive：已存在不抛
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    const name = `${tag}-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}.png`;
+    writeFileSync(path.join(GEN_DIR, name), buf);
+    console.log(`[bot] 💾 生成图已存 generated/${name}（${Math.round(buf.length / 1024)}KB）`);
+  } catch (e) {
+    console.warn('[bot] 生成图落盘失败（不影响发群）:', e.message);
+  }
+}
+
 /** 发单段媒体（image/video/record/text）——群里和私聊发媒体的**唯一出口**（10-30 评审：
  *  旧版 6 处复制粘贴，超时参数/贴纸时机散落，改一处漏五处；2026-11-03 私聊支持：
  *  gid 以 'pv' 开头 = 私聊会话（pv<QQ号>），走 send_private_msg）。
@@ -598,6 +616,7 @@ async function generateImageTool(args, gid) {
   try {
     // 2~3MB 图走 highway 上传可能超过 SDK 默认 30s，实测超时报「发送失败」其实 QQ 侧还在传
     await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+    saveGeneratedImage(buf, 'draw');
   } catch (e) {
     console.warn('[bot] 图片发送失败:', e.message);
     return `图已经画好了（${Math.round(buf.length / 1024)}KB）但发到群里失败：${e.message}`;
@@ -1900,7 +1919,8 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         },
         // 铁令：原文直传，尤其不能经过 appearanceGate（会删掉用户否定/外形词）。
         edit: (prompt, reference) => imggen.editImage(prompt, reference),
-        send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000),
+        send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000)
+          .then(() => saveGeneratedImage(output, 'img2img')),
       })) return;
     } catch (e) {
       await ctx.reply(text(`图生图失败：${humanizeError(e)}`));
@@ -1976,6 +1996,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         const buf = await imggen.generateImage(prompt);
         // 大图 highway 慢传，给到 120s（坑 35）
         await sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }, 120 * 1000);
+        saveGeneratedImage(buf, 'draw');
         const caption = isRedraw
           ? `改好啦喵～按「${drawSubj.slice(0, 30)}」重新画了一版`
           : `画好啦喵～给指挥官画的是：${drawSubj}`;
