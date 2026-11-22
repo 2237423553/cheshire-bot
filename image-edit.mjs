@@ -50,7 +50,7 @@ export class ImageEditRouter {
     if (value && this.now() - value.at < this.ttl) return value.image;
     this.successes.delete(key); return null;
   }
-  async run({ event, scope, enabled, loadReply, loadImage, edit, send }) {
+  async run({ event, scope, enabled, loadReply, loadImage, edit, send, ack }) {
     const segs = Array.isArray(event.message) ? event.message : [];
     const prompt = originalEditText(event);
     const attached = segs.filter(s => s.type === 'image');
@@ -70,6 +70,9 @@ export class ImageEditRouter {
     if (candidates.length > 1) throw new Error('首版仅支持单张参考图，请只附上或引用一张图片');
     const reference = candidates.length ? await loadImage(candidates[0]) : this.previous(scope, event.user_id);
     if (!reference?.length) throw new Error('缺少参考图片，请附图、引用单图，或修改你在本会话十分钟内的成功图');
+    // 「收到」回执 + 接管日志（11-19 实锤：编辑一把 1~3 分钟且全程无日志，
+    // 群里体感就是没反应——出图慢可以等，无声干等不行）
+    if (ack) { try { await ack(); } catch { /* 回执发不出去不挡正事 */ } }
     const output = await edit(prompt, reference);
     await send(output);
     this.remember(scope, event.user_id, output);

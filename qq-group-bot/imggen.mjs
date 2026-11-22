@@ -12,7 +12,9 @@ import { classifyUpstreamError } from './providers.mjs';
 
 const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可贵等也不要误报
 
-/** 显式启用的 OpenAI multipart 编辑协议。绝不推测 URL/能力、不降级、不自动重试付费任务。
+/** 显式启用的 OpenAI multipart 编辑协议。绝不推测 URL/能力、不降级、不自动转文生图。
+ * 429 限流按「先重试后认命」教义等一把再试（11-19 实锤：11-17 首次编辑的 429 就是瞬时的，
+ * 当场认输会让群里白吃一次失败提示）。其余错误仍当场明报。
  * options 仅用于离线 mock 注入；运行时默认使用 cfg/fetch。prompt 不做 trim/改写。 */
 export async function editImage(prompt, image, { config = cfg, fetchImpl = fetch } = {}) {
   if (!config.imggenEditUrl || config.imggenEditProtocol !== 'openai-multipart') {
@@ -20,6 +22,10 @@ export async function editImage(prompt, image, { config = cfg, fetchImpl = fetch
   }
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('缺少本轮改图文字');
   if (!Buffer.isBuffer(image) || !image.length) throw new Error('缺少真实参考图片');
+  return editImageInner(prompt, image, 0, { config, fetchImpl });
+}
+
+async function editImageInner(prompt, image, attempt, { config, fetchImpl }) {
   // 真实字节识别格式，不把任意错误页当图片上传。
   const mime = image.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png'
     : image[0] === 255 && image[1] === 216 && image[2] === 255 ? 'image/jpeg'
@@ -42,7 +48,14 @@ export async function editImage(prompt, image, { config = cfg, fetchImpl = fetch
     if (kind === 'quota') throw new Error('图生图 API 额度已用完，请充值或调整 Key 限额；未转文生图');
     if (kind === 'moderation') throw new Error('图生图被服务商安全审核拒绝；用户原文未修改，未自动重试');
     if (kind === 'key') throw new Error('图生图 API Key 无效或无权限');
-    if (kind === 'rate') throw new Error('图生图接口限流，请稍后再试；未自动重试');
+    // 429 先重试后认命：Retry-After 给多久等多久（封顶 90s），最多 2 把重试
+    if (kind === 'rate') {
+      if (attempt >= 2) throw new Error('图生图接口限流（429 重试 2 次都不行），中转在限流高峰——过几分钟再试');
+      const wait = Math.min(Number(r.headers.get('retry-after')) || 30, 90);
+      console.warn(`[bot] 图生图限流（429），等 ${wait}s 重试（第 ${attempt + 1}/2 次）`);
+      await new Promise((res) => setTimeout(res, wait * 1000));
+      return editImageInner(prompt, image, attempt + 1, { config, fetchImpl });
+    }
     throw new Error(`图生图编辑接口失败（HTTP ${r.status}），请检查编辑协议/权限/额度；未转文生图`);
   }
   const d = j.data?.[0];

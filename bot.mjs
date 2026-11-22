@@ -1918,7 +1918,12 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
           return Buffer.from(loaded.dataUrl.slice(loaded.dataUrl.indexOf(',') + 1), 'base64');
         },
         // 铁令：原文直传，尤其不能经过 appearanceGate（会删掉用户否定/外形词）。
-        edit: (prompt, reference) => imggen.editImage(prompt, reference),
+        // 日志必须有（11-19 教训：编辑路径全程零日志，排查只能靠猜时间线）
+        ack: () => ctx.reply(text('收到喵，按指挥官给的图改，要等十几秒到一分钟～')),
+        edit: (prompt, reference) => {
+          console.log(`[bot] 🖌 图生图接管：${prompt.slice(0, 60)}（参考图 ${Math.round(reference.length / 1024)}KB）`);
+          return imggen.editImage(prompt, reference);
+        },
         send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000)
           .then(() => saveGeneratedImage(output, 'img2img')),
       })) return;
