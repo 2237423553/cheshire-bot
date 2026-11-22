@@ -22,8 +22,10 @@ export function isEditIntent(raw, hasReference = false) {
   // 问句与评论（这张图的表情绝了）不算。
   if (hasReference && !/[?？]/.test(t) && !/(?:什么|怎么|为什么|是不是|多少|哪里)/.test(t)
     && /(?:出镜|合照|合影|都穿|穿上|换装)/.test(t)) return true;
-  return hasReference && /^(?:请|帮我|给我)?\s*(?:画|生成)\s*\S/s.test(t)
-    && !/^(?:请|帮我|给我)?\s*(?:画|生成).{0,12}(?:代码|脚本|文档|视频)/s.test(t);
+  // 引用/附带图 + 画/生成诉求走真参考图编辑（11-19 实锤：「再生成一个第三人称
+  // 视角的。」句首多个「再」字没被接住，落去文生图凭空编了张无关图）。
+  return hasReference && /^(?:请|帮我|给我)?\s*(?:再|重新)?\s*(?:画|生成)\s*\S/s.test(t)
+    && !/^(?:请|帮我|给我)?\s*(?:再|重新)?\s*(?:画|生成).{0,12}(?:代码|脚本|文档|视频)/s.test(t);
 }
 
 export class ImageEditRouter {

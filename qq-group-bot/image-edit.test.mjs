@@ -38,6 +38,11 @@ assert.equal(isEditIntent(sceneReq, true), true);
 assert.equal(isEditIntent(sceneReq, false), false);
 assert.equal(isEditIntent('这张图的表情绝了', true), false);
 assert.equal(isEditIntent('这张图全身都露出来了？', true), false);
+// 11-19 群内实锤回归：「再生成…」句首带「再/重新」也要接住
+assert.equal(isEditIntent('再生成一个第三人称视角的。', true), true);
+assert.equal(isEditIntent('重新画一张，视角拉远', true), true);
+assert.equal(isEditIntent('再画一张天空的', true), true);
+assert.equal(isEditIntent('再生成一个第三人称视角的。', false), false);
 assert.equal(await run(event('u', [{type:'text',data:{text:'这张图片是什么？'}},{type:'image'}])), false);
 await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少参考图片/);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), /仅支持单张/);
