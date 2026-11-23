@@ -43,6 +43,14 @@ assert.equal(isEditIntent('再生成一个第三人称视角的。', true), true
 assert.equal(isEditIntent('重新画一张，视角拉远', true), true);
 assert.equal(isEditIntent('再画一张天空的', true), true);
 assert.equal(isEditIntent('再生成一个第三人称视角的。', false), false);
+// 11-19 第四漏回归：句首「按照/根据」类兜底大闸
+assert.equal(isEditIntent('按照这个聊天记录生成一张图', true), true);
+assert.equal(isEditIntent('根据这张图再画一张全身的', true), true);
+assert.equal(isEditIntent('这图是AI生成的吧', true), false);
+assert.equal(isEditIntent('这张图是谁画的', true), false);
+assert.equal(isEditIntent('这张图是用什么软件生成的', true), false);
+assert.equal(isEditIntent('画一张猫', true), true);   // 有参考图在手，画/生成一律带图走编辑
+assert.equal(isEditIntent('画一张猫', false), false); // 无参考图的纯文生图诉求，不归图生图管
 assert.equal(await run(event('u', [{type:'text',data:{text:'这张图片是什么？'}},{type:'image'}])), false);
 await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少参考图片/);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), /仅支持单张/);
