@@ -20,6 +20,8 @@ A Cheshire cat living in your QQ group. @-mention her to chat — she remembers 
 - 🎵 **Sing** — ask with `唱歌 xxx`, she writes the lyrics and performs them; singing uses its own separate service, so talking and singing can sound differently
 - 🐾 **Random Cheshire meme** — `随机柴郡图` pulls a random meme from a GitHub-hosted collection, no repeats in a run
 - 🖼 **Draw** — `画一张××`; within 10 minutes, `改一下` or `性别错了` gets a revision of the same picture. Moderation blocks or quota exhaustion are reported honestly instead of silently failing
+- 🎨 **Edit a real picture (image-to-image)** — quote or attach a picture and say `改图：…` / `把图片中的人物换成××` / `再生成一个第三人称视角的`; the edit request goes straight to a real image-edit endpoint with the quoted image as reference, and **your words are passed to the model verbatim** — no translator rewriting them (character names, negative requirements and appearance stay exactly as you typed them). She replies "收到" right away, and every generated picture (drawn or edited) is archived to a local `generated/` folder so you don't have to dig it out of the chat
+- 💍 **Daily wife / check-in** — `签到` / `今日老婆` / `今日老婆2` / `本命老婆 <名字>` (all need an @). A fully scripted ship-girl lottery (591 characters, cube bookkeeping per user) — zero LLM tokens, and it never touches the chat memory
 - 🎬 **Make short videos** (15 s cap) — text-to-video, or image-to-video by quoting a picture
 - 📡 **Beacon** — shout the trigger phrase and get an instant scripted reply: zero tokens, proof she's alive
 - 🔁 **+1 echo** — joins a (+1) repeat chain once, with four guards against loops
@@ -47,7 +49,7 @@ A Cheshire cat living in your QQ group. @-mention her to chat — she remembers 
 4. **Prerequisite**: NTQQ (9.9.x; the classic edition won't work) installed and the bot's QQ account logged in
 5. **Double-click `一键启动.cmd`**: stops stale instances → starts SnowLuma + the bot → opens the admin WebUI → runs the 8-point self-check
 
-Daily ops: re-run the same launcher to restart (idempotent); switch models via **`切换面板.cmd`** (local web page: form → model list → 4-point probe → one-click switch, for mouse people) or `切换模型.cmd` (CLI: verify first, then write). Logs: `qq-group-bot/bot.log` (stdout) and `bot.err` (stderr).
+Daily ops: re-run the same launcher to restart (idempotent); switch models via **`切换面板.cmd`** (local web page: form → model list → 4-point probe → one-click switch, for mouse people) or `切换模型.cmd` (CLI: verify first, then write). Logs: `qq-group-bot/bot.log` (stdout) and `bot.err` (stderr); every restart auto-archives the previous log as `bot-<date>.log` / `bot-<date>.err` (only the current day's archive is kept).
 
 ## Customization: what → which key → where → effect
 
@@ -180,6 +182,13 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 - 🐾 **随机柴郡图**：说「随机柴郡图」从表情包库里真随机抽一张，连抽不重样
 - 🖼 **画画**：说「画一张××」就画；10 分钟内说「改一下」「性别错了」她会带着原 prompt 重画。
   审核拦截、限流这些都会如实说，不装死也不静默
+- 🎨 **图生图（真·改图）**：引用或附带一张图说「改图：…」「把图片中的人物换成××」
+  「再生成一个第三人称视角的」——走真正的图片编辑接口，引用的图就是参考图，
+  **你的原话逐字直达生图模型**（不经翻译改写：角色名、否定要求、外形描述都原样保留）。
+  她会先回「收到」再慢慢画；所有生成的图（画的+改的）都会自动存一份到本地
+  `generated/` 文件夹，不用再去聊天记录里翻
+- 💍 **今日老婆 / 签到**：`签到` / `今日老婆` / `今日老婆2` / `本命老婆 <名字>`（都需 @）。
+  纯脚本的舰娘抽签（591 位池、按用户魔方记账），零 LLM 开销，与群聊记忆完全隔离
 - 🎬 **生成短视频**：15 秒内的小片段，文字生成、引用一张图也会图生视频
 - 📡 **寻呼信标**：喊「柴郡柴郡」秒回——零开销确认她还活着
 - 🔁 **+1 复读**：有人 +1 她跟着复读一次（带死循环防护）
@@ -221,7 +230,8 @@ The bot code is yours to use and modify freely; SnowLuma is a third-party compon
 
 日常：重启就再点一次（幂等）；换模型双击 **「切换面板.cmd」**（本地网页：表单填 API → 拉模型列表 → 四件套探测 → 一键切换，适合不想碰命令行）、
 或 `切换模型.cmd`（命令行：先验证再写盘）；
-日志在 `qq-group-bot/bot.log`（正常）和 `bot.err`（报错走 stderr）。
+日志在 `qq-group-bot/bot.log`（正常）和 `bot.err`（报错走 stderr）；每次重启会自动把旧日志
+备份为 `bot-<日期>.log` / `bot-<日期>.err`（只保留当天的备份）。
 
 ## 自定义（想改什么 → 改哪个键 → 在哪 → 怎么生效）
 
