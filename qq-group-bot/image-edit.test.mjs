@@ -71,4 +71,26 @@ const config = {imggenEditUrl:'https://local.invalid/edit', imggenEditProtocol:'
 await editImage(text,image,{config,fetchImpl:async (url,init)=>{fetchCalled=true; const form=init.body; assert.equal(form.get('prompt'),text); assert.equal(form.get('model'),'model'); assert.equal(form.get('image').type,'image/png'); return {ok:true,json:async()=>({data:[{b64_json:image.toString('base64')}]})};}});
 assert.equal(fetchCalled,true);
 await assert.rejects(editImage('x',image,{config:{...config,imggenEditUrl:''},fetchImpl:()=>{throw Error('must not call')}}), /不会转文生图/);
+// ── 判官路径（2026-11-23 指挥官拍板：模型判意优先，正则退居回退）──
+const judgeCalls = [];
+const judgeRun = (e, verdict) => router.run({
+  event: e, scope: e.group_id ?? `pv${e.user_id}`, enabled: true,
+  loadReply: async () => undefined, loadImage: async () => image,
+  edit: async (prompt, ref) => { judgeCalls.push({ prompt, ref }); return image; },
+  send: async () => {},
+  judge: async () => verdict,
+});
+// 判官说不是 → 直接放行，正则再中也不烧钱
+assert.equal(await judgeRun(event('u', [{type:'text',data:{text:'改图换成夜景'}},{type:'image'}]), false), false);
+assert.equal(judgeCalls.length, 0);
+// 判官说是 → 放行，哪怕正则认不出（「把这张做成表情包风格」旧正则不中）
+assert.equal(await judgeRun(event('u2', [{type:'text',data:{text:'把这张做成表情包风格'}},{type:'image'}]), true), true);
+assert.equal(judgeCalls.length, 1);
+assert.equal(judgeCalls[0].prompt, '把这张做成表情包风格');
+// 判官失灵（null/抛错）→ 回退正则：正则认得出的照样触发、认不出的照样不触发
+assert.equal(await judgeRun(event('u3', [{type:'text',data:{text:'真可爱'}},{type:'image'}]), null), false);
+assert.equal(await judgeRun(event('u4', [{type:'text',data:{text:'改图加上月亮'}},{type:'image'}]), null), true);
+assert.equal(judgeCalls.length, 2);
+// 判官抛异常同失灵处理
+assert.equal(await judgeRun(event('u5', [{type:'text',data:{text:'真可爱'}},{type:'image'}]), undefined), false);
 console.log('image-edit offline tests passed');

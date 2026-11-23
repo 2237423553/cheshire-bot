@@ -640,12 +640,14 @@ function buildSystem(sessionId, extraSystem = '') {
     .join('\n\n');
 }
 
-async function callLLM(sessionId, messages, useTools) {
+async function callLLM(sessionId, messages, useTools, opts = {}) {
   const body = {
     model: cfg.model,
     messages,
   };
-  if (cfg.thinking && cfg.thinking !== 'default') body.thinking = cfg.thinking;   // 'default' = 不传，用模型默认
+  // 思考档可覆盖（意图判官用 disabled 提速；'default' = 不传，用模型默认）
+  const thinking = opts.thinking !== undefined ? opts.thinking : cfg.thinking;
+  if (thinking && thinking !== 'default') body.thinking = thinking;
   if (useTools) body.tools = toolsNow();   // 按开关现过滤（search/imggen 关了工具就从清单里消失）
 
   // 空包重试（2026-11-06 群内实锤：HTTP 200 + {} 空体直接落群——网关偶发空包）。
@@ -1920,6 +1922,31 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
         // 铁令：原文直传，尤其不能经过 appearanceGate（会删掉用户否定/外形词）。
         // 日志必须有（11-19 教训：编辑路径全程零日志，排查只能靠猜时间线）
         ack: () => ctx.reply(text('收到喵，按指挥官给的图改，要等十几秒到一分钟～')),
+        // 语义判意（2026-11-23 指挥官拍板）：带参考图的消息先让模型判「是不是要改图」，
+        // 判完再路由。判官失灵（返回 null）由 image-edit.mjs 回退正则。
+        judge: async (text) => {
+          const m = await callLLM('imgedit-judge', [
+            { role: 'system', content:
+              '你是意图分类器，只输出 JSON，不输出任何其他文字。' +
+              '群友引用或附带了一张图并 @ 机器人说了下面这句话。' +
+              '判断这句话是不是要「基于这张图改图 / 以这张图为参考生成图片」的指令' +
+              '（执行会真实花钱生成图片）。' +
+              '算「是」：改成/换成/去掉/加上/重画/再生成/按照这张图画/换装/换背景/全身出镜等明确要动图或带图生成的诉求。' +
+              '算「否」：纯问句（这是什么/谁画的/生成完了吗/用什么软件）、评论夸赞、' +
+              '闲聊、与图片无关的其他诉求。' +
+              '只回复 {"edit": true} 或 {"edit": false}。' },
+            { role: 'user', content: String(text ?? '').slice(0, 300) },
+          ], false, { thinking: { type: 'disabled' } });
+          const raw = String(m?.content ?? '');
+          const hit = /"edit"\s*:\s*(true|false)/i.exec(raw);
+          if (!hit) {
+            console.warn(`[bot] 图生图判官没按格式回（${raw.slice(0, 60)}），回退正则`);
+            return null;
+          }
+          const verdict = hit[1] === 'true';
+          console.log(`[bot] 🧭 图生图判意：${verdict ? '改图' : '不是'} <- ${String(text).slice(0, 30)}`);
+          return verdict;
+        },
         edit: (prompt, reference) => {
           console.log(`[bot] 🖌 图生图接管：${prompt.slice(0, 60)}（参考图 ${Math.round(reference.length / 1024)}KB）`);
           return imggen.editImage(prompt, reference);

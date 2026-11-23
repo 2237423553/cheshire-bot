@@ -62,12 +62,23 @@ export class ImageEditRouter {
     if (value && this.now() - value.at < this.ttl) return value.image;
     this.successes.delete(key); return null;
   }
-  async run({ event, scope, enabled, loadReply, loadImage, edit, send, ack }) {
+  async run({ event, scope, enabled, loadReply, loadImage, edit, send, ack, judge }) {
     const segs = Array.isArray(event.message) ? event.message : [];
     const prompt = originalEditText(event);
     const attached = segs.filter(s => s.type === 'image');
     const replies = segs.filter(s => s.type === 'reply');
-    if (!isEditIntent(prompt, attached.length > 0 || replies.length > 0)) return false;
+    const hasRef = attached.length > 0 || replies.length > 0;
+    // ── 语义判意优先（2026-11-23 指挥官拍板）：带参考图的消息先让模型判一句
+    // 「是不是要基于这张图改图/生成」，判完再路由——正则按句式追永远追不完
+    // （五轮猫鼠游戏：漏四次+误伤一次）。判官返回：true=改图 / false=不是 / null=判官失灵。
+    if (hasRef && judge) {
+      let verdict = null;
+      try { verdict = await judge(prompt); } catch { verdict = null; }
+      if (verdict === false) return false;
+      if (verdict === true) {
+        // 判官说改就走，不再过正则（正则只是判官失灵时的回退）
+      } else if (!isEditIntent(prompt, true)) return false;   // 判官失灵 → 回退正则
+    } else if (!isEditIntent(prompt, hasRef)) return false;
     if (!enabled) throw new Error('画画业务暂停营业');
     let candidates = attached;
     if (!candidates.length && replies.length) {
