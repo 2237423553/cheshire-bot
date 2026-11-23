@@ -51,6 +51,10 @@ assert.equal(isEditIntent('这张图是谁画的', true), false);
 assert.equal(isEditIntent('这张图是用什么软件生成的', true), false);
 assert.equal(isEditIntent('画一张猫', true), true);   // 有参考图在手，画/生成一律带图走编辑
 assert.equal(isEditIntent('画一张猫', false), false); // 无参考图的纯文生图诉求，不归图生图管
+// 11-23 误伤回归：问「生成什么了」（含异体「甚么/基么」）不是改图指令
+assert.equal(isEditIntent('生成甚么了', true), false);
+assert.equal(isEditIntent('生成基么了', true), false);
+assert.equal(isEditIntent('生成完了吗', true), false);
 assert.equal(await run(event('u', [{type:'text',data:{text:'这张图片是什么？'}},{type:'image'}])), false);
 await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少参考图片/);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), /仅支持单张/);
