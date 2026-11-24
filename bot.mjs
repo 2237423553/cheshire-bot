@@ -1947,9 +1947,9 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
           console.log(`[bot] 🧭 图生图判意：${verdict ? '改图' : '不是'} <- ${String(text).slice(0, 30)}`);
           return verdict;
         },
-        edit: (prompt, reference) => {
-          console.log(`[bot] 🖌 图生图接管：${prompt.slice(0, 60)}（参考图 ${Math.round(reference.length / 1024)}KB）`);
-          return imggen.editImage(prompt, reference);
+        edit: (prompt, references) => {
+          console.log(`[bot] 🖌 图生图接管：${prompt.slice(0, 60)}（参考图 ${references.length} 张，共 ${Math.round(references.reduce((n, b) => n + b.length, 0) / 1024)}KB）`);
+          return imggen.editImage(prompt, references);
         },
         send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000)
           .then(() => saveGeneratedImage(output, 'img2img')),

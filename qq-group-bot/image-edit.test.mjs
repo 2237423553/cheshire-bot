@@ -22,9 +22,9 @@ const run = (e, extra = {}) => router.run({
 assert.equal(originalEditText(event('u', [{type:'at',data:{qq:'bot'}},{type:'text',data:{text:'  中文\n不要翻译  '}}])), '  中文\n不要翻译  ');
 assert.equal(await run(event('u', [{type:'text',data:{text}} ,{type:'image'}])), true);
 assert.equal(calls[0].prompt, text);
-assert.deepEqual(calls[0].ref, image);
-await assert.rejects(run(event('other', [{type:'text',data:{text:'改成夜景'}}])), /缺少参考图片/);
-await assert.rejects(run(event('u', [{type:'text',data:{text:'改成夜景'}}], 11)), /缺少参考图片/);
+assert.deepEqual(calls[0].ref, [image]);   // 多图升级后统一传数组
+await assert.rejects(run(event('other', [{type:'text',data:{text:'改成夜景'}}])), /缺少可用参考图片/);
+await assert.rejects(run(event('u', [{type:'text',data:{text:'改成夜景'}}], 11)), /缺少可用参考图片/);
 for (const question of ['有没有60kg左右的弓', '这张图片是什么？', '改图怎么用？', '图生图是什么？']) assert.equal(isEditIntent(question, true), false);
 // 11-18 群内实锤回归：「把图片中的人物换成痞老板」旧正则漏接
 assert.equal(isEditIntent('把图片中的人物换成痞老板。衣服不要换', true), true);
@@ -56,8 +56,10 @@ assert.equal(isEditIntent('生成甚么了', true), false);
 assert.equal(isEditIntent('生成基么了', true), false);
 assert.equal(isEditIntent('生成完了吗', true), false);
 assert.equal(await run(event('u', [{type:'text',data:{text:'这张图片是什么？'}},{type:'image'}])), false);
-await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少参考图片/);
-await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), /仅支持单张/);
+await assert.rejects(run(event('new', [{type:'text',data:{text:'改图，画成雨天'}}])), /缺少可用参考图片/);
+// 多图支持（2026-11-23 指挥官指示升级）：两张参考图全收
+assert.equal(await run(event('u', [{type:'text',data:{text:'改图'}},{type:'image'},{type:'image'}])), true);
+assert.equal(calls.at(-1).ref.length, 2);
 const quoted = await run(event('u', [{type:'text',data:{text:'改图换背景'}},{type:'reply',data:{id:'q'}}]), { reply:{group_id:10,message:[{type:'image'}]} });
 assert.equal(quoted, true);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'reply',data:{id:'q'}}]), { reply:{group_id:11,message:[{type:'image'}]} }), /不属于当前会话/);

@@ -15,26 +15,37 @@ const TIMEOUT = 180 * 1000;   // 实测冷启动能到一分钟以上，宁可�
 /** 显式启用的 OpenAI multipart 编辑协议。绝不推测 URL/能力、不降级、不自动转文生图。
  * 429 限流按「先重试后认命」教义等一把再试（11-19 实锤：11-17 首次编辑的 429 就是瞬时的，
  * 当场认输会让群里白吃一次失败提示）。其余错误仍当场明报。
+ * 多图支持（2026-11-23 指挥官指示升级）：image 可传 Buffer 或 Buffer[]（上限 16，
+ * 官方 edits 端点同款上限）；多图走官方 `image[]` 重复字段，单图维持 `image` 兼容。
  * options 仅用于离线 mock 注入；运行时默认使用 cfg/fetch。prompt 不做 trim/改写。 */
 export async function editImage(prompt, image, { config = cfg, fetchImpl = fetch } = {}) {
   if (!config.imggenEditUrl || config.imggenEditProtocol !== 'openai-multipart') {
     throw new Error('图生图尚未启用：需确认服务商支持编辑协议，并配置 imggenEditUrl 和 imggenEditProtocol=openai-multipart；不会转文生图');
   }
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('缺少本轮改图文字');
-  if (!Buffer.isBuffer(image) || !image.length) throw new Error('缺少真实参考图片');
-  return editImageInner(prompt, image, 0, { config, fetchImpl });
+  const images = Array.isArray(image) ? image : [image];
+  if (!images.length || images.some((b) => !Buffer.isBuffer(b) || !b.length)) throw new Error('缺少真实参考图片');
+  if (images.length > 16) throw new Error('参考图最多 16 张');
+  return editImageInner(prompt, images, 0, { config, fetchImpl });
 }
 
-async function editImageInner(prompt, image, attempt, { config, fetchImpl }) {
-  // 真实字节识别格式，不把任意错误页当图片上传。
-  const mime = image.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png'
-    : image[0] === 255 && image[1] === 216 && image[2] === 255 ? 'image/jpeg'
-    : image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP' ? 'image/webp' : null;
-  if (!mime) throw new Error('参考图片仅支持 PNG、JPEG、WebP');
+async function editImageInner(prompt, images, attempt, { config, fetchImpl }) {
   const form = new FormData();
   form.set('model', config.imggenModel);
   form.set('prompt', prompt);
-  form.set('image', new Blob([image], { type: mime }), 'reference.' + mime.split('/')[1]);
+  // 真实字节识别格式，不把任意错误页当图片上传。
+  images.forEach((image, i) => {
+    const mime = image.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) ? 'image/png'
+      : image[0] === 255 && image[1] === 216 && image[2] === 255 ? 'image/jpeg'
+      : image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP' ? 'image/webp' : null;
+    if (!mime) throw new Error(`参考图第 ${i + 1} 张仅支持 PNG、JPEG、WebP`);
+    if (images.length === 1) {
+      form.set('image', new Blob([image], { type: mime }), 'reference.' + mime.split('/')[1]);
+    } else {
+      // 官方多图字段名 image[]（gpt-image 系多参考图同款）
+      form.append('image[]', new Blob([image], { type: mime }), `reference-${i + 1}.${mime.split('/')[1]}`);
+    }
+  });
   form.set('n', '1');
   if (config.imggenQuality) form.set('quality', config.imggenQuality);
   if (config.imggenSize) form.set('size', config.imggenSize);

@@ -83,20 +83,24 @@ export class ImageEditRouter {
     let candidates = attached;
     if (!candidates.length && replies.length) {
       // 显式引用优先且失败不回退，避免误拿用户上次成功图。
-      if (replies.length !== 1) throw new Error('请只引用一条含单张图片的消息');
+      if (replies.length !== 1) throw new Error('请只引用一条含图片的消息');
       const quoted = await loadReply(replies[0].data?.id);
       if (quoted?.group_id != null && String(quoted.group_id) !== String(scope)) throw new Error('引用图片不属于当前会话');
       if (String(scope).startsWith('pv') && (quoted?.group_id != null || String(quoted?.user_id ?? quoted?.sender?.user_id) !== String(event.user_id))) throw new Error('无法确认私聊引用图片归属');
       candidates = (Array.isArray(quoted?.message) ? quoted.message : []).filter(s => s.type === 'image');
       if (!candidates.length) throw new Error('引用消息没有可用图片，请附上一张参考图');
     }
-    if (candidates.length > 1) throw new Error('首版仅支持单张参考图，请只附上或引用一张图片');
-    const reference = candidates.length ? await loadImage(candidates[0]) : this.previous(scope, event.user_id);
-    if (!reference?.length) throw new Error('缺少参考图片，请附图、引用单图，或修改你在本会话十分钟内的成功图');
+    // 多图支持（2026-11-23 指挥官指示）：官方 edits 端点最多 16 张参考图，
+    // 多图合照/对比场景直接全收，不再「首版仅单张」。
+    if (candidates.length > 16) throw new Error('参考图最多 16 张，多的先删掉再发');
+    const references = candidates.length
+      ? await Promise.all(candidates.map((s) => loadImage(s)))
+      : [this.previous(scope, event.user_id)].filter(Boolean);
+    if (!references.length || references.some((b) => !b?.length)) throw new Error('缺少可用参考图片，请附图或引用含图消息');
     // 「收到」回执 + 接管日志（11-19 实锤：编辑一把 1~3 分钟且全程无日志，
     // 群里体感就是没反应——出图慢可以等，无声干等不行）
     if (ack) { try { await ack(); } catch { /* 回执发不出去不挡正事 */ } }
-    const output = await edit(prompt, reference);
+    const output = await edit(prompt, references);
     await send(output);
     this.remember(scope, event.user_id, output);
     return true;
