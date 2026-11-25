@@ -75,6 +75,18 @@ const config = {imggenEditUrl:'https://local.invalid/edit', imggenEditProtocol:'
 await editImage(text,image,{config,fetchImpl:async (url,init)=>{fetchCalled=true; const form=init.body; assert.equal(form.get('prompt'),text); assert.equal(form.get('model'),'model'); assert.equal(form.get('image').type,'image/png'); return {ok:true,json:async()=>({data:[{b64_json:image.toString('base64')}]})};}});
 assert.equal(fetchCalled,true);
 await assert.rejects(editImage('x',image,{config:{...config,imggenEditUrl:''},fetchImpl:()=>{throw Error('must not call')}}), /不会转文生图/);
+// 多图 429 重试回归（11-25 实锤：重试路径把 images 误传成 undefined，一重试就炸）
+let tries = 0;
+await editImage(text, [image, image], {
+  config,
+  fetchImpl: async (url, init) => {
+    tries++;
+    if (tries === 1) return { ok: false, status: 429, headers: new Map([['retry-after', '0.05']]), json: async () => ({}) };
+    assert.equal(init.body.getAll('image[]').length, 2);   // 重试那把也必须两张全在
+    return { ok: true, json: async () => ({ data: [{ b64_json: image.toString('base64') }] }) };
+  },
+});
+assert.equal(tries, 2);
 // ── 判官路径（2026-11-23 指挥官拍板：模型判意优先，正则退居回退）──
 const judgeCalls = [];
 const judgeRun = (e, verdict) => router.run({

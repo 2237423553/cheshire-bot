@@ -197,26 +197,38 @@ async function toDataUrl(seg, fallbackMime) {
   try {
     let buf;
     let mime = guessMime(name, fallbackMime);
-    if (/^https?:\/\//i.test(src)) {
+    // NTQQ 的段偶发只给 file=裸文件名不给 url（rkey 刷新瞬间，11-25 实锤：引用图
+    // 加载报 ENOENT open '289d….png'）——裸名先找 OneBot get_image 换新鲜链接，
+    // 换不到按原路读文件，报错仍走下面统一人话出口。
+    let src2 = src;
+    if (!/^https?:\/\//i.test(src) && !/[\\/]/.test(src)) {
+      try {
+        const action = seg.type === 'record' ? 'get_record' : seg.type === 'video' ? 'get_video' : 'get_image';
+        const got = await http.raw(action, { file: src });
+        const better = got?.url || got?.file || '';
+        if (better) src2 = better;
+      } catch { /* 换不到按原路走 */ }
+    }
+    if (/^https?:\/\//i.test(src2)) {
       // SSRF 闸（10-24 评审）：URL 是群友塞进来的，不许指向内网/本地面板；
       // 顺手补超时——这里原先也没有，和 exa.rpc 是同一类「挂起静默卡死」隐患
-      await assertSafeUrl(src);
-      const r = await fetch(src, {
+      await assertSafeUrl(src2);
+      const r = await fetch(src2, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
         signal: AbortSignal.timeout(60 * 1000),
       });
       if (!r.ok) {
-        console.warn(`[bot] 媒体下载失败 HTTP ${r.status}: ${String(src).slice(0, 60)}`);
+        console.warn(`[bot] 媒体下载失败 HTTP ${r.status}: ${String(src2).slice(0, 60)}`);
         return { dataUrl: null, reason: `下载失败 HTTP ${r.status}` };
       }
       const ct = (r.headers.get('content-type') || '').split(';')[0];
       if (ct && ct !== 'application/octet-stream') mime = ct;
       buf = Buffer.from(await r.arrayBuffer());
     } else {
-      buf = await readFile(src.replace(/^file:\/\//i, ''));
+      buf = await readFile(src2.replace(/^file:\/\//i, ''));
     }
     if (!buf?.length) {
-      console.warn(`[bot] 媒体加载失败：下载到 0 字节，src=${String(src).slice(0, 60)}`);
+      console.warn(`[bot] 媒体加载失败：下载到 0 字节，src=${String(src2).slice(0, 60)}`);
       return { dataUrl: null, reason: '下载到 0 字节（地址可能已过期）' };
     }
     if (buf.length > MAX_MEDIA_BYTES) {
@@ -226,7 +238,7 @@ async function toDataUrl(seg, fallbackMime) {
     console.log(`[bot] 媒体加载成功：${mb(buf.length)} mime=${mime}`);
     return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, reason: '' };
   } catch (e) {
-    console.warn('[bot] 媒体读取失败:', String(src).slice(0, 60), e.message);
+    console.warn('[bot] 媒体读取失败:', String(src2 ?? src).slice(0, 60), e.message);
     return { dataUrl: null, reason: `读取出错：${e.message}` };
   }
 }
@@ -1947,9 +1959,15 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
           console.log(`[bot] 🧭 图生图判意：${verdict ? '改图' : '不是'} <- ${String(text).slice(0, 30)}`);
           return verdict;
         },
-        edit: (prompt, references) => {
+        edit: async (prompt, references) => {
           console.log(`[bot] 🖌 图生图接管：${prompt.slice(0, 60)}（参考图 ${references.length} 张，共 ${Math.round(references.reduce((n, b) => n + b.length, 0) / 1024)}KB）`);
-          return imggen.editImage(prompt, references);
+          const output = await imggen.editImage(prompt, references);
+          // 引擎软拒答会「成功」地原样退回参考图（11-25 实锤疑似：改曲线几乎没动）——
+          // 单参考图字节级等值就当失败报人话，别把「没改的图」当成果发给指挥官
+          if (references.length === 1 && output.equals(references[0])) {
+            throw new Error('引擎把参考图原样退了回来（多半是措辞触了软审核），换个说法再试');
+          }
+          return output;
         },
         send: output => sendMediaSeg(gid, { type: 'image', data: { file: 'base64://' + output.toString('base64') } }, 120 * 1000)
           .then(() => saveGeneratedImage(output, 'img2img')),

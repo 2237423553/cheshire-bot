@@ -65,7 +65,7 @@ async function editImageInner(prompt, images, attempt, { config, fetchImpl }) {
       const wait = Math.min(Number(r.headers.get('retry-after')) || 30, 90);
       console.warn(`[bot] 图生图限流（429），等 ${wait}s 重试（第 ${attempt + 1}/2 次）`);
       await new Promise((res) => setTimeout(res, wait * 1000));
-      return editImageInner(prompt, image, attempt + 1, { config, fetchImpl });
+      return editImageInner(prompt, images, attempt + 1, { config, fetchImpl });
     }
     throw new Error(`图生图编辑接口失败（HTTP ${r.status}），请检查编辑协议/权限/额度；未转文生图`);
   }
