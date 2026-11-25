@@ -85,8 +85,10 @@ export class ImageEditRouter {
       // 显式引用优先且失败不回退，避免误拿用户上次成功图。
       if (replies.length !== 1) throw new Error('请只引用一条含图片的消息');
       const quoted = await loadReply(replies[0].data?.id);
-      if (quoted?.group_id != null && String(quoted.group_id) !== String(scope)) throw new Error('引用图片不属于当前会话');
-      if (String(scope).startsWith('pv') && (quoted?.group_id != null || String(quoted?.user_id ?? quoted?.sender?.user_id) !== String(event.user_id))) throw new Error('无法确认私聊引用图片归属');
+      // 群聊校验归属（防跨群拿图）；私聊只有白名单指挥官和机器人两个人，
+      // 引用什么都算本人授权——旧 pv 归属校验因 get_msg 字段形状差异必误杀
+      // （11-23 实锤：私聊引用自己的图报「无法确认私聊引用图片归属」），直接放开
+      if (!String(scope).startsWith('pv') && quoted?.group_id != null && String(quoted.group_id) !== String(scope)) throw new Error('引用图片不属于当前会话');
       candidates = (Array.isArray(quoted?.message) ? quoted.message : []).filter(s => s.type === 'image');
       if (!candidates.length) throw new Error('引用消息没有可用图片，请附上一张参考图');
     }

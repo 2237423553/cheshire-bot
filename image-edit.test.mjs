@@ -63,6 +63,8 @@ assert.equal(calls.at(-1).ref.length, 2);
 const quoted = await run(event('u', [{type:'text',data:{text:'改图换背景'}},{type:'reply',data:{id:'q'}}]), { reply:{group_id:10,message:[{type:'image'}]} });
 assert.equal(quoted, true);
 await assert.rejects(run(event('u', [{type:'text',data:{text:'改图'}},{type:'reply',data:{id:'q'}}]), { reply:{group_id:11,message:[{type:'image'}]} }), /不属于当前会话/);
+// 私聊放开归属校验（2026-11-23 误杀实锤）：pv 里引用带 group_id 的消息也放行
+assert.equal(await run(event('pv1', [{type:'text',data:{text:'改图'}},{type:'reply',data:{id:'q'}}], null), { reply:{group_id:5,message:[{type:'image'}]} }), true);
 const previous = await run(event('u', [{type:'text',data:{text:'改图加上月亮'}}]));
 assert.equal(previous, true);
 const beforeFailure = router.previous(10, 'u').toString('hex');
