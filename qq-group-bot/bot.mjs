@@ -238,7 +238,9 @@ async function toDataUrl(seg, fallbackMime) {
     console.log(`[bot] 媒体加载成功：${mb(buf.length)} mime=${mime}`);
     return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, reason: '' };
   } catch (e) {
-    console.warn('[bot] 媒体读取失败:', String(src2 ?? src).slice(0, 60), e.message);
+    // ⚠️ 这里只能用 src——src2 是 try 块内的 let，catch 里看不见（11-25 实锤：
+    // 一引用就 ReferenceError，把真正的报错原因顶掉成「src2 is not defined」）
+    console.warn('[bot] 媒体读取失败:', String(src).slice(0, 60), e.message);
     return { dataUrl: null, reason: `读取出错：${e.message}` };
   }
 }
