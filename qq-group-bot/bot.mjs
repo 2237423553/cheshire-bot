@@ -208,6 +208,11 @@ async function toDataUrl(seg, fallbackMime) {
         const better = got?.url || got?.file || '';
         if (better) src2 = better;
       } catch { /* 换不到按原路走 */ }
+      if (!/^https?:\/\//i.test(src2) && !/[\\/]/.test(src2)) {
+        // get_image 也换不来（缓存里没有）——裸名 readFile 必 ENOENT，直接报人话。
+        // url 是瞬态缺失，外层 getMsgResolvingUrls 的重试通常已经救过一回了。
+        return { dataUrl: null, reason: '图片链接暂时拿不到（QQ 这边瞬态抽风），等几秒再引用一次' };
+      }
     }
     if (/^https?:\/\//i.test(src2)) {
       // SSRF 闸（10-24 评审）：URL 是群友塞进来的，不许指向内网/本地面板；
@@ -358,12 +363,31 @@ async function fetchRecentMedia(gid, senderId) {
  * 引用里如果是合并转发（forward），再拉 get_forward_msg 取各节点内容。
  * 只展开一层不套娃；拉不到就当没有，不影响主流程。
  */
+/**
+ * get_msg 拉引用消息，但带上「图段 url 瞬态缺失」重试——NTQQ 偶发（rkey 刷新瞬间/
+ * 老消息）返回的 image 段没有 url 只剩 file=裸文件名，本地缓存也没有时无路可走
+ * （11-25 两次实锤）。同一 message_id 过几秒重拉往往 url 就回来了——实测验证。
+ * 最多等 3 把 × 1.5s；只把「url 补齐了」的结果采纳，其余字段一律以第一把为准。
+ */
+async function getMsgResolvingUrls(messageId, tries = 3) {
+  const msg = await http.raw('get_msg', { message_id: messageId });
+  const imgsOf = (m) => (Array.isArray(m?.message) ? m.message : []).filter((s) => s.type === 'image');
+  for (let i = 1; i < tries && imgsOf(msg).length > 0 && !imgsOf(msg).every((s) => s.data?.url); i++) {
+    await new Promise((res) => setTimeout(res, 1500));
+    try {
+      const again = await http.raw('get_msg', { message_id: messageId });
+      if (imgsOf(again).every((s) => s.data?.url)) return { ...msg, message: again.message };
+    } catch { /* 重拉失败再等等 */ }
+  }
+  return msg;
+}
+
 async function expandReplySegs(segs) {
   const replies = segs.filter((s) => s.type === 'reply' && s.data?.id);
   // 10-30 评审：每条引用拉一次消息是独立网络请求，并行拿 + 保序合并
   const loaded = await Promise.all(replies.map(async (s) => {
     try {
-      const msg = await http.raw('get_msg', { message_id: s.data.id });
+      const msg = await getMsgResolvingUrls(s.data.id);
       let inner = Array.isArray(msg?.message) ? msg.message : [];
 
       // 合并转发：取最后 3 个节点的内容（最新的在后面）
@@ -1927,7 +1951,7 @@ async function handleAtMe(event, ctx, gid, userText, atMe, cmd) {
     try {
       if (await imageEdits.run({
         event, scope: gid, enabled: featureOn('imggen', true),
-        loadReply: id => http.raw('get_msg', { message_id: id }),
+        loadReply: id => getMsgResolvingUrls(id),
         loadImage: async segment => {
           const loaded = await toDataUrl(segment, 'image/jpeg');
           if (!loaded?.dataUrl) throw new Error('参考图片加载失败，请重新附图');
